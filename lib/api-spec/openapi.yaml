@@ -10,6 +10,10 @@ servers:
 tags:
   - name: health
     description: Health operations
+  - name: products
+    description: Product operations
+  - name: transactions
+    description: Transaction operations
 paths:
   /healthz:
     get:
@@ -24,6 +28,57 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/HealthStatus"
+
+  /products:
+    get:
+      operationId: listProducts
+      tags: [products]
+      summary: List all products
+      description: Returns the full product catalogue
+      responses:
+        "200":
+          description: List of products
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Product"
+
+  /transactions:
+    get:
+      operationId: listTransactions
+      tags: [transactions]
+      summary: List all transactions
+      description: Returns all recorded stock transactions
+      responses:
+        "200":
+          description: List of transactions
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Transaction"
+    post:
+      operationId: createTransaction
+      tags: [transactions]
+      summary: Create a transaction
+      description: Records a stock-in or stock-out transaction and appends it to the Excel file
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateTransactionBody"
+      responses:
+        "201":
+          description: Transaction saved
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Transaction"
+
 components:
   schemas:
     HealthStatus:
@@ -34,3 +89,69 @@ components:
       required:
         - status
 
+    Product:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        unit:
+          type: string
+      required:
+        - id
+        - name
+        - unit
+
+    Transaction:
+      type: object
+      properties:
+        id:
+          type: string
+        productId:
+          type: string
+        productName:
+          type: string
+        quantity:
+          type: number
+          description: Positive for stock-in, negative for stock-out
+        type:
+          type: string
+          enum: [stock_in, stock_out]
+        note:
+          type: string
+        timestamp:
+          type: string
+          format: date-time
+      required:
+        - id
+        - productId
+        - productName
+        - quantity
+        - type
+        - timestamp
+
+    CreateTransactionBody:
+      type: object
+      properties:
+        productId:
+          type: string
+        productName:
+          type: string
+        quantity:
+          type: number
+          description: Positive for stock-in, negative for stock-out
+        type:
+          type: string
+          enum: [stock_in, stock_out]
+        note:
+          type: string
+        timestamp:
+          type: string
+          format: date-time
+      required:
+        - productId
+        - productName
+        - quantity
+        - type
+        - timestamp
