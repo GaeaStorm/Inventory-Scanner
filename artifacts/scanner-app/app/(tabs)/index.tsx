@@ -23,27 +23,73 @@ import colors from "@/constants/colors";
 
 const DEBOUNCE_MS = 2000;
 
-interface ScannedProduct {
+type MovementType = "Restock" | "Use" | "Adjustment";
+type AdjustmentDirection = "in" | "out";
+
+interface ScannedItem {
   qrData: string;
-  productId: string;
-  productName: string;
+  refNo: string;
+  itemCode: string;
+  itemName: string;
+  unitRate: string;
+  godown: string;
+  batchNo: string;
 }
 
-function parseQR(raw: string): ScannedProduct {
-  try {
-    const obj = JSON.parse(raw);
-    return {
-      qrData: raw,
-      productId: obj.id ?? obj.productId ?? raw,
-      productName: obj.name ?? obj.productName ?? raw,
-    };
-  } catch {
-    return {
-      qrData: raw,
-      productId: raw,
-      productName: raw,
-    };
-  }
+const REQUIRED_QR_FIELDS: Array<keyof Omit<ScannedItem, "qrData">> = [
+  "refNo",
+  "itemCode",
+  "itemName",
+  "unitRate",
+  "godown",
+  "batchNo",
+];
+
+function parseQR(raw: string): ScannedItem {
+  const obj = JSON.parse(raw);
+
+  return {
+    qrData: raw,
+    refNo: String(obj.refNo ?? obj.ref_no ?? ""),
+    itemCode: String(obj.itemCode ?? obj.item_code ?? ""),
+    itemName: String(obj.itemName ?? obj.item_name ?? ""),
+    unitRate: String(obj.unitRate ?? obj.unit_rate ?? ""),
+    godown: String(obj.godown ?? ""),
+    batchNo: String(obj.batchNo ?? obj.batch_no ?? ""),
+  };
+}
+
+function getMissingQrFields(item: ScannedItem | null): string[] {
+  if (!item) return [];
+
+  const missing = REQUIRED_QR_FIELDS.filter((field) => !String(item[field]).trim()).map(
+    (field) => {
+      switch (field) {
+        case "refNo":
+          return "Ref No";
+        case "itemCode":
+          return "Item Code";
+        case "itemName":
+          return "Item Name";
+        case "unitRate":
+          return "Unit";
+        case "godown":
+          return "Godown";
+        case "batchNo":
+          return "Batch No";
+        default:
+          return field;
+      }
+    }
+  );
+
+  return missing;
+}
+
+function getMovementColor(type: MovementType) {
+  if (type === "Restock") return colors.light.stockIn;
+  if (type === "Use") return colors.light.stockOut;
+  return colors.light.primary;
 }
 
 export default function ScannerScreen() {
@@ -52,11 +98,14 @@ export default function ScannerScreen() {
   const { addTransaction, isSubmitting, serverUrl } = useSync();
   const [permission, requestPermission] = useCameraPermissions();
   const [scanned, setScanned] = useState(false);
-  const [product, setProduct] = useState<ScannedProduct | null>(null);
+  const [product, setProduct] = useState<ScannedItem | null>(null);
   const [modalVisible, setModalVisible] = useState(false);
   const [quantity, setQuantity] = useState("1");
-  const [note, setNote] = useState("");
   const [feedback, setFeedback] = useState<"success" | "error" | null>(null);
+  const [qrError, setQrError] = useState<string | null>(null);
+  const [movementType, setMovementType] = useState<MovementType>("Restock");
+  const [adjustmentDirection, setAdjustmentDirection] = useState<AdjustmentDirection>("in");
+  const [usedIn, setUsedIn] = useState("");
   const lastScanTime = useRef<number>(0);
 
   const handleBarcodeScanned = useCallback(
@@ -66,12 +115,28 @@ export default function ScannerScreen() {
       lastScanTime.current = now;
 
       if (Platform.OS !== "web") Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
-      setScanned(true);
-      setProduct(parseQR(data));
-      setQuantity("1");
-      setNote("");
-      setFeedback(null);
-      setModalVisible(true);
+
+      try {
+        const item = parseQR(data);
+
+        setScanned(true);
+        setProduct(item);
+        setQuantity("1");
+        setFeedback(null);
+        setQrError(null);
+        setModalVisible(true);
+        setMovementType("Restock");
+        setAdjustmentDirection("in");
+        setUsedIn("");
+      } catch (error) {
+        console.log("Invalid QR code:", data, error);
+        setScanned(true);
+        setProduct(null);
+        setFeedback(null);
+        setQrError("Invalid QR code. Please scan a JSON QR code with Ref No, Item Code, Item Name, Unit, Godown, and Batch No.");
+        setModalVisible(true);
+        if (Platform.OS !== "web") Vibration.vibrate(200);
+      }
     },
     []
   );
@@ -81,19 +146,32 @@ export default function ScannerScreen() {
     setModalVisible(false);
     setProduct(null);
     setFeedback(null);
+    setQrError(null);
   };
 
-  const submitTransaction = async (type: "stock_in" | "stock_out") => {
+  const submitTransaction = async () => {
     if (!product) return;
+
     const qty = parseFloat(quantity);
-    if (isNaN(qty) || qty <= 0) return;
+    const missingQrFields = getMissingQrFields(product);
+
+    if (isNaN(qty) || qty <= 0 || !usedIn.trim() || missingQrFields.length > 0) {
+      setFeedback("error");
+      if (Platform.OS !== "web") Vibration.vibrate(200);
+      return;
+    }
 
     const ok = await addTransaction({
-      productId: product.productId,
-      productName: product.productName,
-      quantity: type === "stock_in" ? qty : -qty,
-      type,
-      note: note.trim() || undefined,
+      refNo: product.refNo,
+      movementType,
+      itemCode: product.itemCode,
+      itemName: product.itemName,
+      quantity: qty,
+      unitRate: product.unitRate,
+      godown: product.godown,
+      batchNo: product.batchNo,
+      usedIn: usedIn.trim(),
+      adjustmentDirection: movementType === "Adjustment" ? adjustmentDirection : undefined,
       timestamp: new Date().toISOString(),
     });
 
@@ -117,6 +195,13 @@ export default function ScannerScreen() {
     setQuantity(String(next));
   };
 
+  const missingQrFields = getMissingQrFields(product);
+  const qty = parseFloat(quantity);
+  const quantityIsValid = !isNaN(qty) && qty > 0;
+  const canSubmit = Boolean(
+    product && quantityIsValid && usedIn.trim() && missingQrFields.length === 0 && !isSubmitting
+  );
+
   if (!permission) {
     return <View style={[styles.container, { backgroundColor: c.background }]} />;
   }
@@ -130,19 +215,10 @@ export default function ScannerScreen() {
         ]}
       >
         <Feather name="camera-off" size={56} color={c.mutedForeground} />
-        <Text style={[styles.permissionTitle, { color: c.foreground }]}>
-          Camera Access Required
-        </Text>
-        <Text style={[styles.permissionText, { color: c.mutedForeground }]}>
-          Allow camera access to scan QR codes
-        </Text>
-        <TouchableOpacity
-          style={[styles.permissionBtn, { backgroundColor: c.primary }]}
-          onPress={requestPermission}
-        >
-          <Text style={[styles.permissionBtnText, { color: c.primaryForeground }]}>
-            Allow Camera
-          </Text>
+        <Text style={[styles.permissionTitle, { color: c.foreground }]}>Camera Access Required</Text>
+        <Text style={[styles.permissionText, { color: c.mutedForeground }]}>Allow camera access to scan QR codes</Text>
+        <TouchableOpacity style={[styles.permissionBtn, { backgroundColor: c.primary }]} onPress={requestPermission}>
+          <Text style={[styles.permissionBtnText, { color: c.primaryForeground }]}>Allow Camera</Text>
         </TouchableOpacity>
       </View>
     );
@@ -159,21 +235,29 @@ export default function ScannerScreen() {
         />
       ) : (
         <View
-          style={[StyleSheet.absoluteFillObject, { backgroundColor: "#111827", alignItems: "center", justifyContent: "center" }]}
+          style={[
+            StyleSheet.absoluteFillObject,
+            { backgroundColor: "#111827", alignItems: "center", justifyContent: "center" },
+          ]}
         >
           <Feather name="camera" size={48} color="#374151" />
-          <Text style={{ color: "#6B7280", marginTop: 12, fontSize: 14 }}>
-            Camera preview not available on web
-          </Text>
+          <Text style={{ color: "#6B7280", marginTop: 12, fontSize: 14 }}>Camera preview not available on web</Text>
           <TouchableOpacity
             style={[styles.webScanBtn, { borderColor: colors.light.primary }]}
             onPress={() =>
-              handleBarcodeScanned({ data: `PROD-${String(Math.floor(Math.random() * 100) + 1).padStart(3, "0")}` })
+              handleBarcodeScanned({
+                data: JSON.stringify({
+                  refNo: "REF-TEST-001",
+                  itemCode: "ITEM-001",
+                  itemName: "Cotton Roll",
+                  unitRate: "pcs",
+                  godown: "Store Room A",
+                  batchNo: "BATCH-001",
+                }),
+              })
             }
           >
-            <Text style={{ color: colors.light.primary, fontWeight: "600" }}>
-              Simulate Scan
-            </Text>
+            <Text style={{ color: colors.light.primary, fontWeight: "600" }}>Simulate Scan</Text>
           </TouchableOpacity>
         </View>
       )}
@@ -196,15 +280,8 @@ export default function ScannerScreen() {
               { backgroundColor: serverUrl ? "rgba(22,163,74,0.8)" : "rgba(220,38,38,0.8)" },
             ]}
           >
-            <View
-              style={[
-                styles.serverDot,
-                { backgroundColor: serverUrl ? "#86efac" : "#fca5a5" },
-              ]}
-            />
-            <Text style={styles.serverBadgeText}>
-              {serverUrl ? "Connected" : "No server"}
-            </Text>
+            <View style={[styles.serverDot, { backgroundColor: serverUrl ? "#86efac" : "#fca5a5" }]} />
+            <Text style={styles.serverBadgeText}>{serverUrl ? "Connected" : "No server"}</Text>
           </View>
         </View>
       </View>
@@ -216,28 +293,14 @@ export default function ScannerScreen() {
           <View style={[styles.corner, styles.cornerTR]} />
           <View style={[styles.corner, styles.cornerBL]} />
           <View style={[styles.corner, styles.cornerBR]} />
-          {!scanned && (
-            <Text style={styles.scanHint}>Align QR code within frame</Text>
-          )}
+          {!scanned && <Text style={styles.scanHint}>Align QR code within frame</Text>}
         </View>
       </View>
 
       {/* Transaction Modal */}
-      <Modal
-        visible={modalVisible}
-        animationType="slide"
-        transparent
-        onRequestClose={resetScanner}
-      >
-        <TouchableOpacity
-          style={styles.modalBackdrop}
-          activeOpacity={1}
-          onPress={resetScanner}
-        />
-        <KeyboardAvoidingView
-          behavior={Platform.OS === "ios" ? "padding" : "height"}
-          style={styles.modalWrapper}
-        >
+      <Modal visible={modalVisible} animationType="slide" transparent onRequestClose={resetScanner}>
+        <TouchableOpacity style={styles.modalBackdrop} activeOpacity={1} onPress={resetScanner} />
+        <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : "height"} style={styles.modalWrapper}>
           <View
             style={[
               styles.sheet,
@@ -250,71 +313,142 @@ export default function ScannerScreen() {
             {feedback ? (
               <View style={styles.feedbackContainer}>
                 <Feather
-                  name={feedback === "success" ? "check-circle" : "wifi-off"}
+                  name={feedback === "success" ? "check-circle" : "alert-triangle"}
                   size={52}
-                  color={
-                    feedback === "success"
-                      ? colors.light.stockIn
-                      : colors.light.pending
-                  }
+                  color={feedback === "success" ? colors.light.stockIn : colors.light.pending}
                 />
                 <Text
                   style={[
                     styles.feedbackText,
                     {
-                      color:
-                        feedback === "success"
-                          ? colors.light.stockIn
-                          : colors.light.pending,
+                      color: feedback === "success" ? colors.light.stockIn : colors.light.pending,
                     },
                   ]}
                 >
                   {feedback === "success"
                     ? "Saved!"
-                    : "Queued — will sync when server available"}
+                    : product
+                    ? "Could not save. Check required fields or server connection."
+                    : "Invalid QR code."}
                 </Text>
               </View>
+            ) : qrError ? (
+              <View style={styles.feedbackContainer}>
+                <Feather name="alert-triangle" size={52} color={colors.light.pending} />
+                <Text style={[styles.feedbackText, { color: colors.light.pending }]}>{qrError}</Text>
+                <TouchableOpacity style={[styles.permissionBtn, { backgroundColor: c.primary }]} onPress={resetScanner}>
+                  <Text style={[styles.permissionBtnText, { color: c.primaryForeground }]}>Scan Again</Text>
+                </TouchableOpacity>
+              </View>
             ) : (
-              <ScrollView
-                showsVerticalScrollIndicator={false}
-                keyboardShouldPersistTaps="handled"
-              >
+              <ScrollView showsVerticalScrollIndicator={false} keyboardShouldPersistTaps="handled">
                 {/* Handle */}
                 <View style={styles.sheetHandle} />
 
-                {/* Product */}
+                {/* Item */}
                 <View style={styles.sheetHeader}>
-                  <View
-                    style={[
-                      styles.productIcon,
-                      { backgroundColor: c.muted },
-                    ]}
-                  >
+                  <View style={[styles.productIcon, { backgroundColor: c.muted }]}>
                     <Feather name="package" size={24} color={c.mutedForeground} />
                   </View>
                   <View style={styles.productInfo}>
-                    <Text style={[styles.productName, { color: c.foreground }]}>
-                      {product?.productName ?? ""}
-                    </Text>
-                    <Text style={[styles.productId, { color: c.mutedForeground }]}>
-                      {product?.productId ?? ""}
-                    </Text>
+                    <Text style={[styles.productName, { color: c.foreground }]}>{product?.itemName ?? ""}</Text>
+                    <Text style={[styles.productId, { color: c.mutedForeground }]}>{product?.itemCode ?? ""}</Text>
                   </View>
                   <TouchableOpacity onPress={resetScanner} style={styles.closeBtn}>
                     <Feather name="x" size={20} color={c.mutedForeground} />
                   </TouchableOpacity>
                 </View>
 
+                {/* QR Details */}
+                <View style={styles.section}>
+                  <Text style={[styles.label, { color: c.mutedForeground }]}>SCANNED DETAILS</Text>
+                  <View style={[styles.detailCard, { backgroundColor: c.background, borderColor: c.border }]}> 
+                    <View style={styles.detailRow}>
+                      <Text style={[styles.detailLabel, { color: c.mutedForeground }]}>Ref No</Text>
+                      <Text style={[styles.detailValue, { color: c.foreground }]}>{product?.refNo || "—"}</Text>
+                    </View>
+                    <View style={styles.detailRow}>
+                      <Text style={[styles.detailLabel, { color: c.mutedForeground }]}>Unit Rate</Text>
+                      <Text style={[styles.detailValue, { color: c.foreground }]}>{product?.unitRate || "—"}</Text>
+                    </View>
+                    <View style={styles.detailRow}>
+                      <Text style={[styles.detailLabel, { color: c.mutedForeground }]}>Godown</Text>
+                      <Text style={[styles.detailValue, { color: c.foreground }]}>{product?.godown || "—"}</Text>
+                    </View>
+                    <View style={styles.detailRow}>
+                      <Text style={[styles.detailLabel, { color: c.mutedForeground }]}>Batch No</Text>
+                      <Text style={[styles.detailValue, { color: c.foreground }]}>{product?.batchNo || "—"}</Text>
+                    </View>
+                  </View>
+
+                  {missingQrFields.length > 0 && (
+                    <Text style={[styles.errorText, { color: colors.light.stockOut }]}>Missing from QR: {missingQrFields.join(", ")}</Text>
+                  )}
+                </View>
+
+                {/* Movement Type */}
+                <View style={styles.section}>
+                  <Text style={[styles.label, { color: c.mutedForeground }]}>MOVEMENT TYPE</Text>
+                  <View style={styles.actionRow}>
+                    {(["Restock", "Use", "Adjustment"] as MovementType[]).map((type) => {
+                      const selected = movementType === type;
+                      const movementColor = getMovementColor(type);
+
+                      return (
+                        <TouchableOpacity
+                          key={type}
+                          style={[
+                            styles.choiceBtn,
+                            {
+                              backgroundColor: selected ? movementColor : c.background,
+                              borderColor: selected ? movementColor : c.border,
+                            },
+                          ]}
+                          onPress={() => setMovementType(type)}
+                        >
+                          <Text style={[styles.choiceBtnText, { color: selected ? "#fff" : c.foreground }]}>{type}</Text>
+                        </TouchableOpacity>
+                      );
+                    })}
+                  </View>
+                </View>
+
+                {/* Adjustment Direction */}
+                {movementType === "Adjustment" && (
+                  <View style={styles.section}>
+                    <Text style={[styles.label, { color: c.mutedForeground }]}>ADJUSTMENT DIRECTION</Text>
+                    <View style={styles.actionRow}>
+                      {(["in", "out"] as AdjustmentDirection[]).map((direction) => {
+                        const selected = adjustmentDirection === direction;
+                        const label = direction === "in" ? "In" : "Out";
+                        const icon = direction === "in" ? "plus-circle" : "minus-circle";
+
+                        return (
+                          <TouchableOpacity
+                            key={direction}
+                            style={[
+                              styles.choiceBtn,
+                              {
+                                backgroundColor: selected ? colors.light.primary : c.background,
+                                borderColor: selected ? colors.light.primary : c.border,
+                              },
+                            ]}
+                            onPress={() => setAdjustmentDirection(direction)}
+                          >
+                            <Feather name={icon} size={17} color={selected ? "#fff" : c.foreground} />
+                            <Text style={[styles.choiceBtnText, { color: selected ? "#fff" : c.foreground }]}>{label}</Text>
+                          </TouchableOpacity>
+                        );
+                      })}
+                    </View>
+                  </View>
+                )}
+
                 {/* Quantity stepper */}
                 <View style={styles.section}>
-                  <Text style={[styles.label, { color: c.mutedForeground }]}>
-                    QUANTITY
-                  </Text>
+                  <Text style={[styles.label, { color: c.mutedForeground }]}>QUANTITY</Text>
                   <View style={styles.stepper}>
-                    <TouchableOpacity
-                      style={[styles.stepBtn, { backgroundColor: c.muted }]}
-                      onPress={() => adjustQuantity(-1)}
-                    >
+                    <TouchableOpacity style={[styles.stepBtn, { backgroundColor: c.muted }]} onPress={() => adjustQuantity(-1)}>
                       <Feather name="minus" size={20} color={c.foreground} />
                     </TouchableOpacity>
                     <TextInput
@@ -322,7 +456,7 @@ export default function ScannerScreen() {
                         styles.quantityInput,
                         {
                           color: c.foreground,
-                          borderColor: c.border,
+                          borderColor: quantityIsValid ? c.border : colors.light.stockOut,
                           backgroundColor: c.background,
                         },
                       ]}
@@ -333,75 +467,54 @@ export default function ScannerScreen() {
                       keyboardType="decimal-pad"
                       selectTextOnFocus
                     />
-                    <TouchableOpacity
-                      style={[styles.stepBtn, { backgroundColor: c.muted }]}
-                      onPress={() => adjustQuantity(1)}
-                    >
+                    <TouchableOpacity style={[styles.stepBtn, { backgroundColor: c.muted }]} onPress={() => adjustQuantity(1)}>
                       <Feather name="plus" size={20} color={c.foreground} />
                     </TouchableOpacity>
                   </View>
                 </View>
 
-                {/* Note */}
+                {/* Used In */}
                 <View style={styles.section}>
-                  <Text style={[styles.label, { color: c.mutedForeground }]}>
-                    NOTE (OPTIONAL)
-                  </Text>
+                  <Text style={[styles.label, { color: c.mutedForeground }]}>USED IN *</Text>
                   <TextInput
                     style={[
                       styles.noteInput,
                       {
                         color: c.foreground,
-                        borderColor: c.border,
+                        borderColor: usedIn.trim() ? c.border : colors.light.stockOut,
                         backgroundColor: c.background,
                       },
                     ]}
-                    value={note}
-                    onChangeText={setNote}
-                    placeholder="Add a note..."
+                    value={usedIn}
+                    onChangeText={setUsedIn}
+                    placeholder="Required, e.g. Job No / Department / Machine"
                     placeholderTextColor={c.mutedForeground}
                     multiline
                     maxLength={120}
                   />
+                  {!usedIn.trim() && <Text style={[styles.errorText, { color: colors.light.stockOut }]}>Used In is required.</Text>}
                 </View>
 
-                {/* Action buttons */}
-                <View style={styles.actionRow}>
-                  <TouchableOpacity
-                    style={[
-                      styles.actionBtn,
-                      { backgroundColor: colors.light.stockOut },
-                    ]}
-                    onPress={() => submitTransaction("stock_out")}
-                    disabled={isSubmitting}
-                  >
-                    {isSubmitting ? (
-                      <ActivityIndicator color="#fff" />
-                    ) : (
-                      <>
-                        <Feather name="minus-circle" size={20} color="#fff" />
-                        <Text style={styles.actionBtnText}>Stock Out</Text>
-                      </>
-                    )}
-                  </TouchableOpacity>
-                  <TouchableOpacity
-                    style={[
-                      styles.actionBtn,
-                      { backgroundColor: colors.light.stockIn },
-                    ]}
-                    onPress={() => submitTransaction("stock_in")}
-                    disabled={isSubmitting}
-                  >
-                    {isSubmitting ? (
-                      <ActivityIndicator color="#fff" />
-                    ) : (
-                      <>
-                        <Feather name="plus-circle" size={20} color="#fff" />
-                        <Text style={styles.actionBtnText}>Stock In</Text>
-                      </>
-                    )}
-                  </TouchableOpacity>
-                </View>
+                {/* Save button */}
+                <TouchableOpacity
+                  style={[
+                    styles.submitBtn,
+                    {
+                      backgroundColor: canSubmit ? getMovementColor(movementType) : c.muted,
+                    },
+                  ]}
+                  onPress={submitTransaction}
+                  disabled={!canSubmit}
+                >
+                  {isSubmitting ? (
+                    <ActivityIndicator color="#fff" />
+                  ) : (
+                    <>
+                      <Feather name="check" size={20} color="#fff" />
+                      <Text style={styles.actionBtnText}>Save Movement</Text>
+                    </>
+                  )}
+                </TouchableOpacity>
               </ScrollView>
             )}
           </View>
@@ -508,6 +621,7 @@ const styles = StyleSheet.create({
     shadowRadius: 12,
     elevation: 20,
     minHeight: 320,
+    maxHeight: "92%",
   },
   sheetHandle: {
     width: 36,
@@ -545,6 +659,32 @@ const styles = StyleSheet.create({
     letterSpacing: 0.8,
     marginBottom: 8,
   },
+  detailCard: {
+    borderWidth: 1,
+    borderRadius: 12,
+    padding: 12,
+    gap: 8,
+  },
+  detailRow: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    gap: 12,
+  },
+  detailLabel: {
+    fontSize: 12,
+    fontFamily: "Inter_500Medium",
+  },
+  detailValue: {
+    flex: 1,
+    textAlign: "right",
+    fontSize: 12,
+    fontFamily: "Inter_600SemiBold",
+  },
+  errorText: {
+    fontSize: 12,
+    fontFamily: "Inter_500Medium",
+    marginTop: 8,
+  },
   stepper: {
     flexDirection: "row",
     alignItems: "center",
@@ -580,14 +720,29 @@ const styles = StyleSheet.create({
     gap: 12,
     marginBottom: 8,
   },
-  actionBtn: {
+  choiceBtn: {
     flex: 1,
+    minHeight: 48,
+    borderRadius: 14,
+    borderWidth: 1,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 6,
+    paddingHorizontal: 8,
+  },
+  choiceBtnText: {
+    fontSize: 14,
+    fontFamily: "Inter_600SemiBold",
+  },
+  submitBtn: {
     height: 52,
     borderRadius: 14,
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "center",
     gap: 8,
+    marginBottom: 8,
   },
   actionBtnText: {
     color: "#fff",

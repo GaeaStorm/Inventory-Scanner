@@ -7,20 +7,32 @@ import React, {
   useCallback,
 } from "react";
 import AsyncStorage from "@react-native-async-storage/async-storage";
-import { setBaseUrl } from "@workspace/api-client-react";
+// import { setBaseUrl } from "@workspace/api-client-react";
 
 const STORAGE_KEYS = {
   SERVER_URL: "@stockscanner/serverUrl",
   TRANSACTIONS: "@stockscanner/transactions",
 };
 
+export type MovementType = "Restock" | "Use" | "Adjustment";
+export type AdjustmentDirection = "in" | "out";
+
 export interface LocalTransaction {
   id: string;
-  productId: string;
-  productName: string;
+
+  refNo: string;
+  itemCode: string;
+  itemName: string;
+  unitRate: string;
+  godown: string;
+  batchNo: string;
+
+  movementType: MovementType;
+  adjustmentDirection?: AdjustmentDirection;
+
   quantity: number;
-  type: "stock_in" | "stock_out";
-  note?: string;
+  usedIn: string;
+
   timestamp: string;
   synced: boolean;
   syncError?: string;
@@ -58,7 +70,7 @@ export function SyncProvider({ children }: { children: React.ReactNode }) {
       const storedTxns = await AsyncStorage.getItem(STORAGE_KEYS.TRANSACTIONS);
       if (storedUrl) {
         setServerUrlState(storedUrl);
-        setBaseUrl(storedUrl);
+        // setBaseUrl(storedUrl);
       }
       if (storedTxns) {
         try {
@@ -81,24 +93,44 @@ export function SyncProvider({ children }: { children: React.ReactNode }) {
 
   const postTransaction = useCallback(
     async (tx: LocalTransaction, url: string): Promise<boolean> => {
-      if (!url) return false;
+      if (!url) {
+        console.log("No server URL saved; cannot sync transaction");
+        return false;
+      }
+  
+      const baseUrl = url.endsWith("/") ? url.slice(0, -1) : url;
+      const endpoint = `${baseUrl}/api/transactions`;
+  
+      const payload = {
+        refNo: tx.refNo,
+        movementType: tx.movementType,
+        itemCode: tx.itemCode,
+        itemName: tx.itemName,
+        quantity: tx.quantity,
+        unitRate: tx.unitRate,
+        godown: tx.godown,
+        batchNo: tx.batchNo,
+        usedIn: tx.usedIn,
+        adjustmentDirection: tx.adjustmentDirection,
+        timestamp: tx.timestamp,
+      };
+  
+      console.log("Posting transaction to:", endpoint);
+      console.log("Transaction payload:", payload);
+  
       try {
-        const baseUrl = url.endsWith("/") ? url.slice(0, -1) : url;
-        const resp = await fetch(`${baseUrl}/api/transactions`, {
+        const resp = await fetch(endpoint, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            productId: tx.productId,
-            productName: tx.productName,
-            quantity: tx.quantity,
-            type: tx.type,
-            note: tx.note,
-            timestamp: tx.timestamp,
-          }),
-          signal: AbortSignal.timeout(8000),
+          body: JSON.stringify(payload),
         });
+  
+        const text = await resp.text();
+        console.log("Transaction response:", resp.status, text);
+  
         return resp.ok;
-      } catch {
+      } catch (error) {
+        console.log("Transaction post failed:", endpoint, error);
         return false;
       }
     },
@@ -136,17 +168,32 @@ export function SyncProvider({ children }: { children: React.ReactNode }) {
   );
 
   const syncPending = useCallback(async () => {
-    if (!serverUrl) return;
+    console.log("syncPending called");
+    console.log("Current serverUrl:", serverUrl);
+    console.log("Total transactions:", transactions.length);
+  
+    if (!serverUrl) {
+      console.log("syncPending stopped: no serverUrl");
+      return;
+    }
+  
     const pending = transactions.filter((t) => !t.synced);
-    if (pending.length === 0) return;
-
+    console.log("Pending transactions:", pending.length);
+  
+    if (pending.length === 0) {
+      console.log("syncPending stopped: no pending transactions");
+      return;
+    }
+  
     const results = await Promise.all(
       pending.map(async (tx) => ({
         id: tx.id,
         ok: await postTransaction(tx, serverUrl),
       }))
     );
-
+  
+    console.log("Sync results:", results);
+  
     const updated = transactions.map((tx) => {
       const result = results.find((r) => r.id === tx.id);
       if (result) {
@@ -158,30 +205,38 @@ export function SyncProvider({ children }: { children: React.ReactNode }) {
       }
       return tx;
     });
-
+  
     await saveTransactions(updated);
+  
     const anyOk = results.some((r) => r.ok);
     setLastSyncResult(anyOk ? "success" : "error");
   }, [transactions, serverUrl, saveTransactions, postTransaction]);
 
   const testConnection = useCallback(async (): Promise<boolean> => {
-    if (!serverUrl) return false;
+    if (!serverUrl) {
+      console.log("No server URL saved");
+      return false;
+    }
+  
+    const baseUrl = serverUrl.endsWith("/") ? serverUrl.slice(0, -1) : serverUrl;
+    const healthUrl = `${baseUrl}/api/healthz`;
+  
+    console.log("Testing health URL:", healthUrl);
+  
     try {
-      const baseUrl = serverUrl.endsWith("/")
-        ? serverUrl.slice(0, -1)
-        : serverUrl;
-      const resp = await fetch(`${baseUrl}/api/healthz`, {
-        signal: AbortSignal.timeout(5000),
-      });
+      const resp = await fetch(healthUrl);
+  
+      console.log("Health response status:", resp.status);
       return resp.ok;
-    } catch {
+    } catch (error) {
+      console.log("Health check failed:", healthUrl, error);
       return false;
     }
   }, [serverUrl]);
 
   const setServerUrl = useCallback(async (url: string) => {
     setServerUrlState(url);
-    setBaseUrl(url);
+    // setBaseUrl(url);
     await AsyncStorage.setItem(STORAGE_KEYS.SERVER_URL, url);
   }, []);
 

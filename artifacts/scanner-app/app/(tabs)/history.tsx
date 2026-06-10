@@ -18,18 +18,28 @@ import colors from "@/constants/colors";
 
 function TransactionItem({ item }: { item: LocalTransaction }) {
   const c = useColors();
-  const isIn = item.type === "stock_in";
-  const abs = Math.abs(item.quantity);
+
+  const isIn =
+    item.movementType === "Restock" ||
+    (item.movementType === "Adjustment" && item.adjustmentDirection !== "out");
+
+  const absQty = Math.abs(item.quantity);
   const date = new Date(item.timestamp);
 
   const dateStr = date.toLocaleDateString(undefined, {
     day: "2-digit",
     month: "short",
   });
+
   const timeStr = date.toLocaleTimeString(undefined, {
     hour: "2-digit",
     minute: "2-digit",
   });
+
+  const movementLabel =
+    item.movementType === "Adjustment"
+      ? `Adjustment ${item.adjustmentDirection === "out" ? "Out" : "In"}`
+      : item.movementType;
 
   return (
     <View style={[styles.item, { backgroundColor: c.card, borderColor: c.border }]}>
@@ -52,18 +62,27 @@ function TransactionItem({ item }: { item: LocalTransaction }) {
 
       <View style={styles.itemContent}>
         <Text style={[styles.itemName, { color: c.foreground }]} numberOfLines={1}>
-          {item.productName}
+          {item.itemName}
         </Text>
+
         <View style={styles.itemMeta}>
-          <Text style={[styles.itemId, { color: c.mutedForeground }]}>
-            {item.productId}
+          <Text style={[styles.itemId, { color: c.mutedForeground }]} numberOfLines={1}>
+            {item.itemCode}
           </Text>
-          {item.note ? (
-            <Text style={[styles.itemNote, { color: c.mutedForeground }]} numberOfLines={1}>
-              · {item.note}
-            </Text>
-          ) : null}
+          <Text style={[styles.itemNote, { color: c.mutedForeground }]} numberOfLines={1}>
+            · {movementLabel}
+          </Text>
         </View>
+
+        <View style={styles.itemMeta}>
+          <Text style={[styles.itemId, { color: c.mutedForeground }]} numberOfLines={1}>
+            Ref: {item.refNo}
+          </Text>
+          <Text style={[styles.itemNote, { color: c.mutedForeground }]} numberOfLines={1}>
+            · Used In: {item.usedIn}
+          </Text>
+        </View>
+
         <Text style={[styles.itemTime, { color: c.mutedForeground }]}>
           {dateStr} · {timeStr}
         </Text>
@@ -78,9 +97,10 @@ function TransactionItem({ item }: { item: LocalTransaction }) {
             },
           ]}
         >
-          {isIn ? "+" : ""}
-          {item.quantity}
+          {isIn ? "+" : "-"}
+          {absQty}
         </Text>
+
         <View style={styles.syncStatus}>
           {item.synced ? (
             <Feather name="check-circle" size={13} color={colors.light.stockIn} />
@@ -91,9 +111,7 @@ function TransactionItem({ item }: { item: LocalTransaction }) {
             style={[
               styles.syncText,
               {
-                color: item.synced
-                  ? colors.light.stockIn
-                  : colors.light.pending,
+                color: item.synced ? colors.light.stockIn : colors.light.pending,
               },
             ]}
           >
@@ -146,6 +164,7 @@ export default function HistoryScreen() {
         ]}
       >
         <Text style={[styles.headerTitle, { color: c.foreground }]}>History</Text>
+
         <View style={styles.headerRight}>
           {pendingCount > 0 && (
             <TouchableOpacity
@@ -158,6 +177,7 @@ export default function HistoryScreen() {
               </Text>
             </TouchableOpacity>
           )}
+
           {transactions.length > 0 && (
             <TouchableOpacity onPress={handleClear} style={styles.clearBtn}>
               <Feather name="trash-2" size={18} color={c.mutedForeground} />
