@@ -1,17 +1,30 @@
 {
-  "name": "workspace",
-  "version": "0.0.0",
+  "name": "inventory-scanner",
+  "version": "0.1.0",
+  "private": true,
   "license": "MIT",
+  "engines": {
+    "node": ">=20.19.0 <25",
+    "pnpm": ">=10 <12"
+  },
+  "devEngines": {
+    "packageManager": {
+      "name": "pnpm",
+      "version": "11.5.2",
+      "onFail": "warn"
+    }
+  },
   "scripts": {
-    "preinstall": "node -e \"const fs=require('fs'); for (const f of ['package-lock.json','yarn.lock']) { try { fs.rmSync(f,{force:true}); } catch {} } const ua=process.env.npm_config_user_agent||''; if (!ua.startsWith('pnpm/')) { console.error('Use pnpm instead'); process.exit(1); }\"",
     "build": "pnpm run typecheck && pnpm -r --if-present run build",
     "typecheck:libs": "tsc --build",
-    "typecheck": "pnpm run typecheck:libs && pnpm -r --filter \"./artifacts/**\" --filter \"./scripts\" --if-present run typecheck"
+    "typecheck": "pnpm run typecheck:libs && pnpm -r --filter \"./artifacts/**\" --filter \"./scripts\" --if-present run typecheck",
+
+    "dev:server": "pnpm --filter @workspace/api-server run dev",
+    "dev:app": "pnpm --filter @workspace/scanner-app run dev",
+    "dev:mockup": "pnpm --filter @workspace/mockup-sandbox run dev"
   },
-  "private": true,
   "devDependencies": {
     "prettier": "^3.8.3",
     "typescript": "~5.9.3"
-  },
-  "packageManager": "pnpm@11.5.2+sha512.71c631e382066efc25625d5cf029075de07b61b37f6e27350fbd84b1bda5864c8c1967adc280776b45c30a715c0359a3be08fef42d5bb09e2b99029979692916"
+  }
 }

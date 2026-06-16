@@ -1,49 +1,130 @@
-# See https://docs.github.com/en/get-started/getting-started-with-git/ignoring-files for more about ignoring files.
+# -------------------------------------------------------------------
+# Dependencies and package-manager state
+# -------------------------------------------------------------------
+node_modules/
+.pnpm-store/
+.pnp.*
+package-lock.json
+npm-shrinkwrap.json
+yarn.lock
+pnpm-debug.log*
 
-# compiled output
-dist
-tmp
-out-tsc
+# pnpm-lock.yaml MUST be committed.
+
+# -------------------------------------------------------------------
+# Build output
+# -------------------------------------------------------------------
+dist/
+build/
+out/
+out-tsc/
+web-build/
+tmp/
+temp/
 *.tsbuildinfo
-.expo
-.expo-shared
 
-# dependencies
-node_modules
+# Native build artifacts
+*.apk
+*.aab
+*.ipa
+*.xcarchive
 
-# IDEs and editors
-/.idea
-.project
-.classpath
-.c9/
-*.launch
-.settings/
-*.sublime-workspace
+# -------------------------------------------------------------------
+# Tests and tooling
+# -------------------------------------------------------------------
+coverage/
+.nyc_output/
+.eslintcache
+.stylelintcache
+.vite/
+.turbo/
 
-# IDE - VSCode
+# -------------------------------------------------------------------
+# Expo and Metro local state
+# -------------------------------------------------------------------
+.expo/
+.expo-shared/
+.metro-health-check*
+expo-env.d.ts
+
+# Generated native projects.
+# Remove these rules if you intentionally maintain custom native code.
+artifacts/scanner-app/android/
+artifacts/scanner-app/ios/
+artifacts/scanner-app/.kotlin/
+artifacts/scanner-app/.gradle/
+
+# -------------------------------------------------------------------
+# Environment-specific configuration and secrets
+# -------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+!.env.*.example
+
+.npmrc.local
+
+# Signing certificates and private keys
+*.jks
+*.keystore
+*.p8
+*.p12
+*.mobileprovision
+*.pem
+*.key
+
+# -------------------------------------------------------------------
+# Runtime application data
+# -------------------------------------------------------------------
+stock_transactions.xlsx
+stock_transactions-*.xlsx
+~$*.xlsx
+
+# -------------------------------------------------------------------
+# Logs and crash reports
+# -------------------------------------------------------------------
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+lerna-debug.log*
+
+# -------------------------------------------------------------------
+# Editors
+# -------------------------------------------------------------------
+.idea/
 .vscode/*
 !.vscode/settings.json
+!.vscode/extensions.json
 !.vscode/tasks.json
 !.vscode/launch.json
-!.vscode/extensions.json
 
-# misc
-/.sass-cache
-/connect.lock
-/coverage
-/libpeerconnection.log
-npm-debug.log
-yarn-error.log
-testem.log
-/typings
+*.sublime-workspace
+*.sublime-project
+*.swp
+*.swo
+*~
 
-# System Files
+# Local editor and AI-tool state
+.cursor/
+.agents/
+
+# -------------------------------------------------------------------
+# Operating-system files
+# -------------------------------------------------------------------
 .DS_Store
+.AppleDouble
+.LSOverride
+._*
 Thumbs.db
+Desktop.ini
 
-.cursor/rules/nx-rules.mdc
-.github/instructions/nx.instructions.md
-
-# Replit
+# -------------------------------------------------------------------
+# Obsolete Replit-specific local state
+# -------------------------------------------------------------------
+.replit
+.replitignore
+replit.md
 .cache/
 .local/

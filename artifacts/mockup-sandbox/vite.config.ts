@@ -1,71 +1,76 @@
-import { defineConfig } from "vite";
-import react from "@vitejs/plugin-react";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
 import tailwindcss from "@tailwindcss/vite";
-import path from "path";
-import runtimeErrorOverlay from "@replit/vite-plugin-runtime-error-modal";
+import react from "@vitejs/plugin-react";
+import { defineConfig, loadEnv } from "vite";
+
 import { mockupPreviewPlugin } from "./mockupPreviewPlugin";
 
-const rawPort = process.env.PORT;
+const projectRoot = fileURLToPath(new URL(".", import.meta.url));
 
-if (!rawPort) {
-  throw new Error(
-    "PORT environment variable is required but was not provided.",
-  );
+function parsePort(value: string | undefined, fallback: number): number {
+  if (!value) {
+    return fallback;
+  }
+
+  const port = Number(value);
+
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new Error(`Invalid PORT value: "${value}"`);
+  }
+
+  return port;
 }
 
-const port = Number(rawPort);
+function normalizeBasePath(value: string | undefined): string {
+  const trimmed = value?.trim();
 
-if (Number.isNaN(port) || port <= 0) {
-  throw new Error(`Invalid PORT value: "${rawPort}"`);
+  if (!trimmed || trimmed === "/") {
+    return "/";
+  }
+
+  return `/${trimmed.replace(/^\/+|\/+$/g, "")}/`;
 }
 
-const basePath = process.env.BASE_PATH;
+export default defineConfig(({ mode }) => {
+  const env = loadEnv(mode, projectRoot, "");
 
-if (!basePath) {
-  throw new Error(
-    "BASE_PATH environment variable is required but was not provided.",
-  );
-}
+  const port = parsePort(env.PORT, 5173);
+  const base = normalizeBasePath(env.BASE_PATH);
 
-export default defineConfig({
-  base: basePath,
-  plugins: [
-    mockupPreviewPlugin(),
-    react(),
-    tailwindcss(),
-    runtimeErrorOverlay(),
-    ...(process.env.NODE_ENV !== "production" &&
-    process.env.REPL_ID !== undefined
-      ? [
-          await import("@replit/vite-plugin-cartographer").then((m) =>
-            m.cartographer({
-              root: path.resolve(import.meta.dirname, ".."),
-            }),
-          ),
-        ]
-      : []),
-  ],
-  resolve: {
-    alias: {
-      "@": path.resolve(import.meta.dirname, "src"),
+  return {
+    root: projectRoot,
+    base,
+
+    plugins: [
+      mockupPreviewPlugin(),
+      react(),
+      tailwindcss(),
+    ],
+
+    resolve: {
+      alias: {
+        "@": path.resolve(projectRoot, "src"),
+      },
     },
-  },
-  root: path.resolve(import.meta.dirname),
-  build: {
-    outDir: path.resolve(import.meta.dirname, "dist"),
-    emptyOutDir: true,
-  },
-  server: {
-    port,
-    host: "0.0.0.0",
-    allowedHosts: true,
-    fs: {
-      strict: true,
+
+    build: {
+      outDir: path.resolve(projectRoot, "dist"),
+      emptyOutDir: true,
     },
-  },
-  preview: {
-    port,
-    host: "0.0.0.0",
-    allowedHosts: true,
-  },
+
+    server: {
+      host: true,
+      port,
+      fs: {
+        strict: true,
+      },
+    },
+
+    preview: {
+      host: true,
+      port,
+    },
+  };
 });

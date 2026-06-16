@@ -4,12 +4,40 @@ import path from "path";
 import fs from "fs";
 import { z } from "zod";
 import { logger } from "../lib/logger";
+import os from "node:os";
 
 const router = Router();
 
-export const EXCEL_PATH =
-  process.env["EXCEL_PATH"] ||
-  path.resolve(process.cwd(), "stock_transactions.xlsx");
+function getDefaultDataDirectory(): string {
+  const override = process.env["INVENTORY_DATA_DIR"];
+
+  if (override) {
+    return path.resolve(override);
+  }
+
+  if (process.platform === "win32" && process.env["APPDATA"]) {
+    return path.join(process.env["APPDATA"], "Inventory Scanner");
+  }
+
+  if (process.platform === "darwin") {
+    return path.join(
+      os.homedir(),
+      "Library",
+      "Application Support",
+      "Inventory Scanner",
+    );
+  }
+
+  return path.join(
+    process.env["XDG_DATA_HOME"] ??
+      path.join(os.homedir(), ".local", "share"),
+    "inventory-scanner",
+  );
+}
+
+export const EXCEL_PATH = process.env["EXCEL_PATH"]
+  ? path.resolve(process.env["EXCEL_PATH"])
+  : path.join(getDefaultDataDirectory(), "stock_transactions.xlsx");
 
 type MovementType = "Restock" | "Use" | "Adjustment";
 type AdjustmentDirection = "in" | "out";
@@ -113,6 +141,10 @@ function getInOutQty(tx: StoredTransaction): {
 }
 
 function appendToExcel(tx: StoredTransaction): void {
+  fs.mkdirSync(path.dirname(EXCEL_PATH), {
+  recursive: true,
+  });
+
   try {
     let wb: XLSX.WorkBook;
 
