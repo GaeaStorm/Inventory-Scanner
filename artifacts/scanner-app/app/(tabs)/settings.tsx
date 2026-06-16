@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import React, { useEffect, useState } from "react";
 import {
   View,
   Text,
@@ -17,6 +17,7 @@ import * as Haptics from "expo-haptics";
 import { useColors } from "@/hooks/useColors";
 import { useSync } from "@/context/SyncContext";
 import colors from "@/constants/colors";
+import ServerQrScanner from "@/components/ServerQrScanner";
 
 function Section({
   title,
@@ -31,7 +32,12 @@ function Section({
       <Text style={[styles.sectionTitle, { color: c.mutedForeground }]}>
         {title}
       </Text>
-      <View style={[styles.sectionContent, { backgroundColor: c.card, borderColor: c.border }]}>
+      <View
+        style={[
+          styles.sectionContent,
+          { backgroundColor: c.card, borderColor: c.border },
+        ]}
+      >
         {children}
       </View>
     </View>
@@ -52,7 +58,12 @@ function Row({
   const c = useColors();
   return (
     <View style={[styles.row, { borderBottomColor: c.border }]}>
-      <Feather name={icon as any} size={16} color={c.mutedForeground} style={styles.rowIcon} />
+      <Feather
+        name={icon as any}
+        size={16}
+        color={c.mutedForeground}
+        style={styles.rowIcon}
+      />
       <Text style={[styles.rowLabel, { color: c.foreground }]}>{label}</Text>
       {value !== undefined && (
         <Text style={[styles.rowValue, { color: accent ?? c.mutedForeground }]}>
@@ -66,13 +77,24 @@ function Row({
 export default function SettingsScreen() {
   const c = useColors();
   const insets = useSafeAreaInsets();
-  const { serverUrl, setServerUrl, pendingCount, syncPending, transactions, testConnection } =
-    useSync();
+  const {
+    serverUrl,
+    setServerUrl,
+    pendingCount,
+    syncPending,
+    transactions,
+    testConnection,
+  } = useSync();
 
   const [urlDraft, setUrlDraft] = useState(serverUrl);
   const [isSaving, setIsSaving] = useState(false);
   const [isTesting, setIsTesting] = useState(false);
   const [testResult, setTestResult] = useState<"ok" | "fail" | null>(null);
+  const [isQrScannerOpen, setIsQrScannerOpen] = useState(false);
+
+  useEffect(() => {
+    setUrlDraft(serverUrl);
+  }, [serverUrl]);
 
   const handleSave = async () => {
     const trimmed = urlDraft.trim().replace(/\/$/, "");
@@ -85,18 +107,43 @@ export default function SettingsScreen() {
     setUrlDraft(trimmed);
     setIsSaving(false);
     setTestResult(null);
-    if (Platform.OS !== "web") Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+    if (Platform.OS !== "web")
+      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
   };
 
   const handleTest = async () => {
     setIsTesting(true);
     setTestResult(null);
-    const ok = await testConnection();
+    const ok = await testConnection(urlDraft);
     setTestResult(ok ? "ok" : "fail");
     setIsTesting(false);
-    if (Platform.OS !== "web") {
-      if (ok) Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+    if (Platform.OS !== "web" && ok) {
+      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
     }
+  };
+
+  const handleQrServerUrl = async (url: string) => {
+    setUrlDraft(url);
+    setTestResult(null);
+    setIsSaving(true);
+
+    await setServerUrl(url);
+    const ok = await testConnection(url);
+
+    setTestResult(ok ? "ok" : "fail");
+    setIsSaving(false);
+    setIsQrScannerOpen(false);
+
+    if (Platform.OS !== "web" && ok) {
+      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+    }
+
+    Alert.alert(
+      ok ? "Connected" : "Address saved",
+      ok
+        ? `Inventory Scanner is connected to ${url}.`
+        : `The address ${url} was saved, but the server could not be reached. Check that both devices are on the same network.`,
+    );
   };
 
   const handleSync = async () => {
@@ -105,7 +152,8 @@ export default function SettingsScreen() {
       return;
     }
     await syncPending();
-    if (Platform.OS !== "web") Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+    if (Platform.OS !== "web")
+      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
   };
 
   const syncedCount = transactions.filter((t) => t.synced).length;
@@ -124,10 +172,21 @@ export default function SettingsScreen() {
     >
       <Text style={[styles.title, { color: c.foreground }]}>Settings</Text>
 
+      <ServerQrScanner
+        visible={isQrScannerOpen}
+        onCancel={() => setIsQrScannerOpen(false)}
+        onServerUrl={handleQrServerUrl}
+      />
+
       {/* Server URL */}
       <Section title="SERVER CONNECTION">
         <View style={styles.urlInputWrapper}>
-          <Feather name="server" size={16} color={c.mutedForeground} style={styles.urlIcon} />
+          <Feather
+            name="server"
+            size={16}
+            color={c.mutedForeground}
+            style={styles.urlIcon}
+          />
           <TextInput
             style={[styles.urlInput, { color: c.foreground }]}
             value={urlDraft}
@@ -150,14 +209,21 @@ export default function SettingsScreen() {
           )}
         </View>
 
+        <TouchableOpacity
+          style={[styles.qrButton, { backgroundColor: c.muted }]}
+          onPress={() => setIsQrScannerOpen(true)}
+        >
+          <Feather name="camera" size={16} color={c.primary} />
+          <Text style={[styles.qrButtonText, { color: c.foreground }]}>
+            Scan setup QR
+          </Text>
+        </TouchableOpacity>
+
         <View style={[styles.divider, { backgroundColor: c.border }]} />
 
         <View style={styles.btnRow}>
           <TouchableOpacity
-            style={[
-              styles.btn,
-              { backgroundColor: c.muted, flex: 1 },
-            ]}
+            style={[styles.btn, { backgroundColor: c.muted, flex: 1 }]}
             onPress={handleTest}
             disabled={isTesting || !urlDraft.trim()}
           >
@@ -170,16 +236,16 @@ export default function SettingsScreen() {
                     testResult === "ok"
                       ? "check-circle"
                       : testResult === "fail"
-                      ? "x-circle"
-                      : "wifi"
+                        ? "x-circle"
+                        : "wifi"
                   }
                   size={15}
                   color={
                     testResult === "ok"
                       ? colors.light.stockIn
                       : testResult === "fail"
-                      ? colors.light.stockOut
-                      : c.mutedForeground
+                        ? colors.light.stockOut
+                        : c.mutedForeground
                   }
                 />
                 <Text
@@ -190,16 +256,16 @@ export default function SettingsScreen() {
                         testResult === "ok"
                           ? colors.light.stockIn
                           : testResult === "fail"
-                          ? colors.light.stockOut
-                          : c.mutedForeground,
+                            ? colors.light.stockOut
+                            : c.mutedForeground,
                     },
                   ]}
                 >
                   {testResult === "ok"
                     ? "Connected"
                     : testResult === "fail"
-                    ? "Failed"
-                    : "Test"}
+                      ? "Failed"
+                      : "Test"}
                 </Text>
               </>
             )}
@@ -256,13 +322,37 @@ export default function SettingsScreen() {
         <View style={styles.instructionsList}>
           {[
             { icon: "monitor", text: "Run the server on your laptop" },
-            { icon: "wifi", text: "Ensure phone and laptop are on the same Wi-Fi network" },
-            { icon: "info", text: 'Enter your laptop\'s local IP (e.g. http://192.168.1.10:5000)' },
-            { icon: "file-text", text: "Transactions are saved to stock_transactions.xlsx on your laptop" },
+            {
+              icon: "wifi",
+              text: "Ensure phone and laptop are on the same Wi-Fi network",
+            },
+            {
+              icon: "info",
+              text: "Scan the setup QR shown in the laptop dashboard",
+            },
+            {
+              icon: "file-text",
+              text: "Transactions are saved to stock_transactions.xlsx on your laptop",
+            },
           ].map((item, i) => (
-            <View key={i} style={[styles.instructionRow, { borderBottomColor: c.border, borderBottomWidth: i < 3 ? StyleSheet.hairlineWidth : 0 }]}>
-              <View style={[styles.instructionIcon, { backgroundColor: c.muted }]}>
-                <Feather name={item.icon as any} size={14} color={c.mutedForeground} />
+            <View
+              key={i}
+              style={[
+                styles.instructionRow,
+                {
+                  borderBottomColor: c.border,
+                  borderBottomWidth: i < 3 ? StyleSheet.hairlineWidth : 0,
+                },
+              ]}
+            >
+              <View
+                style={[styles.instructionIcon, { backgroundColor: c.muted }]}
+              >
+                <Feather
+                  name={item.icon as any}
+                  size={14}
+                  color={c.mutedForeground}
+                />
               </View>
               <Text style={[styles.instructionText, { color: c.foreground }]}>
                 {item.text}
@@ -274,8 +364,18 @@ export default function SettingsScreen() {
 
       {/* Sync status */}
       <Section title="SYNC STATUS">
-        <Row icon="check-circle" label="Synced" value={`${syncedCount}`} accent={colors.light.stockIn} />
-        <Row icon="clock" label="Pending" value={`${pendingCount}`} accent={pendingCount > 0 ? colors.light.pending : c.mutedForeground} />
+        <Row
+          icon="check-circle"
+          label="Synced"
+          value={`${syncedCount}`}
+          accent={colors.light.stockIn}
+        />
+        <Row
+          icon="clock"
+          label="Pending"
+          value={`${pendingCount}`}
+          accent={pendingCount > 0 ? colors.light.pending : c.mutedForeground}
+        />
         <Row icon="list" label="Total" value={`${transactions.length}`} />
         <View style={[styles.divider, { backgroundColor: c.border }]} />
         <TouchableOpacity
@@ -283,9 +383,22 @@ export default function SettingsScreen() {
           onPress={handleSync}
           disabled={pendingCount === 0}
         >
-          <Feather name="refresh-cw" size={15} color={pendingCount > 0 ? colors.light.pending : c.mutedForeground} />
-          <Text style={[styles.syncAllText, { color: pendingCount > 0 ? colors.light.pending : c.mutedForeground }]}>
-            Sync {pendingCount} Pending {pendingCount === 1 ? "Transaction" : "Transactions"}
+          <Feather
+            name="refresh-cw"
+            size={15}
+            color={pendingCount > 0 ? colors.light.pending : c.mutedForeground}
+          />
+          <Text
+            style={[
+              styles.syncAllText,
+              {
+                color:
+                  pendingCount > 0 ? colors.light.pending : c.mutedForeground,
+              },
+            ]}
+          >
+            Sync {pendingCount} Pending{" "}
+            {pendingCount === 1 ? "Transaction" : "Transactions"}
           </Text>
         </TouchableOpacity>
       </Section>
@@ -319,6 +432,20 @@ const styles = StyleSheet.create({
   },
   urlIcon: { flexShrink: 0 },
   urlInput: { flex: 1, fontSize: 15, fontFamily: "Inter_400Regular" },
+  qrButton: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 8,
+    marginHorizontal: 12,
+    marginBottom: 12,
+    paddingVertical: 11,
+    borderRadius: 10,
+  },
+  qrButtonText: {
+    fontSize: 14,
+    fontFamily: "Inter_600SemiBold",
+  },
   divider: { height: StyleSheet.hairlineWidth, marginHorizontal: 14 },
   btnRow: { flexDirection: "row", gap: 10, padding: 12 },
   btn: {

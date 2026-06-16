@@ -1,34 +1,43 @@
-import express, { type Express } from "express";
 import cors from "cors";
+import express, { type Express } from "express";
 import pinoHttp from "pino-http";
-import router from "./routes";
+
 import { logger } from "./lib/logger";
+import apiRouter from "./routes";
+import dashboardRouter from "./routes/dashboard";
 
 const app: Express = express();
 
 app.use(
   pinoHttp({
     logger,
+    autoLogging: {
+      ignore: (request) =>
+        request.url === "/api/dashboard" ||
+        request.url === "/api/healthz",
+    },
     serializers: {
-      req(req) {
+      req(request) {
         return {
-          id: req.id,
-          method: req.method,
-          url: req.url?.split("?")[0],
+          id: request.id,
+          method: request.method,
+          url: request.url?.split("?")[0],
         };
       },
-      res(res) {
+      res(response) {
         return {
-          statusCode: res.statusCode,
+          statusCode: response.statusCode,
         };
       },
     },
   }),
 );
+
 app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-app.use("/api", router);
+app.use(dashboardRouter);
+app.use("/api", apiRouter);
 
 export default app;

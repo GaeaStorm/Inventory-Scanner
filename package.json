@@ -5,7 +5,7 @@
   "license": "MIT",
   "engines": {
     "node": ">=20.19.0 <25",
-    "pnpm": ">=10 <12"
+    "pnpm": "11.5.2"
   },
   "devEngines": {
     "packageManager": {
@@ -18,7 +18,8 @@
     "build": "pnpm run typecheck && pnpm -r --if-present run build",
     "typecheck:libs": "tsc --build",
     "typecheck": "pnpm run typecheck:libs && pnpm -r --filter \"./artifacts/**\" --filter \"./scripts\" --if-present run typecheck",
-
+    "launch": "pnpm --filter @workspace/scripts run launch",
+    "start": "pnpm launch",
     "dev:server": "pnpm --filter @workspace/api-server run dev",
     "dev:app": "pnpm --filter @workspace/scanner-app run dev",
     "dev:mockup": "pnpm --filter @workspace/mockup-sandbox run dev"

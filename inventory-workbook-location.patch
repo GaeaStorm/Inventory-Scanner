@@ -1,0 +1,787 @@
+--- a/artifacts/api-server/src/lib/workbook.ts
++++ b/artifacts/api-server/src/lib/workbook.ts
+@@ -31,9 +31,17 @@
+   modifiedAt: string | null;
+   totalRows: number;
+   rows: Array<Record<string, unknown>>;
++  error: string | null;
++}
++
++export interface WorkbookLocationResult {
++  path: string;
++  created: boolean;
+ }
+ 
+ const SHEET_NAME = "Transactions";
++const DEFAULT_FILE_NAME = "stock_transactions.xlsx";
++const SETTINGS_FILE_NAME = "settings.json";
+ const HEADERS = [
+   "Date",
+   "Timestamp in IST",
+@@ -49,11 +57,30 @@
+   "Used In",
+ ];
+ 
++const COLUMN_WIDTHS = [
++  { wch: 12 },
++  { wch: 22 },
++  { wch: 18 },
++  { wch: 16 },
++  { wch: 18 },
++  { wch: 32 },
++  { wch: 10 },
++  { wch: 10 },
++  { wch: 14 },
++  { wch: 20 },
++  { wch: 22 },
++  { wch: 30 },
++];
++
++interface AppSettings {
++  workbookPath?: string;
++}
++
+ function getDefaultDataDirectory(): string {
+-  const override = process.env["INVENTORY_DATA_DIR"];
++  const override = process.env["INVENTORY_DATA_DIR"]?.trim();
+ 
+   if (override) {
+-    return path.resolve(override);
++    return path.resolve(expandHomeDirectory(override));
+   }
+ 
+   if (process.platform === "win32" && process.env["APPDATA"]) {
+@@ -76,9 +103,175 @@
+   );
+ }
+ 
+-export const EXCEL_PATH = process.env["EXCEL_PATH"]
+-  ? path.resolve(process.env["EXCEL_PATH"])
+-  : path.join(getDefaultDataDirectory(), "stock_transactions.xlsx");
++function expandHomeDirectory(value: string): string {
++  if (value === "~") {
++    return os.homedir();
++  }
++
++  if (value.startsWith("~/") || value.startsWith("~\\")) {
++    return path.join(os.homedir(), value.slice(2));
++  }
++
++  return value;
++}
++
++function getDefaultWorkbookPath(): string {
++  return path.join(getDefaultDataDirectory(), DEFAULT_FILE_NAME);
++}
++
++function getSettingsPath(): string {
++  return path.join(getDefaultDataDirectory(), SETTINGS_FILE_NAME);
++}
++
++function readSavedWorkbookPath(): string | null {
++  const settingsPath = getSettingsPath();
++
++  if (!fs.existsSync(settingsPath)) {
++    return null;
++  }
++
++  try {
++    const parsed = JSON.parse(
++      fs.readFileSync(settingsPath, "utf8"),
++    ) as AppSettings;
++
++    return typeof parsed.workbookPath === "string" &&
++      parsed.workbookPath.trim().length > 0
++      ? path.resolve(expandHomeDirectory(parsed.workbookPath.trim()))
++      : null;
++  } catch (error) {
++    logger.warn(
++      { err: error, path: settingsPath },
++      "Workbook settings could not be read; using the default location",
++    );
++    return null;
++  }
++}
++
++function saveWorkbookPath(workbookPath: string | null): void {
++  const settingsPath = getSettingsPath();
++  fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
++
++  const settings: AppSettings = workbookPath
++    ? { workbookPath }
++    : {};
++
++  fs.writeFileSync(
++    settingsPath,
++    `${JSON.stringify(settings, null, 2)}\n`,
++    "utf8",
++  );
++}
++
++function getFallbackWorkbookPath(): string {
++  const environmentPath = process.env["EXCEL_PATH"]?.trim();
++
++  if (environmentPath) {
++    return path.resolve(expandHomeDirectory(environmentPath));
++  }
++
++  return getDefaultWorkbookPath();
++}
++
++function getInitialWorkbookPath(): string {
++  return readSavedWorkbookPath() ?? getFallbackWorkbookPath();
++}
++
++let activeWorkbookPath = getInitialWorkbookPath();
++
++export function getWorkbookPath(): string {
++  return activeWorkbookPath;
++}
++
++function resolveRequestedWorkbookPath(value: string): string {
++  const trimmed = value.trim();
++
++  if (!trimmed) {
++    return getFallbackWorkbookPath();
++  }
++
++  const expanded = expandHomeDirectory(trimmed);
++  let resolved = path.resolve(expanded);
++  const endsWithSeparator = /[\\/]$/.test(trimmed);
++
++  if (fs.existsSync(resolved)) {
++    const stats = fs.statSync(resolved);
++
++    if (stats.isDirectory()) {
++      resolved = path.join(resolved, DEFAULT_FILE_NAME);
++    } else if (!stats.isFile()) {
++      throw new Error("The selected workbook location is not a regular file");
++    }
++  } else if (endsWithSeparator) {
++    resolved = path.join(resolved, DEFAULT_FILE_NAME);
++  }
++
++  if (path.extname(resolved).toLowerCase() !== ".xlsx") {
++    throw new Error(
++      'Enter a path ending in ".xlsx", or enter an existing directory',
++    );
++  }
++
++  return resolved;
++}
++
++function createEmptyWorkbook(workbookPath: string): void {
++  fs.mkdirSync(path.dirname(workbookPath), { recursive: true });
++
++  const workbook = XLSX.utils.book_new();
++  const worksheet = XLSX.utils.aoa_to_sheet([HEADERS]);
++  worksheet["!cols"] = COLUMN_WIDTHS;
++  XLSX.utils.book_append_sheet(workbook, worksheet, SHEET_NAME);
++  XLSX.writeFile(workbook, workbookPath);
++}
++
++function validateExistingWorkbook(workbookPath: string): void {
++  const workbook = XLSX.readFile(workbookPath);
++
++  if (workbook.SheetNames.length === 0) {
++    throw new Error("The selected Excel file does not contain any worksheets");
++  }
++}
++
++export function ensureWorkbookExists(): WorkbookLocationResult {
++  const workbookPath = getWorkbookPath();
++
++  if (fs.existsSync(workbookPath)) {
++    validateExistingWorkbook(workbookPath);
++    return { path: workbookPath, created: false };
++  }
++
++  createEmptyWorkbook(workbookPath);
++  logger.info({ path: workbookPath }, "Created Excel workbook");
++  return { path: workbookPath, created: true };
++}
++
++export function setWorkbookPath(value: string): WorkbookLocationResult {
++  const useDefaultLocation = value.trim().length === 0;
++  const nextPath = resolveRequestedWorkbookPath(value);
++  const previousPath = activeWorkbookPath;
++
++  activeWorkbookPath = nextPath;
++
++  try {
++    const result = ensureWorkbookExists();
++    saveWorkbookPath(useDefaultLocation ? null : nextPath);
++
++    logger.info(
++      {
++        path: nextPath,
++        previousPath,
++        created: result.created,
++      },
++      "Excel workbook location changed",
++    );
++
++    return result;
++  } catch (error) {
++    activeWorkbookPath = previousPath;
++    throw error;
++  }
++}
+ 
+ function getIstDateTime(timestamp: string): {
+   date: string;
+@@ -134,12 +327,8 @@
+ export function appendTransactionToWorkbook(
+   transaction: StoredTransaction,
+ ): void {
+-  fs.mkdirSync(path.dirname(EXCEL_PATH), { recursive: true });
+-
+-  const workbook = fs.existsSync(EXCEL_PATH)
+-    ? XLSX.readFile(EXCEL_PATH)
+-    : XLSX.utils.book_new();
+-
++  const { path: workbookPath } = ensureWorkbookExists();
++  const workbook = XLSX.readFile(workbookPath);
+   const worksheet = workbook.Sheets[SHEET_NAME];
+   const existingRows = worksheet
+     ? XLSX.utils.sheet_to_json<Record<string, string | number>>(worksheet, {
+@@ -169,50 +358,24 @@
+     header: HEADERS,
+   });
+ 
+-  updatedWorksheet["!cols"] = [
+-    { wch: 12 },
+-    { wch: 22 },
+-    { wch: 18 },
+-    { wch: 16 },
+-    { wch: 18 },
+-    { wch: 32 },
+-    { wch: 10 },
+-    { wch: 10 },
+-    { wch: 14 },
+-    { wch: 20 },
+-    { wch: 22 },
+-    { wch: 30 },
+-  ];
+-
++  updatedWorksheet["!cols"] = COLUMN_WIDTHS;
+   workbook.Sheets[SHEET_NAME] = updatedWorksheet;
+ 
+   if (!workbook.SheetNames.includes(SHEET_NAME)) {
+     workbook.SheetNames.push(SHEET_NAME);
+   }
+ 
+-  XLSX.writeFile(workbook, EXCEL_PATH);
++  XLSX.writeFile(workbook, workbookPath);
+ 
+   logger.info(
+-    { id: transaction.id, path: EXCEL_PATH },
++    { id: transaction.id, path: workbookPath },
+     "Transaction written to Excel",
+   );
+ }
+ 
+ export function readWorkbookPreview(limit = 12): WorkbookPreview {
+-  const fileName = path.basename(EXCEL_PATH);
+-
+-  if (!fs.existsSync(EXCEL_PATH)) {
+-    return {
+-      exists: false,
+-      path: EXCEL_PATH,
+-      fileName,
+-      modifiedAt: null,
+-      totalRows: 0,
+-      rows: [],
+-    };
+-  }
+-
+-  const workbook = XLSX.readFile(EXCEL_PATH);
++  const { path: workbookPath } = ensureWorkbookExists();
++  const workbook = XLSX.readFile(workbookPath);
+   const worksheet = workbook.Sheets[SHEET_NAME];
+   const allRows = worksheet
+     ? XLSX.utils.sheet_to_json<Record<string, unknown>>(worksheet, {
+@@ -220,15 +383,16 @@
+         raw: false,
+       })
+     : [];
+-  const stats = fs.statSync(EXCEL_PATH);
++  const stats = fs.statSync(workbookPath);
+   const safeLimit = Math.min(Math.max(Math.trunc(limit), 1), 100);
+ 
+   return {
+     exists: true,
+-    path: EXCEL_PATH,
+-    fileName,
++    path: workbookPath,
++    fileName: path.basename(workbookPath),
+     modifiedAt: stats.mtime.toISOString(),
+     totalRows: allRows.length,
+     rows: allRows.slice(-safeLimit).reverse(),
++    error: null,
+   };
+ }
+--- a/artifacts/api-server/src/routes/dashboard.ts
++++ b/artifacts/api-server/src/routes/dashboard.ts
+@@ -6,8 +6,10 @@
+ import { logger } from "../lib/logger";
+ import { getLanAddresses } from "../lib/network";
+ import {
+-  EXCEL_PATH,
++  getWorkbookPath,
+   readWorkbookPreview,
++  setWorkbookPath,
++  type WorkbookPreview,
+ } from "../lib/workbook";
+ 
+ const router = Router();
+@@ -29,9 +31,23 @@
+ 
+       * { box-sizing: border-box; }
+       body { margin: 0; min-height: 100vh; background: #0b1020; }
+-      button, a { font: inherit; }
++      button, a, input { font: inherit; }
+       a { color: inherit; }
+ 
++      input {
++        width: 100%;
++        border: 1px solid #344166;
++        border-radius: 10px;
++        background: #0b1020;
++        padding: 10px 12px;
++        color: #eef2ff;
++      }
++
++      input:focus {
++        border-color: #60a5fa;
++        outline: 2px solid rgb(96 165 250 / 24%);
++      }
++
+       .shell {
+         width: min(1180px, calc(100% - 32px));
+         margin: 0 auto;
+@@ -133,6 +149,24 @@
+       .button.primary:hover { background: #1d4ed8; }
+       .button[disabled] { cursor: not-allowed; opacity: 0.45; }
+ 
++      .workbook-form {
++        display: grid;
++        gap: 10px;
++        margin-top: 18px;
++        padding-top: 16px;
++        border-top: 1px solid #293456;
++      }
++
++      .form-actions {
++        display: flex;
++        flex-wrap: wrap;
++        gap: 8px;
++      }
++
++      .form-message { min-height: 18px; }
++      .form-message.success { color: #86efac; }
++      .form-message.error { color: #fca5a5; }
++
+       .meta {
+         display: grid;
+         gap: 8px;
+@@ -247,6 +281,33 @@
+               href="/api/workbook/download"
+             >Download workbook</a>
+           </div>
++
++          <form id="workbook-form" class="workbook-form">
++            <label for="workbook-location" class="small">
++              Workbook location
++            </label>
++            <input
++              id="workbook-location"
++              name="workbookLocation"
++              type="text"
++              autocomplete="off"
++              spellcheck="false"
++              placeholder="Full path ending in .xlsx"
++            />
++            <div class="muted small">
++              Enter an .xlsx file path or an existing directory. Missing
++              directories and workbooks are created automatically.
++            </div>
++            <div class="form-actions">
++              <button id="save-location-button" class="button" type="submit">
++                Use this location
++              </button>
++              <button id="default-location-button" class="button" type="button">
++                Use default location
++              </button>
++            </div>
++            <div id="location-message" class="form-message small"></div>
++          </form>
+         </article>
+       </section>
+ 
+@@ -304,6 +365,15 @@
+       const rowsElement = document.querySelector("#rows");
+       const refreshButton = document.querySelector("#refresh-button");
+       const downloadButton = document.querySelector("#download-button");
++      const workbookForm = document.querySelector("#workbook-form");
++      const workbookLocation = document.querySelector("#workbook-location");
++      const saveLocationButton = document.querySelector(
++        "#save-location-button",
++      );
++      const defaultLocationButton = document.querySelector(
++        "#default-location-button",
++      );
++      const locationMessage = document.querySelector("#location-message");
+ 
+       function makeCell(value) {
+         const cell = document.createElement("td");
+@@ -340,6 +410,15 @@
+         }
+       }
+ 
++      function setLocationMessage(message, kind) {
++        locationMessage.textContent = message;
++        locationMessage.classList.remove("success", "error");
++
++        if (kind) {
++          locationMessage.classList.add(kind);
++        }
++      }
++
+       function renderRows(rows) {
+         rowsElement.replaceChildren();
+ 
+@@ -381,7 +460,11 @@
+           renderUrls(data.scannerUrls);
+ 
+           document.querySelector("#workbook-status").textContent =
+-            data.workbook.exists ? "Ready" : "Waiting for first transaction";
++            data.workbook.error
++              ? "Cannot read workbook: " + data.workbook.error
++              : data.workbook.exists
++                ? "Ready"
++                : "Not created";
+           document.querySelector("#row-count").textContent =
+             String(data.workbook.totalRows);
+           document.querySelector("#modified-at").textContent =
+@@ -390,13 +473,19 @@
+               : "—";
+           document.querySelector("#workbook-path").textContent =
+             data.workbook.path;
+-          downloadButton.style.pointerEvents =
+-            data.workbook.exists ? "auto" : "none";
++
++          if (document.activeElement !== workbookLocation) {
++            workbookLocation.value = data.workbook.path;
++          }
++
++          const canDownload =
++            data.workbook.exists && !data.workbook.error;
++          downloadButton.style.pointerEvents = canDownload ? "auto" : "none";
+           downloadButton.setAttribute(
+             "aria-disabled",
+-            data.workbook.exists ? "false" : "true",
++            canDownload ? "false" : "true",
+           );
+-          downloadButton.style.opacity = data.workbook.exists ? "1" : "0.45";
++          downloadButton.style.opacity = canDownload ? "1" : "0.45";
+ 
+           renderRows(data.workbook.rows);
+           document.querySelector("#last-refresh").textContent =
+@@ -410,6 +499,53 @@
+         }
+       }
+ 
++      async function saveWorkbookLocation(pathValue) {
++        saveLocationButton.disabled = true;
++        defaultLocationButton.disabled = true;
++        setLocationMessage("Saving…");
++
++        try {
++          const response = await fetch("/api/workbook/location", {
++            method: "PUT",
++            headers: {
++              "Content-Type": "application/json",
++            },
++            body: JSON.stringify({ path: pathValue }),
++          });
++          const data = await response.json();
++
++          if (!response.ok) {
++            throw new Error(data.error || "The workbook location was rejected");
++          }
++
++          workbookLocation.value = data.workbook.path;
++          setLocationMessage(
++            data.created
++              ? "Workbook created and selected."
++              : "Workbook location updated.",
++            "success",
++          );
++          await refresh();
++        } catch (error) {
++          setLocationMessage(
++            error instanceof Error ? error.message : String(error),
++            "error",
++          );
++        } finally {
++          saveLocationButton.disabled = false;
++          defaultLocationButton.disabled = false;
++        }
++      }
++
++      workbookForm.addEventListener("submit", (event) => {
++        event.preventDefault();
++        saveWorkbookLocation(workbookLocation.value);
++      });
++
++      defaultLocationButton.addEventListener("click", () => {
++        saveWorkbookLocation("");
++      });
++
+       refreshButton.addEventListener("click", refresh);
+       refresh();
+       window.setInterval(refresh, 3000);
+@@ -427,6 +563,56 @@
+   return Math.min(Math.max(Math.trunc(parsed), 1), 100);
+ }
+ 
++function getErrorMessage(error: unknown): string {
++  return error instanceof Error ? error.message : String(error);
++}
++
++function isLocalMachineRequest(req: Request): boolean {
++  const remoteAddress = (req.socket.remoteAddress ?? "").replace(
++    /^::ffff:/,
++    "",
++  );
++  const localAddresses = new Set([
++    "127.0.0.1",
++    "::1",
++    ...getLanAddresses(0).map(({ address }) => address),
++  ]);
++
++  return localAddresses.has(remoteAddress);
++}
++
++function readWorkbookPreviewSafely(limit: number): WorkbookPreview {
++  try {
++    return readWorkbookPreview(limit);
++  } catch (error) {
++    const workbookPath = getWorkbookPath();
++    let modifiedAt: string | null = null;
++
++    try {
++      modifiedAt = fs.existsSync(workbookPath)
++        ? fs.statSync(workbookPath).mtime.toISOString()
++        : null;
++    } catch {
++      modifiedAt = null;
++    }
++
++    logger.error(
++      { err: error, path: workbookPath },
++      "Failed to read workbook preview",
++    );
++
++    return {
++      exists: fs.existsSync(workbookPath),
++      path: workbookPath,
++      fileName: path.basename(workbookPath),
++      modifiedAt,
++      totalRows: 0,
++      rows: [],
++      error: getErrorMessage(error),
++    };
++  }
++}
++
+ router.get("/", (_req: Request, res: Response) => {
+   res
+     .status(200)
+@@ -440,41 +626,79 @@
+ });
+ 
+ router.get("/api/dashboard", (req: Request, res: Response) => {
+-  try {
+-    const fallbackPort = Number(process.env["PORT"] ?? 5050);
+-    const port = req.socket.localPort ?? fallbackPort;
+-    const lanAddresses = getLanAddresses(port);
+-    const scannerUrls =
+-      lanAddresses.length > 0
+-        ? lanAddresses.map(({ url }) => url)
+-        : [`http://localhost:${port}`];
++  const fallbackPort = Number(process.env["PORT"] ?? 5050);
++  const port = req.socket.localPort ?? fallbackPort;
++  const lanAddresses = getLanAddresses(port);
++  const scannerUrls =
++    lanAddresses.length > 0
++      ? lanAddresses.map(({ url }) => url)
++      : [`http://localhost:${port}`];
++
++  res
++    .set("Cache-Control", "no-store")
++    .json({
++      status: "ok",
++      scannerUrls,
++      workbook: readWorkbookPreviewSafely(
++        parsePreviewLimit(req.query["limit"]),
++      ),
++    });
++});
++
++router.put("/api/workbook/location", (req: Request, res: Response) => {
++  if (!isLocalMachineRequest(req)) {
++    res.status(403).json({
++      error:
++        "Workbook locations can only be changed from a browser on this computer",
++    });
++    return;
++  }
+ 
++  if (typeof req.body?.path !== "string") {
++    res.status(400).json({
++      error: "A workbook path is required",
++    });
++    return;
++  }
++
++  try {
++    const result = setWorkbookPath(req.body.path);
+     res
+       .set("Cache-Control", "no-store")
+       .json({
+-        status: "ok",
+-        scannerUrls,
+-        workbook: readWorkbookPreview(parsePreviewLimit(req.query["limit"])),
++        created: result.created,
++        workbook: readWorkbookPreview(12),
+       });
+   } catch (error) {
+-    logger.error({ error, path: EXCEL_PATH }, "Failed to read workbook preview");
+-    res.status(500).json({
+-      error: "The workbook preview could not be read",
++    logger.error(
++      {
++        err: error,
++        requestedPath: req.body.path,
++      },
++      "Failed to change workbook location",
++    );
++    res.status(400).json({
++      error: getErrorMessage(error),
+     });
+   }
+ });
+ 
+ router.get("/api/workbook/download", (_req: Request, res: Response) => {
+-  if (!fs.existsSync(EXCEL_PATH)) {
++  const workbookPath = getWorkbookPath();
++
++  if (!fs.existsSync(workbookPath)) {
+     res.status(404).json({
+       error: "The workbook does not exist yet",
+     });
+     return;
+   }
+ 
+-  res.download(EXCEL_PATH, path.basename(EXCEL_PATH), (error) => {
++  res.download(workbookPath, path.basename(workbookPath), (error) => {
+     if (error && !res.headersSent) {
+-      logger.error({ error, path: EXCEL_PATH }, "Failed to download workbook");
++      logger.error(
++        { err: error, path: workbookPath },
++        "Failed to download workbook",
++      );
+       res.status(500).json({
+         error: "The workbook could not be downloaded",
+       });
+--- a/artifacts/api-server/src/routes/transactions.ts
++++ b/artifacts/api-server/src/routes/transactions.ts
+@@ -6,7 +6,7 @@
+ import { logger } from "../lib/logger";
+ import {
+   appendTransactionToWorkbook,
+-  EXCEL_PATH,
++  getWorkbookPath,
+   type StoredTransaction,
+ } from "../lib/workbook";
+ 
+@@ -74,8 +74,8 @@
+   } catch (error) {
+     logger.error(
+       {
+-        error,
+-        path: EXCEL_PATH,
++        err: error,
++        path: getWorkbookPath(),
+       },
+       "Failed to save transaction",
+     );
+--- a/artifacts/api-server/src/routes/index.ts
++++ b/artifacts/api-server/src/routes/index.ts
+@@ -1,15 +1,11 @@
+ import { Router, type IRouter } from "express";
+ 
+-import { logger } from "../lib/logger";
+-import { EXCEL_PATH } from "../lib/workbook";
+ import healthRouter from "./health";
+ import productsRouter from "./products";
+ import transactionsRouter from "./transactions";
+ 
+ const router: IRouter = Router();
+ 
+-logger.info({ path: EXCEL_PATH }, "Excel file will be saved to");
+-
+ router.use(healthRouter);
+ router.use(productsRouter);
+ router.use(transactionsRouter);
+--- a/artifacts/api-server/src/index.ts
++++ b/artifacts/api-server/src/index.ts
+@@ -1,6 +1,10 @@
+ import app from "./app";
+ import { logger } from "./lib/logger";
+ import { getServiceUrls } from "./lib/network";
++import {
++  ensureWorkbookExists,
++  getWorkbookPath,
++} from "./lib/workbook";
+ 
+ function parsePort(value: string | undefined, fallback: number): number {
+   if (!value) {
+@@ -19,6 +23,27 @@
+ const port = parsePort(process.env["PORT"], 5050);
+ const host = process.env["HOST"]?.trim() || "0.0.0.0";
+ 
++try {
++  const workbook = ensureWorkbookExists();
++  logger.info(
++    {
++      path: workbook.path,
++      created: workbook.created,
++    },
++    workbook.created
++      ? "Excel workbook created"
++      : "Excel workbook ready",
++  );
++} catch (error) {
++  logger.warn(
++    {
++      err: error,
++      path: getWorkbookPath(),
++    },
++    "Excel workbook could not be initialized; choose another location in the dashboard",
++  );
++}
++
+ const server = app.listen(port, host, () => {
+   logger.info(
+     {
+@@ -31,6 +56,6 @@
+ });
+ 
+ server.on("error", (error) => {
+-  logger.error({ error }, "Inventory server failed");
++  logger.error({ err: error }, "Inventory server failed");
+   process.exitCode = 1;
+ });
