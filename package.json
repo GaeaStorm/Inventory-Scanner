@@ -5,12 +5,12 @@
   "license": "MIT",
   "engines": {
     "node": ">=20.19.0 <25",
-    "pnpm": "11.5.2"
+    "pnpm": "11.7.0"
   },
   "devEngines": {
     "packageManager": {
       "name": "pnpm",
-      "version": "11.5.2",
+      "version": "11.7.0",
       "onFail": "warn"
     }
   },
@@ -22,10 +22,15 @@
     "start": "pnpm launch",
     "dev:server": "pnpm --filter @workspace/api-server run dev",
     "dev:app": "pnpm --filter @workspace/scanner-app run dev",
-    "dev:mockup": "pnpm --filter @workspace/mockup-sandbox run dev"
+    "dev:mockup": "pnpm --filter @workspace/mockup-sandbox run dev",
+    "desktop:setup": "node artifacts/desktop-app/scripts/setup-workspace.mjs",
+    "desktop:dev": "pnpm --filter @workspace/desktop-app dev",
+    "desktop:build": "pnpm --filter @workspace/desktop-app build",
+    "desktop:dist": "pnpm --filter @workspace/desktop-app dist"
   },
   "devDependencies": {
     "prettier": "^3.8.3",
     "typescript": "~5.9.3"
-  }
+  },
+  "packageManager": "pnpm@11.7.0+sha512.19cc852c120c7125760f2443ee6be0ca5b40f9f50598de1a09a1f177503e010e57c23c77646e01e761de59bf874fb22a3398c33ab9691fc13eb946b6f0f4d620"
 }

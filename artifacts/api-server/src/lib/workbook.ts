@@ -1,12 +1,9 @@
 import fs from "node:fs";
-import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
+import * as XLSX from "xlsx";
 
 import { logger } from "./logger";
-
-const require = createRequire(import.meta.url);
-const XLSX = require("xlsx") as typeof import("xlsx");
 
 export type MovementType = "Restock" | "Use" | "Adjustment";
 export type AdjustmentDirection = "in" | "out";
