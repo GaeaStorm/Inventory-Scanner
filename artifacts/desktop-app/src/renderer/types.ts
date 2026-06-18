@@ -64,5 +64,8 @@ export type {
   StoresSupplier,
   VendorReceiptInput,
   MaterialOutInput,
-  ReturnUnusedInput,
+  AdjustmentInput,
+  OpeningQuantityInput,
+  StoresRestoreResult,
+  AdjustmentContext,
 } from "../stores/types";

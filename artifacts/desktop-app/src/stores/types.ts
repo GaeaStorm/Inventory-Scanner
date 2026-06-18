@@ -1,7 +1,16 @@
 export type StoresWorkflow =
   | "VENDOR_MATERIAL_IN"
   | "MATERIAL_OUT"
-  | "RETURN_UNUSED";
+  | "ADJUSTMENT";
+
+export type AdjustmentDirection = "RETURN_TO_STOCK" | "ADDITIONAL_OUT";
+
+export type AdjustmentReason =
+  | "UNUSED_MATERIAL"
+  | "MISCOUNT"
+  | "DATA_ENTRY_ERROR"
+  | "DAMAGE_OR_LOSS"
+  | "OTHER";
 
 export type ReviewStatus =
   | "PENDING"
@@ -99,6 +108,10 @@ export interface StoresMovement {
   challanNumber: string;
   status: ReviewStatus;
   createdAt: string;
+  adjustmentDirection: AdjustmentDirection | null;
+  adjustmentReason: AdjustmentReason | null;
+  adjustmentNote: string;
+  referenceMovementId: string;
 }
 
 export interface StoresFifoAllocation {
@@ -115,7 +128,7 @@ export interface StoresFifoAllocation {
 
 export interface StoresReviewEntry {
   id: string;
-  entityType: "GRN" | "MATERIAL_OUT" | "RETURN_EXCEPTION";
+  entityType: "GRN" | "MATERIAL_OUT" | "ADJUSTMENT_EXCEPTION";
   entityId: string;
   status: ReviewStatus;
   externalId: string;
@@ -148,6 +161,15 @@ export interface StoresSyncSummary {
   warnings: string[];
 }
 
+export interface StoresBackupInfo {
+  path: string;
+  fileName: string;
+  createdAt: string;
+  sizeBytes: number;
+  valid: boolean;
+  schemaVersion: number;
+}
+
 export interface StoresDatabaseStatus {
   path: string;
   schemaVersion: number;
@@ -156,6 +178,21 @@ export interface StoresDatabaseStatus {
   backupFolder: string;
   exportFolder: string;
   latestBackup: string | null;
+  hostId: string;
+  writerMode: "AUTHORITATIVE_HOST";
+  backups: StoresBackupInfo[];
+}
+
+export interface StoresOpeningQuantityAdjustment {
+  id: string;
+  tallyItemGuid: string;
+  itemName: string;
+  previousAvailableQuantity: number;
+  targetAvailableQuantity: number;
+  deltaQuantity: number;
+  reason: string;
+  adjustedBy: string;
+  createdAt: string;
 }
 
 export type StoresDataMode = "empty" | "demo" | "tally";
@@ -173,6 +210,8 @@ export interface StoresState {
   purchaseLots: StoresPurchaseLot[];
   recentMovements: StoresMovement[];
   reviewEntries: StoresReviewEntry[];
+  openingQuantityAdjustments: StoresOpeningQuantityAdjustment[];
+  exportSchemaVersion: string;
   materialOutXmlConfigured: boolean;
 }
 
@@ -226,13 +265,58 @@ export interface MaterialOutInput {
   eventDate?: string;
 }
 
-export interface ReturnUnusedInput {
+export interface AdjustmentInput {
   clientTransactionId: string;
   boxId: string;
   tallyItemGuid: string;
   destinationTallyItemGuid: string;
   quantity: number;
+  direction: AdjustmentDirection;
+  reason: AdjustmentReason;
+  note?: string;
   eventDate?: string;
+}
+
+export interface AdjustmentContext {
+  materialOutVoucherId: string;
+  eventDate: string;
+  issuedItemName: string;
+  destinationName: string;
+  pendingQuantity: number;
+  latestMovementId: string;
+  latestMovementQuantity: number;
+  latestMovementCreatedAt: string;
+  status: ReviewStatus;
+  tallyVoucherNumber: string;
+}
+
+export interface OpeningQuantityInput {
+  clientTransactionId: string;
+  tallyItemGuid: string;
+  targetQuantity: number;
+  reason: string;
+  adjustedBy?: string;
+}
+
+export type StoresOfflineOperation =
+  | { type: "MATERIAL_OUT"; clientTransactionId: string; payload: MaterialOutInput }
+  | { type: "ADJUSTMENT"; clientTransactionId: string; payload: AdjustmentInput };
+
+export interface StoresOfflineBatchInput {
+  deviceId: string;
+  operations: StoresOfflineOperation[];
+}
+
+export interface StoresOfflineBatchItemResult {
+  clientTransactionId: string;
+  status: "ACCEPTED" | "REJECTED" | "RETRY";
+  movement?: StoresMovement;
+  error?: string;
+}
+
+export interface StoresOfflineBatchResult {
+  receivedAt: string;
+  results: StoresOfflineBatchItemResult[];
 }
 
 export interface ReviewDecisionInput {
@@ -255,6 +339,7 @@ export interface ConfirmImportInput {
 }
 
 export interface ExportBatchResult {
+  schemaVersion: string;
   batchId: string;
   excelPath: string;
   csvPath: string | null;
@@ -266,4 +351,11 @@ export interface StoresBackupResult {
   path: string;
   createdAt: string;
   valid: boolean;
+}
+
+export interface StoresRestoreResult {
+  restoredFrom: string;
+  safetyBackupPath: string;
+  restoredAt: string;
+  state: StoresState;
 }

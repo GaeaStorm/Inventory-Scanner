@@ -56,6 +56,18 @@ export default function BulkMaterialInForm({ stores, onChanged, onNotice, onErro
     return sum + (Number.isInteger(quantity) && quantity > 0 ? quantity : 0);
   }, 0);
 
+  function clearForm(): void {
+    setSupplierId("");
+    setPurchaseOrderId("");
+    setChallanNumber("");
+    setChallanDate(today());
+    setReceiptDate(today());
+    setNonPoException(false);
+    setRows([emptyRow()]);
+    onError("");
+    onNotice("");
+  }
+
   function chooseSupplier(value: string): void {
     setSupplierId(value);
     setPurchaseOrderId("");
@@ -141,7 +153,10 @@ export default function BulkMaterialInForm({ stores, onChanged, onNotice, onErro
     <article className="panel bulk-receipt-panel">
       <div className="panel__header bulk-receipt-heading">
         <div><p className="eyebrow">MATERIAL IN · RECEIPT NOTE / GRN</p><h2>Record a large vendor restock</h2><p>Use one header for the supplier delivery, then enter all Stock Item quantities received on that challan.</p></div>
-        <span className="health-badge">WHOLE COUNTS</span>
+        <div className="bulk-receipt-heading-actions">
+          <button className="button button--secondary" type="button" onClick={clearForm} disabled={busy}>Clear form</button>
+          <span className="health-badge">WHOLE COUNTS</span>
+        </div>
       </div>
 
       <div className="bulk-receipt-header-grid">

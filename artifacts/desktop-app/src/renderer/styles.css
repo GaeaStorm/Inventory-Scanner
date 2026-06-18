@@ -1925,3 +1925,65 @@ code {
   font-weight: 500;
   line-height: 1.45;
 }
+
+/* Phone adjustment workflow and Material In reset (v15) */
+.bulk-receipt-heading-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+/* v1 consolidation: opening quantity, shared database host, and restore */
+.opening-panel {
+  margin-bottom: 18px;
+}
+
+.opening-form-grid {
+  display: grid;
+  grid-template-columns: minmax(260px, 2fr) minmax(150px, 0.8fr) minmax(180px, 1fr);
+  gap: 12px;
+  margin-top: 16px;
+}
+
+.opening-form-grid label {
+  display: grid;
+  gap: 6px;
+  color: #647087;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.opening-reason {
+  grid-column: 1 / -1;
+}
+
+.opening-history,
+.backup-list {
+  max-height: 280px;
+  margin-top: 16px;
+  border: 1px solid #e3e8f2;
+  border-radius: 10px;
+}
+
+.backup-list code {
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.button--small {
+  min-height: 32px;
+  padding: 6px 10px;
+  font-size: 11px;
+}
+
+@media (max-width: 900px) {
+  .opening-form-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .opening-reason {
+    grid-column: auto;
+  }
+}

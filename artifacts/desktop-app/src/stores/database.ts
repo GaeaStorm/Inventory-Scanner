@@ -1,5 +1,6 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
+  copyFileSync,
   existsSync,
   mkdirSync,
   readdirSync,
@@ -10,22 +11,28 @@ import {
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
+import { ApplicationDatabase } from "../database/application-database";
 import type { TallyStoresSnapshot } from "../tally/types";
 import type {
+  AdjustmentContext,
+  AdjustmentInput,
   BulkVendorReceiptInput,
   BulkVendorReceiptResult,
   ConfirmImportInput,
   ExportBatchInput,
   MaterialOutInput,
-  ReturnUnusedInput,
+  OpeningQuantityInput,
   ReviewDecisionInput,
   SaveBoxInput,
+  StoresBackupInfo,
   StoresBackupResult,
+  StoresRestoreResult,
   StoresBox,
   StoresDatabaseStatus,
   StoresDataMode,
   StoresFifoAllocation,
   StoresMovement,
+  StoresOpeningQuantityAdjustment,
   StoresPurchaseLot,
   StoresPurchaseOrder,
   StoresReviewEntry,
@@ -36,7 +43,7 @@ import type {
   VendorReceiptInput,
 } from "./types";
 
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 4;
 const BACKUP_RETENTION = 30;
 const LEGACY_SUPPLIER_NAME = "Opening Legacy Stock";
 
@@ -47,9 +54,13 @@ function nowIso(): string {
 }
 
 function businessDate(value?: string): string {
+  if (value && /^\d{4}-\d{2}-\d{2}$/.test(value)) return value;
   const date = value ? new Date(value) : new Date();
   if (Number.isNaN(date.valueOf())) throw new Error("Enter a valid transaction date.");
-  return date.toISOString().slice(0, 10);
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
 }
 
 function text(value: unknown): string {
@@ -64,6 +75,18 @@ function integerQuantity(value: unknown, label = "Quantity"): number {
   return quantity;
 }
 
+function adjustmentDirection(value: unknown): AdjustmentInput["direction"] {
+  if (value === "RETURN_TO_STOCK" || value === "ADDITIONAL_OUT") return value;
+  throw new Error("Choose whether the adjustment returns stock or records an additional issue.");
+}
+
+function adjustmentReason(value: unknown): AdjustmentInput["reason"] {
+  if (["UNUSED_MATERIAL", "MISCOUNT", "DATA_ENTRY_ERROR", "DAMAGE_OR_LOSS", "OTHER"].includes(String(value))) {
+    return value as AdjustmentInput["reason"];
+  }
+  throw new Error("Choose an adjustment reason.");
+}
+
 function nullableNumber(value: unknown): number | null {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : null;
@@ -71,6 +94,24 @@ function nullableNumber(value: unknown): number | null {
 
 function json(value: unknown): string {
   return JSON.stringify(value ?? null);
+}
+
+function stableValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(stableValue);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>)
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([key, entry]) => [key, stableValue(entry)]),
+    );
+  }
+  return value;
+}
+
+function payloadHash(value: unknown): string {
+  return createHash("sha256")
+    .update(JSON.stringify(stableValue(value)))
+    .digest("hex");
 }
 
 function sqlValue(value: unknown): string | number | bigint | null | Uint8Array {
@@ -101,37 +142,48 @@ export class StoresDatabase {
   readonly databasePath: string;
   readonly defaultBackupFolder: string;
   readonly defaultExportFolder: string;
-  readonly db: DatabaseSync;
+  readonly host: ApplicationDatabase;
 
-  constructor(userDataDirectory: string) {
+  static databasePathFor(userDataDirectory: string): string {
+    return path.join(userDataDirectory, "data", "inventory-scanner.sqlite");
+  }
+
+  constructor(userDataDirectory: string, host?: ApplicationDatabase) {
     const dataDirectory = path.join(userDataDirectory, "data");
     mkdirSync(dataDirectory, { recursive: true });
-    this.databasePath = path.join(dataDirectory, "inventory-scanner.sqlite");
+    this.databasePath = StoresDatabase.databasePathFor(userDataDirectory);
     this.defaultBackupFolder = path.join(userDataDirectory, "backups");
     this.defaultExportFolder = path.join(userDataDirectory, "exports");
     mkdirSync(this.defaultBackupFolder, { recursive: true });
     mkdirSync(this.defaultExportFolder, { recursive: true });
 
+    this.host = host ?? new ApplicationDatabase(this.databasePath);
+    if (this.host.databasePath !== this.databasePath) {
+      throw new Error("The Stores module must use the shared application database host.");
+    }
     const existingSchemaVersion = this.detectSchemaVersionOnDisk();
     if (existingSchemaVersion > 0 && existingSchemaVersion < SCHEMA_VERSION) {
       this.backupBeforeMigration();
     }
-    this.db = new DatabaseSync(this.databasePath, {
-      timeout: 5_000,
-      enableForeignKeyConstraints: true,
-    });
-    this.db.exec("PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL; PRAGMA foreign_keys = ON;");
     this.migrate();
-    if (!this.getSetting("backup_folder")) {
-      this.setSetting("backup_folder", this.defaultBackupFolder);
-    }
-    if (!this.getSetting("export_folder")) {
-      this.setSetting("export_folder", this.defaultExportFolder);
-    }
+    this.ensureDefaultSettings();
+  }
+
+  get db(): DatabaseSync {
+    return this.host.db;
   }
 
   close(): void {
-    if (this.db.isOpen) this.db.close();
+    // The Electron composition root owns this connection so future domains,
+    // such as Production, can share the same transaction coordinator.
+  }
+
+  private ensureDefaultSettings(): void {
+    if (!this.getSetting("backup_folder")) this.setSetting("backup_folder", this.defaultBackupFolder);
+    if (!this.getSetting("export_folder")) this.setSetting("export_folder", this.defaultExportFolder);
+    if (!this.getSetting("application_database_host_id")) {
+      this.setSetting("application_database_host_id", randomUUID());
+    }
   }
 
   private detectSchemaVersionOnDisk(): number {
@@ -151,20 +203,19 @@ export class StoresDatabase {
     }
   }
 
-  private validateBackupFile(backupPath: string): boolean {
+  private validateBackupFile(backupPath: string, quick = false): boolean {
     let check: DatabaseSync | undefined;
     try {
       check = new DatabaseSync(backupPath, { readOnly: true });
-      const result = check.prepare("PRAGMA integrity_check").get() as Row | undefined;
+      const result = check.prepare(quick ? "PRAGMA quick_check" : "PRAGMA integrity_check").get() as Row | undefined;
       return Object.values(result ?? {}).some((value) => value === "ok");
     } catch {
       return false;
     } finally {
       if (check?.isOpen) check.close();
-      for (const suffix of ["-wal", "-shm"]) {
-        const sidecar = `${backupPath}${suffix}`;
-        if (existsSync(sidecar)) unlinkSync(sidecar);
-      }
+      // Never remove WAL/SHM files here. This validator may be used against
+      // the active database during restore verification; deleting its live
+      // sidecars would corrupt the connection.
     }
   }
 
@@ -478,18 +529,64 @@ export class StoresDatabase {
         this.db.prepare("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)").run(2, nowIso());
       });
     }
+
+    if (current < 3) {
+      this.transaction(() => {
+        this.db.exec(`
+          CREATE TABLE inventory_adjustments (
+            movement_id TEXT PRIMARY KEY REFERENCES inventory_movements(id) ON DELETE CASCADE,
+            material_out_voucher_id TEXT NOT NULL REFERENCES material_out_vouchers(id),
+            reference_movement_id TEXT NOT NULL REFERENCES inventory_movements(id),
+            direction TEXT NOT NULL CHECK (direction IN ('RETURN_TO_STOCK','ADDITIONAL_OUT')),
+            reason TEXT NOT NULL CHECK (reason IN ('UNUSED_MATERIAL','MISCOUNT','DATA_ENTRY_ERROR','DAMAGE_OR_LOSS','OTHER')),
+            note TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL
+          ) STRICT;
+          CREATE INDEX idx_inventory_adjustments_group
+            ON inventory_adjustments(material_out_voucher_id, created_at);
+        `);
+        this.db.prepare("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)").run(3, nowIso());
+      });
+    }
+
+    if (current < 4) {
+      this.transaction(() => {
+        this.db.exec(`
+          CREATE TABLE idempotency_requests (
+            client_transaction_id TEXT PRIMARY KEY,
+            operation TEXT NOT NULL,
+            payload_hash TEXT NOT NULL,
+            response_json TEXT NOT NULL,
+            completed_at TEXT NOT NULL
+          ) STRICT;
+
+          CREATE TABLE opening_quantity_adjustments (
+            id TEXT PRIMARY KEY,
+            client_transaction_id TEXT NOT NULL UNIQUE,
+            stock_item_id INTEGER NOT NULL REFERENCES tally_stock_items(id),
+            previous_available_quantity INTEGER NOT NULL,
+            target_available_quantity INTEGER NOT NULL CHECK (target_available_quantity >= 0),
+            delta_quantity INTEGER NOT NULL,
+            reason TEXT NOT NULL,
+            adjusted_by TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL
+          ) STRICT;
+
+          ALTER TABLE tally_export_batches
+            ADD COLUMN export_schema_version TEXT NOT NULL DEFAULT '1.0';
+          ALTER TABLE tally_export_batches
+            ADD COLUMN xml_adapter_version TEXT NOT NULL DEFAULT 'receipt-note-v1/material-out-pending';
+
+          CREATE INDEX idx_opening_adjustments_item
+            ON opening_quantity_adjustments(stock_item_id, created_at);
+        `);
+        this.db.prepare("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)").run(4, nowIso());
+      }, "migrating the Local Stores Database to schema 4");
+    }
   }
 
-  transaction<T>(work: () => T): T {
-    this.db.exec("BEGIN IMMEDIATE");
-    try {
-      const result = work();
-      this.db.exec("COMMIT");
-      return result;
-    } catch (error) {
-      this.db.exec("ROLLBACK");
-      throw error;
-    }
+  transaction<T>(work: () => T, operation = "updating inventory"): T {
+    return this.host.transaction(operation, work);
   }
 
   private getSetting<T = unknown>(key: string): T | null {
@@ -502,6 +599,38 @@ export class StoresDatabase {
       INSERT INTO settings(key, value_json, updated_at) VALUES (?, ?, ?)
       ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at
     `).run(key, json(value), nowIso());
+  }
+
+  runIdempotent<T>(
+    clientTransactionId: string,
+    operation: string,
+    payload: unknown,
+    work: () => T,
+  ): T {
+    const id = text(clientTransactionId);
+    if (!id) throw new Error("A stable client transaction ID is required.");
+    return this.transaction(() => {
+      const hash = payloadHash(payload);
+      const existing = this.db.prepare(`
+        SELECT operation, payload_hash, response_json
+        FROM idempotency_requests WHERE client_transaction_id = ?
+      `).get(id) as Row | undefined;
+      if (existing) {
+        if (text(existing.operation) !== operation || text(existing.payload_hash) !== hash) {
+          throw new Error(
+            "This transaction ID was already used for different data. Keep the original ID only when retrying the same operation.",
+          );
+        }
+        return parseJson<T>(existing.response_json, null as T);
+      }
+      const result = work();
+      this.db.prepare(`
+        INSERT INTO idempotency_requests(
+          client_transaction_id, operation, payload_hash, response_json, completed_at
+        ) VALUES (?, ?, ?, ?, ?)
+      `).run(id, operation, hash, json(result), nowIso());
+      return result;
+    }, `processing ${operation}`);
   }
 
   getDataMode(): StoresDataMode {
@@ -523,9 +652,12 @@ export class StoresDatabase {
     this.transaction(() => {
       this.db.exec(`
         DELETE FROM tally_import_results;
+        DELETE FROM idempotency_requests;
+        DELETE FROM opening_quantity_adjustments;
         DELETE FROM tally_export_entries;
         DELETE FROM tally_export_batches;
         DELETE FROM material_out_movement_links;
+        DELETE FROM inventory_adjustments;
         DELETE FROM material_out_vouchers;
         DELETE FROM fifo_allocations;
         DELETE FROM movement_lines;
@@ -542,7 +674,7 @@ export class StoresDatabase {
         DELETE FROM tally_stock_items;
         DELETE FROM sync_history;
         DELETE FROM settings
-        WHERE key NOT IN ('backup_folder', 'export_folder', 'material_out_xml_configured');
+        WHERE key NOT IN ('backup_folder', 'export_folder', 'material_out_xml_configured', 'application_database_host_id');
       `);
       this.setSetting("data_mode", "empty");
     });
@@ -582,6 +714,109 @@ export class StoresDatabase {
     this.pruneBackups(backupFolder);
 
     return { path: backupPath, createdAt, valid: true };
+  }
+
+  private schemaVersionForFile(databasePath: string): number {
+    const check = new DatabaseSync(databasePath, { readOnly: true });
+    try {
+      const table = check.prepare(
+        "SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations'",
+      ).get();
+      if (!table) return 0;
+      const row = check.prepare(
+        "SELECT COALESCE(MAX(version), 0) AS version FROM schema_migrations",
+      ).get() as Row | undefined;
+      return Number(row?.version ?? 0);
+    } finally {
+      check.close();
+    }
+  }
+
+  listBackups(): StoresBackupInfo[] {
+    const folder = this.getBackupFolder();
+    if (!existsSync(folder)) return [];
+    return readdirSync(folder)
+      .filter((name) => name.endsWith(".sqlite"))
+      .map((fileName) => {
+        const backupPath = path.join(folder, fileName);
+        const stats = statSync(backupPath);
+        let valid = false;
+        let schemaVersion = 0;
+        try {
+          valid = this.validateBackupFile(backupPath, true);
+          schemaVersion = this.schemaVersionForFile(backupPath);
+        } catch {
+          valid = false;
+        }
+        return {
+          path: backupPath,
+          fileName,
+          createdAt: stats.mtime.toISOString(),
+          sizeBytes: stats.size,
+          valid,
+          schemaVersion,
+        };
+      })
+      .sort((left, right) => right.createdAt.localeCompare(left.createdAt))
+      .slice(0, BACKUP_RETENTION);
+  }
+
+  restoreBackup(backupPathValue: string): StoresRestoreResult {
+    const backupPath = path.normalize(backupPathValue);
+    if (!path.isAbsolute(backupPath) || !existsSync(backupPath)) {
+      throw new Error("Choose an existing SQLite backup file.");
+    }
+    if (backupPath === this.databasePath) {
+      throw new Error("Choose a backup snapshot, not the active SQLite database.");
+    }
+    const temporary = `${this.databasePath}.restore-${randomUUID()}.partial`;
+    const rollback = `${this.databasePath}.pre-restore-${randomUUID()}`;
+    copyFileSync(backupPath, temporary);
+    if (!this.validateBackupFile(temporary)) {
+      unlinkSync(temporary);
+      throw new Error("The selected backup failed SQLite integrity validation after copying.");
+    }
+    const backupSchema = this.schemaVersionForFile(temporary);
+    if (backupSchema > SCHEMA_VERSION) {
+      unlinkSync(temporary);
+      throw new Error(
+        `This backup uses schema ${backupSchema}, which is newer than this application supports (${SCHEMA_VERSION}).`,
+      );
+    }
+    const safety = this.backup("before-restore");
+
+    this.host.close();
+    for (const sidecar of [`${this.databasePath}-wal`, `${this.databasePath}-shm`]) {
+      if (existsSync(sidecar)) unlinkSync(sidecar);
+    }
+    if (existsSync(this.databasePath)) renameSync(this.databasePath, rollback);
+
+    try {
+      renameSync(temporary, this.databasePath);
+      this.host.open();
+      this.migrate();
+      this.ensureDefaultSettings();
+      if (!this.validateBackupFile(this.databasePath)) {
+        throw new Error("The restored database failed its post-restore integrity check.");
+      }
+      if (existsSync(rollback)) unlinkSync(rollback);
+      return {
+        restoredFrom: backupPath,
+        safetyBackupPath: safety.path,
+        restoredAt: nowIso(),
+        state: this.getState(),
+      };
+    } catch (error) {
+      this.host.close();
+      if (existsSync(this.databasePath)) unlinkSync(this.databasePath);
+      if (existsSync(rollback)) renameSync(rollback, this.databasePath);
+      this.host.open();
+      this.migrate();
+      this.ensureDefaultSettings();
+      throw error;
+    } finally {
+      if (existsSync(temporary)) unlinkSync(temporary);
+    }
   }
 
   private upsertStockItem(item: TallyStoresSnapshot["stockItems"][number], syncedAt: string): number {
@@ -1192,76 +1427,406 @@ export class StoresDatabase {
     });
   }
 
-  recordReturnUnused(input: ReturnUnusedInput): StoresMovement {
+  setOpeningQuantity(input: OpeningQuantityInput): StoresOpeningQuantityAdjustment {
+    const clientTransactionId = text(input.clientTransactionId);
+    if (!clientTransactionId) throw new Error("A stable opening-quantity transaction ID is required.");
+    const targetQuantity = Number(input.targetQuantity);
+    if (!Number.isInteger(targetQuantity) || targetQuantity < 0) {
+      throw new Error("Opening quantity must be a whole number of zero or more.");
+    }
+    const reason = text(input.reason);
+    if (!reason) throw new Error("Explain why the opening quantity is being adjusted.");
+    const adjustedBy = text(input.adjustedBy);
+
+    return this.runIdempotent(
+      clientTransactionId,
+      "OPENING_QUANTITY",
+      { ...input, clientTransactionId, targetQuantity, reason, adjustedBy },
+      () => {
+        const stockItemId = this.itemId(input.tallyItemGuid);
+        const totals = this.db.prepare(`
+          SELECT
+            COALESCE(SUM(quantity_remaining), 0) AS current_total,
+            COALESCE(SUM(CASE WHEN source_type <> 'LEGACY_OPENING' THEN quantity_remaining ELSE 0 END), 0) AS non_legacy_total,
+            COALESCE(SUM(CASE WHEN source_type = 'LEGACY_OPENING' THEN quantity_remaining ELSE 0 END), 0) AS legacy_total
+          FROM purchase_lots WHERE stock_item_id = ?
+        `).get(stockItemId) as Row;
+        const previous = Number(totals.current_total);
+        const nonLegacy = Number(totals.non_legacy_total);
+        const currentLegacy = Number(totals.legacy_total);
+        if (targetQuantity < nonLegacy) {
+          throw new Error(
+            `This item has ${nonLegacy} units linked to GRNs or local receipts. Opening quantity cannot be reduced below that value; correct the source receipt instead.`,
+          );
+        }
+
+        const desiredLegacy = targetQuantity - nonLegacy;
+        const legacyDelta = desiredLegacy - currentLegacy;
+        const timestamp = nowIso();
+        if (legacyDelta > 0) {
+          const supplierId = this.upsertSupplier(
+            LEGACY_SUPPLIER_NAME,
+            "LOCAL:OPENING_LEGACY",
+            timestamp,
+          );
+          this.db.prepare(`
+            INSERT INTO purchase_lots(
+              stock_item_id, supplier_id, source_type, source_voucher_guid, source_voucher_date,
+              grn_number, receipt_date, quantity_received, quantity_remaining, legacy_warning, created_at
+            ) VALUES (?, ?, 'LEGACY_OPENING', ?, ?, ?, ?, ?, ?, 1, ?)
+          `).run(
+            stockItemId,
+            supplierId,
+            `MANUAL-OPENING-${clientTransactionId}`,
+            businessDate(),
+            `Opening adjustment ${timestamp.slice(0, 10)}`,
+            businessDate(),
+            legacyDelta,
+            legacyDelta,
+            timestamp,
+          );
+        } else if (legacyDelta < 0) {
+          let remaining = Math.abs(legacyDelta);
+          const lots = this.db.prepare(`
+            SELECT id, quantity_remaining FROM purchase_lots
+            WHERE stock_item_id = ? AND source_type = 'LEGACY_OPENING' AND quantity_remaining > 0
+            ORDER BY receipt_date DESC, id DESC
+          `).all(stockItemId) as Row[];
+          for (const lot of lots) {
+            if (remaining <= 0) break;
+            const reduction = Math.min(remaining, Number(lot.quantity_remaining));
+            this.db.prepare(
+              "UPDATE purchase_lots SET quantity_remaining = quantity_remaining - ? WHERE id = ?",
+            ).run(reduction, lot.id);
+            remaining -= reduction;
+          }
+          if (remaining !== 0) throw new Error("Opening-stock reduction could not be completed safely.");
+        }
+
+        const item = this.db.prepare(
+          "SELECT tally_guid, name FROM tally_stock_items WHERE id = ?",
+        ).get(stockItemId) as Row;
+        const adjustment: StoresOpeningQuantityAdjustment = {
+          id: `OPEN-${randomUUID()}`,
+          tallyItemGuid: text(item.tally_guid),
+          itemName: text(item.name),
+          previousAvailableQuantity: previous,
+          targetAvailableQuantity: targetQuantity,
+          deltaQuantity: targetQuantity - previous,
+          reason,
+          adjustedBy,
+          createdAt: timestamp,
+        };
+        this.db.prepare(`
+          INSERT INTO opening_quantity_adjustments(
+            id, client_transaction_id, stock_item_id, previous_available_quantity,
+            target_available_quantity, delta_quantity, reason, adjusted_by, created_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          adjustment.id,
+          clientTransactionId,
+          stockItemId,
+          previous,
+          targetQuantity,
+          adjustment.deltaQuantity,
+          reason,
+          adjustedBy,
+          timestamp,
+        );
+        return adjustment;
+      },
+    );
+  }
+
+  getAdjustmentContext(
+    tallyItemGuid: string,
+    destinationTallyItemGuid: string,
+    eventDateValue?: string,
+  ): AdjustmentContext | null {
+    const eventDate = businessDate(eventDateValue);
+    const stockItemId = this.itemId(tallyItemGuid);
+    const destinationItemId = this.itemId(destinationTallyItemGuid);
+    return this.adjustmentContextByIds(stockItemId, destinationItemId, eventDate);
+  }
+
+  private adjustmentContextByIds(
+    stockItemId: number,
+    destinationItemId: number,
+    eventDate: string,
+  ): AdjustmentContext | null {
+    const group = this.db.prepare(`
+      SELECT mov.*, issued.name AS issued_name, destination.name AS destination_name
+      FROM material_out_vouchers mov
+      JOIN tally_stock_items issued ON issued.id = mov.issued_item_id
+      JOIN tally_stock_items destination ON destination.id = mov.destination_item_id
+      WHERE mov.business_date = ? AND mov.issued_item_id = ? AND mov.destination_item_id = ?
+    `).get(eventDate, stockItemId, destinationItemId) as Row | undefined;
+    if (!group) return null;
+
+    const latest = this.db.prepare(`
+      SELECT m.id, m.quantity, m.created_at
+      FROM material_out_movement_links ml
+      JOIN inventory_movements m ON m.id = ml.movement_id
+      WHERE ml.material_out_voucher_id = ? AND ml.net_quantity > 0
+      ORDER BY m.created_at DESC, m.id DESC
+      LIMIT 1
+    `).get(group.id) as Row | undefined;
+    if (!latest) return null;
+
+    return {
+      materialOutVoucherId: text(group.id),
+      eventDate,
+      issuedItemName: text(group.issued_name),
+      destinationName: text(group.destination_name),
+      pendingQuantity: Number(group.quantity),
+      latestMovementId: text(latest.id),
+      latestMovementQuantity: Number(latest.quantity),
+      latestMovementCreatedAt: text(latest.created_at),
+      status: text(group.status) as AdjustmentContext["status"],
+      tallyVoucherNumber: text(group.tally_voucher_number),
+    };
+  }
+
+  recordAdjustment(input: AdjustmentInput): StoresMovement {
     const quantity = integerQuantity(input.quantity);
     const eventDate = businessDate(input.eventDate);
+    const direction = adjustmentDirection(input.direction);
+    const reason = adjustmentReason(input.reason);
+    const note = text(input.note);
+    if (reason === "OTHER" && !note) {
+      throw new Error("Describe the adjustment when the reason is Other.");
+    }
+
     return this.transaction(() => {
       const duplicate = this.movementByClientId(input.clientTransactionId);
       if (duplicate) return duplicate;
+
       const stockItemId = this.itemId(input.tallyItemGuid);
       const destinationItemId = this.itemId(input.destinationTallyItemGuid);
       this.ensureBoxContains(input.boxId, stockItemId);
-      const group = this.db.prepare(`
-        SELECT id, quantity, status, tally_voucher_number FROM material_out_vouchers
-        WHERE business_date = ? AND issued_item_id = ? AND destination_item_id = ?
-      `).get(eventDate, stockItemId, destinationItemId) as Row | undefined;
-      if (!group) throw new Error("No matching same-day Material Out exists for this item and destination.");
-      if (["EXPORTED", "CONFIRMED"].includes(text(group.status))) {
-        const movementId = this.insertReturnException(input, stockItemId, destinationItemId, quantity, eventDate, text(group.tally_voucher_number));
+      const context = this.adjustmentContextByIds(stockItemId, destinationItemId, eventDate);
+      if (!context) {
+        throw new Error("No matching same-day Material Out exists for this item and destination.");
+      }
+
+      if (["EXPORTED", "CONFIRMED"].includes(context.status)) {
+        const movementId = this.insertAdjustmentException(
+          input,
+          stockItemId,
+          destinationItemId,
+          quantity,
+          eventDate,
+          context,
+          direction,
+          reason,
+          note,
+        );
         return this.getMovement(movementId)!;
       }
-      if (quantity > Number(group.quantity)) throw new Error(`Returned quantity cannot exceed the unreturned issued quantity of ${group.quantity}.`);
+
+      if (direction === "RETURN_TO_STOCK" && quantity > context.pendingQuantity) {
+        throw new Error(
+          `The return-to-stock adjustment cannot exceed the current same-day issued quantity of ${context.pendingQuantity}.`,
+        );
+      }
+
+      if (direction === "ADDITIONAL_OUT") {
+        const available = Number((this.db.prepare(
+          "SELECT COALESCE(SUM(quantity_remaining), 0) AS quantity FROM purchase_lots WHERE stock_item_id = ?",
+        ).get(stockItemId) as Row).quantity);
+        if (available < quantity) {
+          throw new Error(`Insufficient local stock. ${available} available; ${quantity} requested.`);
+        }
+      }
 
       const movementId = `MOV-${randomUUID()}`;
       const timestamp = nowIso();
       this.db.prepare(`
-        INSERT INTO inventory_movements(id, client_transaction_id, workflow, event_date, box_id, stock_item_id, quantity, destination_item_id, status, created_at)
-        VALUES (?, ?, 'RETURN_UNUSED', ?, ?, ?, ?, ?, 'PENDING', ?)
-      `).run(movementId, input.clientTransactionId, eventDate, text(input.boxId), stockItemId, quantity, destinationItemId, timestamp);
-      this.db.prepare("INSERT INTO movement_lines(movement_id, stock_item_id, quantity, direction) VALUES (?, ?, ?, 'IN')").run(movementId, stockItemId, quantity);
+        INSERT INTO inventory_movements(
+          id, client_transaction_id, workflow, event_date, box_id,
+          stock_item_id, quantity, destination_item_id, status, created_at
+        ) VALUES (?, ?, 'RETURN_UNUSED', ?, ?, ?, ?, ?, 'PENDING', ?)
+      `).run(
+        movementId,
+        input.clientTransactionId,
+        eventDate,
+        text(input.boxId),
+        stockItemId,
+        quantity,
+        destinationItemId,
+        timestamp,
+      );
+      this.db.prepare(`
+        INSERT INTO inventory_adjustments(
+          movement_id, material_out_voucher_id, reference_movement_id,
+          direction, reason, note, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        movementId,
+        context.materialOutVoucherId,
+        context.latestMovementId,
+        direction,
+        reason,
+        note,
+        timestamp,
+      );
+      this.db.prepare(`
+        INSERT INTO movement_lines(movement_id, stock_item_id, quantity, direction)
+        VALUES (?, ?, ?, ?)
+      `).run(
+        movementId,
+        stockItemId,
+        quantity,
+        direction === "RETURN_TO_STOCK" ? "IN" : "OUT",
+      );
 
-      let remaining = quantity;
-      const allocations = this.db.prepare(`
-        SELECT fa.id, fa.purchase_lot_id, fa.quantity,
-          COALESCE((SELECT SUM(r.quantity) FROM fifo_allocations r WHERE r.source_allocation_id = fa.id AND r.direction = 'RESTORE'), 0) AS restored
-        FROM fifo_allocations fa
-        JOIN material_out_movement_links ml ON ml.movement_id = fa.movement_id
-        WHERE ml.material_out_voucher_id = ? AND fa.direction = 'OUT'
-        ORDER BY fa.id DESC
-      `).all(group.id) as Row[];
-      for (const allocation of allocations) {
-        if (remaining <= 0) break;
-        const reversible = Number(allocation.quantity) - Number(allocation.restored);
-        if (reversible <= 0) continue;
-        const restored = Math.min(remaining, reversible);
-        this.db.prepare("UPDATE purchase_lots SET quantity_remaining = quantity_remaining + ? WHERE id = ?").run(restored, allocation.purchase_lot_id);
-        this.db.prepare(`
-          INSERT INTO fifo_allocations(movement_id, purchase_lot_id, quantity, direction, source_allocation_id, created_at)
-          VALUES (?, ?, ?, 'RESTORE', ?, ?)
-        `).run(movementId, allocation.purchase_lot_id, restored, allocation.id, timestamp);
-        remaining -= restored;
+      if (direction === "RETURN_TO_STOCK") {
+        let remaining = quantity;
+        const allocations = this.db.prepare(`
+          SELECT fa.id, fa.purchase_lot_id, fa.quantity,
+            COALESCE((
+              SELECT SUM(r.quantity) FROM fifo_allocations r
+              WHERE r.source_allocation_id = fa.id AND r.direction = 'RESTORE'
+            ), 0) AS restored
+          FROM fifo_allocations fa
+          JOIN material_out_movement_links ml ON ml.movement_id = fa.movement_id
+          JOIN inventory_movements source_movement ON source_movement.id = fa.movement_id
+          WHERE ml.material_out_voucher_id = ? AND fa.direction = 'OUT'
+          ORDER BY source_movement.created_at DESC, fa.id DESC
+        `).all(context.materialOutVoucherId) as Row[];
+        for (const allocation of allocations) {
+          if (remaining <= 0) break;
+          const reversible = Number(allocation.quantity) - Number(allocation.restored);
+          if (reversible <= 0) continue;
+          const restored = Math.min(remaining, reversible);
+          this.db.prepare(
+            "UPDATE purchase_lots SET quantity_remaining = quantity_remaining + ? WHERE id = ?",
+          ).run(restored, allocation.purchase_lot_id);
+          this.db.prepare(`
+            INSERT INTO fifo_allocations(
+              movement_id, purchase_lot_id, quantity, direction,
+              source_allocation_id, created_at
+            ) VALUES (?, ?, ?, 'RESTORE', ?, ?)
+          `).run(movementId, allocation.purchase_lot_id, restored, allocation.id, timestamp);
+          remaining -= restored;
+        }
+        if (remaining !== 0) {
+          throw new Error("The original FIFO allocations could not be fully reversed.");
+        }
+      } else {
+        let remaining = quantity;
+        const lots = this.db.prepare(`
+          SELECT id, quantity_remaining FROM purchase_lots
+          WHERE stock_item_id = ? AND quantity_remaining > 0
+          ORDER BY receipt_date ASC, source_voucher_date ASC, id ASC
+        `).all(stockItemId) as Row[];
+        for (const lot of lots) {
+          if (remaining <= 0) break;
+          const allocated = Math.min(remaining, Number(lot.quantity_remaining));
+          this.db.prepare(
+            "UPDATE purchase_lots SET quantity_remaining = quantity_remaining - ? WHERE id = ?",
+          ).run(allocated, lot.id);
+          this.db.prepare(`
+            INSERT INTO fifo_allocations(
+              movement_id, purchase_lot_id, quantity, direction, created_at
+            ) VALUES (?, ?, ?, 'OUT', ?)
+          `).run(movementId, lot.id, allocated, timestamp);
+          remaining -= allocated;
+        }
+        if (remaining !== 0) {
+          throw new Error("FIFO allocation failed despite the availability check.");
+        }
       }
-      if (remaining !== 0) throw new Error("The original FIFO allocations could not be fully reversed.");
 
-      this.db.prepare("UPDATE material_out_vouchers SET quantity = quantity - ?, status = 'PENDING', updated_at = ? WHERE id = ?").run(quantity, timestamp, group.id);
-      this.db.prepare("INSERT INTO material_out_movement_links(material_out_voucher_id, movement_id, net_quantity) VALUES (?, ?, ?)").run(group.id, movementId, -quantity);
-      this.db.prepare("UPDATE tally_export_entries SET status = 'PENDING', batch_id = NULL, reviewed_by = '', reviewed_at = NULL, updated_at = ? WHERE entity_type = 'MATERIAL_OUT' AND entity_id = ?").run(timestamp, group.id);
+      const netQuantity = direction === "RETURN_TO_STOCK" ? -quantity : quantity;
+      this.db.prepare(`
+        UPDATE material_out_vouchers
+        SET quantity = quantity + ?, status = 'PENDING', updated_at = ?
+        WHERE id = ?
+      `).run(netQuantity, timestamp, context.materialOutVoucherId);
+      this.db.prepare(`
+        INSERT INTO material_out_movement_links(
+          material_out_voucher_id, movement_id, net_quantity
+        ) VALUES (?, ?, ?)
+      `).run(context.materialOutVoucherId, movementId, netQuantity);
+      this.db.prepare(`
+        UPDATE tally_export_entries
+        SET status = 'PENDING', batch_id = NULL, reviewed_by = '',
+          reviewed_at = NULL, updated_at = ?
+        WHERE entity_type = 'MATERIAL_OUT' AND entity_id = ?
+      `).run(timestamp, context.materialOutVoucherId);
       return this.getMovement(movementId)!;
     });
   }
 
-  private insertReturnException(input: ReturnUnusedInput, stockItemId: number, destinationItemId: number, quantity: number, eventDate: string, tallyVoucherNumber: string): string {
+  private insertAdjustmentException(
+    input: AdjustmentInput,
+    stockItemId: number,
+    destinationItemId: number,
+    quantity: number,
+    eventDate: string,
+    context: AdjustmentContext,
+    direction: AdjustmentInput["direction"],
+    reason: AdjustmentInput["reason"],
+    note: string,
+  ): string {
     const movementId = `MOV-${randomUUID()}`;
     const timestamp = nowIso();
     this.db.prepare(`
-      INSERT INTO inventory_movements(id, client_transaction_id, workflow, event_date, box_id, stock_item_id, quantity, destination_item_id, status, created_at)
-      VALUES (?, ?, 'RETURN_UNUSED', ?, ?, ?, ?, ?, 'EXCEPTION', ?)
-    `).run(movementId, input.clientTransactionId, eventDate, text(input.boxId), stockItemId, quantity, destinationItemId, timestamp);
-    this.db.prepare("INSERT INTO movement_lines(movement_id, stock_item_id, quantity, direction) VALUES (?, ?, ?, 'IN')").run(movementId, stockItemId, quantity);
+      INSERT INTO inventory_movements(
+        id, client_transaction_id, workflow, event_date, box_id,
+        stock_item_id, quantity, destination_item_id, status, created_at
+      ) VALUES (?, ?, 'RETURN_UNUSED', ?, ?, ?, ?, ?, 'EXCEPTION', ?)
+    `).run(
+      movementId,
+      input.clientTransactionId,
+      eventDate,
+      text(input.boxId),
+      stockItemId,
+      quantity,
+      destinationItemId,
+      timestamp,
+    );
     this.db.prepare(`
-      INSERT INTO tally_export_entries(id, entity_type, entity_id, status, external_id, validation_json, created_at, updated_at)
-      VALUES (?, 'RETURN_EXCEPTION', ?, 'EXCEPTION', ?, ?, ?, ?)
-    `).run(`EXP-${randomUUID()}`, movementId, `INVSCAN-RETURN-${movementId}`, json([`Original Material Out was already exported${tallyVoucherNumber ? ` as ${tallyVoucherNumber}` : ""}. Chief of Staff correction is required.`]), timestamp, timestamp);
+      INSERT INTO inventory_adjustments(
+        movement_id, material_out_voucher_id, reference_movement_id,
+        direction, reason, note, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      movementId,
+      context.materialOutVoucherId,
+      context.latestMovementId,
+      direction,
+      reason,
+      note,
+      timestamp,
+    );
+    this.db.prepare(`
+      INSERT INTO movement_lines(movement_id, stock_item_id, quantity, direction)
+      VALUES (?, ?, ?, ?)
+    `).run(
+      movementId,
+      stockItemId,
+      quantity,
+      direction === "RETURN_TO_STOCK" ? "IN" : "OUT",
+    );
+    this.db.prepare(`
+      INSERT INTO tally_export_entries(
+        id, entity_type, entity_id, status, external_id,
+        validation_json, created_at, updated_at
+      ) VALUES (?, 'RETURN_EXCEPTION', ?, 'EXCEPTION', ?, ?, ?, ?)
+    `).run(
+      `EXP-${randomUUID()}`,
+      movementId,
+      `INVSCAN-ADJUSTMENT-${movementId}`,
+      json([
+        `The matching Material Out was already ${context.status.toLocaleLowerCase()}${
+          context.tallyVoucherNumber ? ` as ${context.tallyVoucherNumber}` : ""
+        }. Chief of Staff correction is required.`,
+      ]),
+      timestamp,
+      timestamp,
+    );
     return movementId;
   }
 
@@ -1307,9 +1872,16 @@ export class StoresDatabase {
   }
 
   private mapMovement(row: Row): StoresMovement {
+    const adjustment = this.db.prepare(`
+      SELECT direction, reason, note, reference_movement_id
+      FROM inventory_adjustments WHERE movement_id = ?
+    `).get(row.id) as Row | undefined;
+    const isLegacyReturn = text(row.workflow) === "RETURN_UNUSED" && !adjustment;
     return {
       id: text(row.id),
-      workflow: text(row.workflow) as StoresMovement["workflow"],
+      workflow: adjustment || isLegacyReturn
+        ? "ADJUSTMENT"
+        : text(row.workflow) as StoresMovement["workflow"],
       eventDate: text(row.event_date),
       boxId: text(row.box_id),
       itemName: text(row.item_name),
@@ -1321,6 +1893,14 @@ export class StoresDatabase {
       challanNumber: text(row.challan_number),
       status: text(row.status) as StoresMovement["status"],
       createdAt: text(row.created_at),
+      adjustmentDirection: adjustment
+        ? text(adjustment.direction) as StoresMovement["adjustmentDirection"]
+        : isLegacyReturn ? "RETURN_TO_STOCK" : null,
+      adjustmentReason: adjustment
+        ? text(adjustment.reason) as StoresMovement["adjustmentReason"]
+        : isLegacyReturn ? "UNUSED_MATERIAL" : null,
+      adjustmentNote: adjustment ? text(adjustment.note) : "",
+      referenceMovementId: adjustment ? text(adjustment.reference_movement_id) : "",
     };
   }
 
@@ -1342,6 +1922,9 @@ export class StoresDatabase {
       backupFolder,
       exportFolder: this.getExportFolder(this.defaultExportFolder),
       latestBackup: latest,
+      hostId: this.getSetting<string>("application_database_host_id") || "",
+      writerMode: "AUTHORITATIVE_HOST",
+      backups: this.listBackups(),
     };
   }
 
@@ -1440,6 +2023,22 @@ export class StoresDatabase {
     `).all() as Row[]).map((row) => this.mapMovement(row));
 
     const reviewEntries = this.reviewEntries();
+    const openingQuantityAdjustments: StoresOpeningQuantityAdjustment[] = (this.db.prepare(`
+      SELECT adjustment.*, item.tally_guid, item.name AS item_name
+      FROM opening_quantity_adjustments adjustment
+      JOIN tally_stock_items item ON item.id = adjustment.stock_item_id
+      ORDER BY adjustment.created_at DESC LIMIT 100
+    `).all() as Row[]).map((row) => ({
+      id: text(row.id),
+      tallyItemGuid: text(row.tally_guid),
+      itemName: text(row.item_name),
+      previousAvailableQuantity: Number(row.previous_available_quantity),
+      targetAvailableQuantity: Number(row.target_available_quantity),
+      deltaQuantity: Number(row.delta_quantity),
+      reason: text(row.reason),
+      adjustedBy: text(row.adjusted_by),
+      createdAt: text(row.created_at),
+    }));
     const emptySync: StoresSyncSummary = {
       syncedAt: null,
       stockItemsImported: 0,
@@ -1478,6 +2077,8 @@ export class StoresDatabase {
       purchaseLots,
       recentMovements,
       reviewEntries,
+      openingQuantityAdjustments,
+      exportSchemaVersion: "1.0",
       materialOutXmlConfigured: this.getSetting<boolean>("material_out_xml_configured") === true,
     };
   }
@@ -1520,8 +2121,11 @@ export class StoresDatabase {
         };
       }
       const movement = this.getMovement(text(entry.entity_id));
+      const effect = movement?.adjustmentDirection === "ADDITIONAL_OUT"
+        ? "additional issue"
+        : "return to stock";
       return {
-        id: text(entry.id), entityType: "RETURN_EXCEPTION", entityId: text(entry.entity_id), status: text(entry.status) as StoresReviewEntry["status"], externalId: text(entry.external_id), eventDate: movement?.eventDate ?? "", title: `Return exception — ${movement?.itemName ?? "Unknown item"}`, supplierName: "", poNumber: "", challanNumber: "", issuedItemName: movement?.itemName ?? "", destinationName: movement?.destinationName ?? "", quantity: movement?.quantity ?? 0, fifoSummary: "", validationMessages: parseJson<string[]>(entry.validation_json, []), contributingTransactions: 1, tallyVoucherNumber: text(entry.tally_voucher_number),
+        id: text(entry.id), entityType: "ADJUSTMENT_EXCEPTION", entityId: text(entry.entity_id), status: text(entry.status) as StoresReviewEntry["status"], externalId: text(entry.external_id), eventDate: movement?.eventDate ?? "", title: `Adjustment exception (${effect}) — ${movement?.itemName ?? "Unknown item"}`, supplierName: "", poNumber: "", challanNumber: "", issuedItemName: movement?.itemName ?? "", destinationName: movement?.destinationName ?? "", quantity: movement?.quantity ?? 0, fifoSummary: "", validationMessages: parseJson<string[]>(entry.validation_json, []), contributingTransactions: 1, tallyVoucherNumber: text(entry.tally_voucher_number),
       };
     });
   }
@@ -1632,11 +2236,23 @@ export class StoresDatabase {
     return { review, allocations, movements, legacyLots };
   }
 
-  createBatchRecord(input: ExportBatchInput, entryIds: string[], requestedBatchId?: string): string {
+  createBatchRecord(
+    input: ExportBatchInput,
+    entryIds: string[],
+    requestedBatchId?: string,
+    exportSchemaVersion = "1.0",
+    xmlAdapterVersion = "receipt-note-v1/material-out-pending",
+  ): string {
     const batchId = requestedBatchId || `BATCH-${randomUUID()}`;
     const timestamp = nowIso();
     this.transaction(() => {
-      this.db.prepare("INSERT INTO tally_export_batches(id, created_at, approval_timestamp, approved_by) VALUES (?, ?, ?, ?)").run(batchId, timestamp, timestamp, text(input.reviewedBy));
+      this.db.prepare(`
+        INSERT INTO tally_export_batches(
+          id, created_at, approval_timestamp, approved_by, export_schema_version, xml_adapter_version
+        ) VALUES (?, ?, ?, ?, ?, ?)
+      `).run(
+        batchId, timestamp, timestamp, text(input.reviewedBy), exportSchemaVersion, xmlAdapterVersion,
+      );
       const update = this.db.prepare("UPDATE tally_export_entries SET batch_id = ?, status = 'EXPORTED', updated_at = ? WHERE id = ? AND status = 'APPROVED'");
       for (const entryId of entryIds) update.run(batchId, timestamp, entryId);
       this.db.prepare(`UPDATE material_out_vouchers SET status = 'EXPORTED', updated_at = ? WHERE id IN (SELECT entity_id FROM tally_export_entries WHERE batch_id = ? AND entity_type = 'MATERIAL_OUT')`).run(timestamp, batchId);

@@ -1,5 +1,5 @@
 import { existsSync } from "node:fs";
-import { mkdir } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import type { Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import os from "node:os";
@@ -15,8 +15,10 @@ import {
 } from "electron";
 import express, { type Express } from "express";
 
+import { ApplicationDatabase } from "./database/application-database";
 import { TallyService } from "./tally/service";
 import { createStoresRouter } from "./stores/router";
+import { StoresDatabase } from "./stores/database";
 import { StoresService } from "./stores/service";
 
 interface DesktopInfo {
@@ -43,6 +45,7 @@ let apiServer: Server | null = null;
 let desktopInfo: DesktopInfo | null = null;
 let tallyService: TallyService | null = null;
 let storesService: StoresService | null = null;
+let applicationDatabase: ApplicationDatabase | null = null;
 
 function preferredPort(): number {
   const configured = Number(process.env.INVENTORY_SCANNER_PORT ?? DEFAULT_PORT);
@@ -158,11 +161,76 @@ function absolutePath(value: unknown, label: string): string {
   return path.normalize(value);
 }
 
+interface PrintResult {
+  success: boolean;
+  failureReason?: string;
+}
+
+function printableHtml(value: unknown): string {
+  if (typeof value !== "string" || value.trim().length === 0) {
+    throw new Error("Printable HTML is required.");
+  }
+  if (Buffer.byteLength(value, "utf8") > 25 * 1024 * 1024) {
+    throw new Error("The print job is too large. Reduce the number of labels and try again.");
+  }
+  return value;
+}
+
+async function printHtmlDocument(html: string): Promise<PrintResult> {
+  const temporaryDirectory = await mkdtemp(
+    path.join(os.tmpdir(), "inventory-scanner-print-"),
+  );
+  const printFilePath = path.join(temporaryDirectory, "labels.html");
+  await writeFile(printFilePath, html, "utf8");
+
+  const printWindow = new BrowserWindow({
+    title: "Print Inventory Labels",
+    width: 1100,
+    height: 800,
+    show: false,
+    parent: mainWindow ?? undefined,
+    webPreferences: {
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true,
+      javascript: false,
+    },
+  });
+
+  try {
+    await printWindow.loadFile(printFilePath);
+
+    return await new Promise<PrintResult>((resolve) => {
+      printWindow.webContents.print(
+        {
+          silent: false,
+          printBackground: true,
+        },
+        (success, failureReason) => {
+          resolve({
+            success,
+            failureReason: success
+              ? undefined
+              : failureReason || "The operating system did not accept the print job.",
+          });
+        },
+      );
+    });
+  } finally {
+    if (!printWindow.isDestroyed()) printWindow.destroy();
+    await rm(temporaryDirectory, { recursive: true, force: true });
+  }
+}
+
 function registerIpcHandlers(): void {
   ipcMain.handle("desktop:get-info", () => {
     if (!desktopInfo) throw new Error("The local server has not started yet.");
     return desktopInfo;
   });
+
+  ipcMain.handle("desktop:print-html", async (_event, html: unknown) =>
+    printHtmlDocument(printableHtml(html)),
+  );
 
   ipcMain.handle(
     "desktop:choose-workbook-folder",
@@ -268,6 +336,31 @@ function registerIpcHandlers(): void {
     return storesService.backup("manual");
   });
 
+  ipcMain.handle("stores:set-opening-quantity", (_event, input: unknown) => {
+    if (!storesService) throw new Error("The Local Stores Database is unavailable.");
+    return storesService.setOpeningQuantity(input as never);
+  });
+
+  ipcMain.handle("stores:choose-backup-file", async () => {
+    if (!storesService) throw new Error("The Local Stores Database is unavailable.");
+    const options: OpenDialogOptions = {
+      title: "Choose an Inventory Scanner SQLite backup",
+      buttonLabel: "Choose backup",
+      defaultPath: storesService.getState().database.backupFolder,
+      properties: ["openFile"],
+      filters: [{ name: "SQLite database", extensions: ["sqlite", "db"] }],
+    };
+    const result = mainWindow
+      ? await dialog.showOpenDialog(mainWindow, options)
+      : await dialog.showOpenDialog(options);
+    return result.canceled ? null : (result.filePaths[0] ?? null);
+  });
+
+  ipcMain.handle("stores:restore-backup", (_event, backupPath: unknown) => {
+    if (!storesService) throw new Error("The Local Stores Database is unavailable.");
+    return storesService.restoreBackup(absolutePath(backupPath, "Backup path"));
+  });
+
   ipcMain.handle("stores:choose-folder", async (_event, kind: "backup" | "export") => {
     if (!storesService) throw new Error("The Local Stores Database is unavailable.");
     const state = storesService.getState();
@@ -337,7 +430,10 @@ async function createWindow(): Promise<void> {
 
 async function bootstrap(): Promise<void> {
   Menu.setApplicationMenu(null);
-  storesService = new StoresService(app.getPath("userData"));
+  applicationDatabase = new ApplicationDatabase(
+    StoresDatabase.databasePathFor(app.getPath("userData")),
+  );
+  storesService = new StoresService(app.getPath("userData"), applicationDatabase);
   storesService.ensureDemoData();
   tallyService = new TallyService(app.getPath("userData"));
   if (process.platform === "darwin") app.dock?.setIcon(applicationIconPath());
@@ -381,4 +477,6 @@ app.on("before-quit", () => {
   apiServer = null;
   storesService?.close();
   storesService = null;
+  applicationDatabase?.close();
+  applicationDatabase = null;
 });

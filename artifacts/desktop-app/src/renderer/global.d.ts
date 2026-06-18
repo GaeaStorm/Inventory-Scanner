@@ -5,9 +5,11 @@ import type {
   DesktopInfo,
   ExportBatchInput,
   ExportBatchResult,
+  OpeningQuantityInput,
   ReviewDecisionInput,
   SaveBoxInput,
   StoresBackupResult,
+  StoresRestoreResult,
   StoresBox,
   StoresState,
   TallyConnectionResult,
@@ -21,6 +23,7 @@ declare global {
   interface Window {
     desktop: {
       getInfo: () => Promise<DesktopInfo>;
+      printHtml: (html: string) => Promise<{ success: boolean; failureReason?: string }>;
       chooseWorkbookFolder: (currentWorkbookPath?: string) => Promise<string | null>;
       openWorkbookFolder: (workbookPath: string) => Promise<string>;
       openExcelFile: (workbookPath: string) => Promise<string>;
@@ -42,6 +45,9 @@ declare global {
         exportBatch: (input: ExportBatchInput) => Promise<ExportBatchResult>;
         confirmImport: (input: ConfirmImportInput) => Promise<StoresState>;
         backupNow: () => Promise<StoresBackupResult>;
+        setOpeningQuantity: (input: OpeningQuantityInput) => Promise<StoresState>;
+        chooseBackupFile: () => Promise<string | null>;
+        restoreBackup: (backupPath: string) => Promise<StoresRestoreResult>;
         chooseFolder: (kind: "backup" | "export") => Promise<StoresState | null>;
         openPath: (targetPath: string) => Promise<string>;
       };

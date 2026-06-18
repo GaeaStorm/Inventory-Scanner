@@ -9,6 +9,9 @@ import { StoresDatabase } from "./database";
 
 type Row = Record<string, any>;
 
+export const REVIEW_EXPORT_SCHEMA_VERSION = "1.0";
+export const TALLY_XML_ADAPTER_VERSION = "receipt-note-v1/material-out-pending";
+
 function text(value: unknown): string {
   return String(value ?? "").trim();
 }
@@ -86,7 +89,7 @@ export class StoresExporter {
     const exportFolder = this.database.getExportFolder(this.defaultExportFolder);
     mkdirSync(exportFolder, { recursive: true });
     const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-    const base = `inventory-scanner-${stamp}`;
+    const base = `inventory-scanner-v${REVIEW_EXPORT_SCHEMA_VERSION}-${stamp}`;
     const excelPath = path.join(exportFolder, `${base}-review.xlsx`);
     const csvPath = input.includeCsv ? path.join(exportFolder, `${base}-review.csv`) : null;
     const xmlPath = path.join(exportFolder, `${base}-tally.xml`);
@@ -144,6 +147,17 @@ export class StoresExporter {
       "Quantity Remaining": lot.quantityRemaining,
       Warning: "Supplier could not be reconstructed from historical GRNs.",
     }));
+    const openingAdjustmentRows: Row[] = this.database.getState().openingQuantityAdjustments.map((entry) => ({
+      "Adjustment ID": entry.id,
+      "Created At": entry.createdAt,
+      "Stock Item": entry.itemName,
+      "Tally Item GUID": entry.tallyItemGuid,
+      "Previous Local Count": entry.previousAvailableQuantity,
+      "Target Local Count": entry.targetAvailableQuantity,
+      "Quantity Change": entry.deltaQuantity,
+      Reason: entry.reason,
+      "Adjusted By": entry.adjustedBy,
+    }));
     const exceptionRows: Row[] = this.database.getState().reviewEntries
       .filter((entry) => entry.status === "EXCEPTION" || entry.validationMessages.length > 0)
       .map((entry) => ({
@@ -166,24 +180,44 @@ export class StoresExporter {
       "PO Number": movement.poNumber,
       "Challan Number": movement.challanNumber,
       Status: movement.status,
+      "Adjustment Effect": movement.adjustmentDirection ?? "",
+      "Adjustment Reason": movement.adjustmentReason ?? "",
+      "Adjustment Note": movement.adjustmentNote,
+      "Adjusted Movement ID": movement.referenceMovementId,
       "Created At": movement.createdAt,
     }));
 
     const workbook = XLSX.utils.book_new();
+    workbook.Props = {
+      Title: "Inventory Scanner End-of-Day Review",
+      Subject: `Schema ${REVIEW_EXPORT_SCHEMA_VERSION}`,
+      Author: "Inventory Scanner",
+      CreatedDate: new Date(),
+    };
+    appendSheet(workbook, "Metadata", [{
+      "Export Schema Version": REVIEW_EXPORT_SCHEMA_VERSION,
+      "Tally XML Adapter Version": TALLY_XML_ADAPTER_VERSION,
+      "Batch ID": batchId,
+      "Generated At": new Date().toISOString(),
+      "Reviewed By": reviewedBy,
+      Company: this.database.getState().companyName,
+    }]);
     appendSheet(workbook, "Summary", summaryRows);
     appendSheet(workbook, "GRNs", grnRows);
     appendSheet(workbook, "Material Out", materialOutRows);
     appendSheet(workbook, "FIFO Allocations", allocationRows);
     appendSheet(workbook, "Opening Legacy Stock", legacyRows);
+    appendSheet(workbook, "Opening Adjustments", openingAdjustmentRows);
     appendSheet(workbook, "Exceptions", exceptionRows);
     appendSheet(workbook, "Source Transactions", sourceRows);
     XLSX.writeFile(workbook, excelPath);
 
     if (csvPath) {
       const combinedRows = [
-        ...summaryRows.map((row) => ({ "Record Type": "Summary", ...row })),
-        ...allocationRows.map((row) => ({ "Record Type": "FIFO Allocation", ...row })),
-        ...sourceRows.map((row) => ({ "Record Type": "Source Transaction", ...row })),
+        ...summaryRows.map((row) => ({ "Schema Version": REVIEW_EXPORT_SCHEMA_VERSION, "Record Type": "Summary", ...row })),
+        ...allocationRows.map((row) => ({ "Schema Version": REVIEW_EXPORT_SCHEMA_VERSION, "Record Type": "FIFO Allocation", ...row })),
+        ...openingAdjustmentRows.map((row) => ({ "Schema Version": REVIEW_EXPORT_SCHEMA_VERSION, "Record Type": "Opening Adjustment", ...row })),
+        ...sourceRows.map((row) => ({ "Schema Version": REVIEW_EXPORT_SCHEMA_VERSION, "Record Type": "Source Transaction", ...row })),
       ];
       writeFileSync(csvPath, rowsToCsv(combinedRows), "utf8");
     }
@@ -194,6 +228,7 @@ export class StoresExporter {
       ? this.buildConfiguredMaterialOutXml(materialOut)
       : "";
     const payload = `<?xml version="1.0" encoding="utf-8"?>
+<!-- Inventory Scanner export schema ${REVIEW_EXPORT_SCHEMA_VERSION}; adapter ${TALLY_XML_ADAPTER_VERSION}; batch ${batchId} -->
 <ENVELOPE>
   <HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER>
   <BODY>
@@ -211,10 +246,23 @@ ${grnXml}${materialOutXml}
     writeFileSync(xmlPath, payload, "utf8");
 
     const payloadHash = createHash("sha256").update(payload).digest("hex");
-    this.database.createBatchRecord(input, exportable.map((entry) => entry.id), batchId);
+    this.database.createBatchRecord(
+      input,
+      exportable.map((entry) => entry.id),
+      batchId,
+      REVIEW_EXPORT_SCHEMA_VERSION,
+      TALLY_XML_ADAPTER_VERSION,
+    );
     this.database.finishBatch(batchId, { excelPath, csvPath, xmlPath, payloadHash });
 
-    return { batchId, excelPath, csvPath, xmlPath, warnings };
+    return {
+      schemaVersion: REVIEW_EXPORT_SCHEMA_VERSION,
+      batchId,
+      excelPath,
+      csvPath,
+      xmlPath,
+      warnings,
+    };
   }
 
   private buildGrnXml(entries: ReturnType<StoresDatabase["approvedEntries"]>): string {

@@ -2,6 +2,7 @@ import { contextBridge, ipcRenderer } from "electron";
 
 contextBridge.exposeInMainWorld("desktop", {
   getInfo: () => ipcRenderer.invoke("desktop:get-info"),
+  printHtml: (html: string) => ipcRenderer.invoke("desktop:print-html", html),
   chooseWorkbookFolder: (currentWorkbookPath?: string) =>
     ipcRenderer.invoke("desktop:choose-workbook-folder", currentWorkbookPath),
   openWorkbookFolder: (workbookPath: string) =>
@@ -25,6 +26,9 @@ contextBridge.exposeInMainWorld("desktop", {
     exportBatch: (input: unknown) => ipcRenderer.invoke("stores:export-batch", input),
     confirmImport: (input: unknown) => ipcRenderer.invoke("stores:confirm-import", input),
     backupNow: () => ipcRenderer.invoke("stores:backup-now"),
+    setOpeningQuantity: (input: unknown) => ipcRenderer.invoke("stores:set-opening-quantity", input),
+    chooseBackupFile: () => ipcRenderer.invoke("stores:choose-backup-file"),
+    restoreBackup: (backupPath: string) => ipcRenderer.invoke("stores:restore-backup", backupPath),
     chooseFolder: (kind: "backup" | "export") =>
       ipcRenderer.invoke("stores:choose-folder", kind),
     openPath: (targetPath: string) => ipcRenderer.invoke("stores:open-path", targetPath),

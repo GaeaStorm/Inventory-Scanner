@@ -1,14 +1,7 @@
 import { Router, type NextFunction, type Request, type Response } from "express";
 
+import { DatabaseBusyError } from "../database/application-database";
 import { StoresService } from "./service";
-
-function asyncHandler(
-  handler: (request: Request, response: Response) => Promise<void> | void,
-) {
-  return (request: Request, response: Response, next: NextFunction) => {
-    Promise.resolve(handler(request, response)).catch(next);
-  };
-}
 
 export function createStoresRouter(service: StoresService): Router {
   const router = Router();
@@ -25,8 +18,7 @@ export function createStoresRouter(service: StoresService): Router {
         if (left.hasBom !== right.hasBom) return left.hasBom ? -1 : 1;
         return left.name.localeCompare(right.name);
       }),
-      suppliers: state.suppliers,
-      purchaseOrders: state.purchaseOrders,
+      cacheVersion: `${state.companyGuid}:${state.sync.syncedAt ?? "local"}`,
     });
   });
 
@@ -55,13 +47,53 @@ export function createStoresRouter(service: StoresService): Router {
     response.status(201).json(service.materialOut(request.body));
   });
 
+  router.post("/offline-batch", (request, response) => {
+    response.json(service.processOfflineBatch(request.body));
+  });
+
+  router.post("/opening-quantity", (request, response) => {
+    response.json(service.setOpeningQuantity(request.body));
+  });
+
+  router.get("/adjustment-context", (request, response) => {
+    const context = service.adjustmentContext(
+      String(request.query.tallyItemGuid ?? ""),
+      String(request.query.destinationTallyItemGuid ?? ""),
+      String(request.query.eventDate ?? ""),
+    );
+    if (!context) {
+      response.status(404).json({
+        error: "No matching same-day Material Out exists for this item and destination.",
+      });
+      return;
+    }
+    response.json(context);
+  });
+
+  router.post("/adjustments", (request, response) => {
+    response.status(201).json(service.adjustment(request.body));
+  });
+
+  // Backward compatibility for older scanner builds and previously printed workflow docs.
   router.post("/return-unused", (request, response) => {
-    response.status(201).json(service.returnUnused(request.body));
+    response.status(201).json(service.adjustment({
+      ...request.body,
+      direction: "RETURN_TO_STOCK",
+      reason: "UNUSED_MATERIAL",
+    }));
   });
 
   router.use((error: unknown, _request: Request, response: Response, _next: NextFunction) => {
+    if (error instanceof DatabaseBusyError) {
+      response.setHeader("Retry-After", String(error.retryAfterSeconds));
+      response.status(503).json({
+        error: error.message,
+        retryable: true,
+      });
+      return;
+    }
     const message = error instanceof Error ? error.message : String(error);
-    response.status(400).json({ error: message });
+    response.status(400).json({ error: message, retryable: false });
   });
 
   return router;

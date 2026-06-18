@@ -70,6 +70,7 @@ export default function BoxQrCodeCreatorTab({ stores, onChanged }: Props) {
   const [copies, setCopies] = useState("1");
   const [queue, setQueue] = useState<QueueEntry[]>([]);
   const [busy, setBusy] = useState(false);
+  const [printing, setPrinting] = useState(false);
   const [notice, setNotice] = useState("");
   const [error, setError] = useState("");
 
@@ -183,14 +184,12 @@ export default function BoxQrCodeCreatorTab({ stores, onChanged }: Props) {
     setNotice(`Added ${count} label${count === 1 ? "" : "s"} to the print queue.`);
   }
 
-  function printQueue(): void {
-    if (queue.length === 0) return;
-    const printWindow = window.open("", "_blank", "width=1100,height=800");
-    if (!printWindow) {
-      setError("The print window was blocked.");
-      return;
-    }
-    const labels = queue.flatMap((entry) => Array.from({ length: entry.copies }, () => entry));
+  async function printQueue(): Promise<void> {
+    if (queue.length === 0 || printing) return;
+
+    const labels = queue.flatMap((entry) =>
+      Array.from({ length: entry.copies }, () => entry),
+    );
     const pages = chunksOf(labels, 4);
     const labelMarkup = ({ box, qrDataUrl: image }: QueueEntry) => `<article class="label">
       <div class="label-header"><strong>${escapeHtml(box.boxId)}</strong><span>r${box.revision}</span></div>
@@ -198,10 +197,29 @@ export default function BoxQrCodeCreatorTab({ stores, onChanged }: Props) {
       <div class="company">${escapeHtml(stores.companyName || "Tally company")}</div>
       <ol class="items">${box.items.map((item) => `<li>${escapeHtml(item.itemName)}</li>`).join("")}</ol>
     </article>`;
-    printWindow.document.write(`<!doctype html><html><head><title>Inventory box labels</title><style>
-      @page{size:auto;margin:.25in}*{box-sizing:border-box}html,body{margin:0;padding:0}body{font-family:Arial,sans-serif;color:#111}.sheet{display:grid;grid-template-columns:repeat(2,3.75in);grid-auto-rows:4in;gap:.15in;justify-content:center;align-content:start;break-after:page;page-break-after:always}.sheet:last-child{break-after:auto;page-break-after:auto}.label{width:3.75in;height:4in;overflow:hidden;border:1px solid #777;border-radius:.08in;padding:.1in .14in;break-inside:avoid;page-break-inside:avoid;display:flex;flex-direction:column;align-items:center;background:#fff}.label-header{width:100%;display:flex;justify-content:space-between;gap:.1in;align-items:center;font-size:10pt;line-height:1.1}.label-header strong{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.label-header span{font-size:8pt;color:#444;flex:0 0 auto}.label img{display:block;width:2in;height:2in;min-width:2in;min-height:2in;margin:.04in auto .03in;image-rendering:pixelated}.company{width:100%;font-size:7.5pt;text-align:center;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:#444}.items{width:100%;margin:.04in 0 0;padding-left:.22in;font-size:8.5pt;line-height:1.12;overflow:hidden}.items li{margin:0 0 .025in;overflow-wrap:anywhere}.items li::marker{font-size:7pt}@media screen{body{padding:.25in;background:#eee}.sheet{margin:0 auto .25in;background:#fff;box-shadow:0 2px 14px #999}}
-    </style></head><body>${pages.map((page) => `<section class="sheet">${page.map(labelMarkup).join("")}</section>`).join("")}<script>window.onload=()=>window.print()</script></body></html>`);
-    printWindow.document.close();
+    const html = `<!doctype html><html><head><meta charset="utf-8"><title>Inventory box labels</title><style>
+      @page{size:auto;margin:.25in}*{box-sizing:border-box}html,body{margin:0;padding:0}body{font-family:Arial,sans-serif;color:#111}.sheet{display:grid;grid-template-columns:repeat(2,3.75in);grid-auto-rows:4in;gap:.15in;justify-content:center;align-content:start;break-after:page;page-break-after:always}.sheet:last-child{break-after:auto;page-break-after:auto}.label{width:3.75in;height:4in;overflow:hidden;border:1px solid #777;border-radius:.08in;padding:.1in .14in;break-inside:avoid;page-break-inside:avoid;display:flex;flex-direction:column;align-items:center;background:#fff}.label-header{width:100%;display:flex;justify-content:space-between;gap:.1in;align-items:center;font-size:10pt;line-height:1.1}.label-header strong{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.label-header span{font-size:8pt;color:#444;flex:0 0 auto}.label img{display:block;width:2in;height:2in;min-width:2in;min-height:2in;margin:.04in auto .03in;image-rendering:pixelated}.company{width:100%;font-size:7.5pt;text-align:center;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:#444}.items{width:100%;margin:.04in 0 0;padding-left:.22in;font-size:8.5pt;line-height:1.12;overflow:hidden}.items li{margin:0 0 .025in;overflow-wrap:anywhere}.items li::marker{font-size:7pt}
+    </style></head><body>${pages.map((page) => `<section class="sheet">${page.map(labelMarkup).join("")}</section>`).join("")}</body></html>`;
+
+    setPrinting(true);
+    setError("");
+    try {
+      const result = await window.desktop.printHtml(html);
+      if (!result.success) {
+        const reason = result.failureReason || "Printing did not complete.";
+        if (reason.toLocaleLowerCase().includes("cancel")) {
+          setNotice("Printing was cancelled.");
+        } else {
+          setError(reason);
+        }
+        return;
+      }
+      setNotice("The label print job completed.");
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setPrinting(false);
+    }
   }
 
   return (
@@ -255,7 +273,7 @@ export default function BoxQrCodeCreatorTab({ stores, onChanged }: Props) {
       </div>
 
       <article className="panel">
-        <div className="panel__header"><div><p className="eyebrow">PRINT QUEUE</p><h2>Box labels</h2></div><button className="button" type="button" onClick={printQueue} disabled={queue.length === 0}>Print labels</button></div>
+        <div className="panel__header"><div><p className="eyebrow">PRINT QUEUE</p><h2>Box labels</h2></div><button className="button" type="button" onClick={() => void printQueue()} disabled={queue.length === 0 || printing}>{printing ? "Opening print dialog…" : "Print labels"}</button></div>
         <div className="queue-list">{queue.map((entry) => <div key={entry.key}><strong>{entry.box.boxId}</strong><span>r{entry.box.revision} · {entry.box.items.map((item) => item.itemName).join(", ")}</span><b>{entry.copies} copies</b><button type="button" onClick={() => setQueue((current) => current.filter((candidate) => candidate.key !== entry.key))}>Remove</button></div>)}{queue.length === 0 && <p className="muted">The queue is empty.</p>}</div>
       </article>
     </section>

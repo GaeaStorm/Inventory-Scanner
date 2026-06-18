@@ -1,7 +1,9 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 
+import BackupRestorePanel from "./BackupRestorePanel";
 import BoxQrCodeCreatorTab from "./BoxQrCodeCreatorTab";
 import BulkMaterialInForm from "./BulkMaterialInForm";
+import OpeningQuantityPanel from "./OpeningQuantityPanel";
 import TallyTab from "./TallyTab";
 import {
   getDashboard,
@@ -38,6 +40,14 @@ function formatBytes(value: number): string {
   if (value < 1024) return `${value} B`;
   if (value < 1024 ** 2) return `${(value / 1024).toFixed(1)} KB`;
   return `${(value / 1024 ** 2).toFixed(1)} MB`;
+}
+
+function formatCode(value: string | null): string {
+  if (!value) return "";
+  return value
+    .toLocaleLowerCase()
+    .replaceAll("_", " ")
+    .replace(/^./, (letter) => letter.toLocaleUpperCase());
 }
 
 export default function App() {
@@ -164,14 +174,17 @@ export default function App() {
               onError={setError}
             />
             <article className="panel table-panel">
-              <div className="panel__header"><div><p className="eyebrow">RECENT EVENTS</p><h2>Vendor receipts, issues, and unused returns</h2></div><span className="table-count">{stores.recentMovements.length} shown</span></div>
+              <div className="panel__header"><div><p className="eyebrow">RECENT EVENTS</p><h2>Vendor receipts, issues, and adjustments</h2></div><span className="table-count">{stores.recentMovements.length} shown</span></div>
               <div className="table-scroll stores-main-table"><table>
-                <thead><tr><th>Date</th><th>Workflow</th><th>Box</th><th>Item</th><th>Qty</th><th>Destination / supplier</th><th>PO / challan</th><th>Status</th></tr></thead>
+                <thead><tr><th>Date</th><th>Workflow</th><th>Box</th><th>Item</th><th>Qty</th><th>Destination / details</th><th>PO / challan</th><th>Status</th></tr></thead>
                 <tbody>
                   {stores.recentMovements.map((movement) => (
                     <tr key={movement.id}>
                       <td>{movement.eventDate}</td><td>{movement.workflow.replaceAll("_", " ")}</td><td><code>{movement.boxId || "—"}</code></td><td>{movement.itemName}</td><td>{movement.quantity}</td>
-                      <td>{movement.destinationName || movement.supplierName || "—"}</td><td>{[movement.poNumber, movement.challanNumber].filter(Boolean).join(" / ") || "—"}</td><td><span className={`review-status review-status--${movement.status.toLowerCase().replaceAll("_", "-")}`}>{movement.status}</span></td>
+                      <td>
+                        <span>{movement.destinationName || movement.supplierName || "—"}</span>
+                        {movement.workflow === "ADJUSTMENT" && <small className="table-subtext">{movement.adjustmentDirection === "RETURN_TO_STOCK" ? "Return to stock" : "Additional issue"} · {formatCode(movement.adjustmentReason)}{movement.adjustmentNote ? ` · ${movement.adjustmentNote}` : ""}</small>}
+                      </td><td>{[movement.poNumber, movement.challanNumber].filter(Boolean).join(" / ") || "—"}</td><td><span className={`review-status review-status--${movement.status.toLowerCase().replaceAll("_", "-")}`}>{movement.status}</span></td>
                     </tr>
                   ))}
                   {stores.recentMovements.length === 0 && <tr><td colSpan={8} className="empty-table">No local inventory movements have been recorded yet.</td></tr>}
@@ -190,6 +203,12 @@ export default function App() {
               <article className="stat-card"><span className="stat-card__icon">⚠</span><div><small>Legacy-stock items</small><strong>{stores.sync.openingLegacyItems}</strong><span>supplier not reconstructed</span></div></article>
               <article className="stat-card"><span className="stat-card__icon">⧉</span><div><small>Active boxes</small><strong>{stores.boxes.length}</strong><span>SQLite box records</span></div></article>
             </section>
+            <OpeningQuantityPanel
+              stores={stores}
+              onChanged={setStores}
+              onNotice={setNotice}
+              onError={setError}
+            />
             <article className="panel table-panel">
               <div className="panel__header"><div><p className="eyebrow">RECONCILIATION</p><h2>Local FIFO balance versus Tally closing count</h2></div></div>
               <div className="table-scroll stores-main-table"><table>
@@ -223,14 +242,17 @@ export default function App() {
               </article>
               <article className="panel">
                 <div className="panel__header"><div><p className="eyebrow">SQLITE</p><h2>Operational database</h2></div><span className="health-badge">{stores.database.integrity.toUpperCase()}</span></div>
-                <dl className="settings-details"><div><dt>Path</dt><dd>{stores.database.path}</dd></div><div><dt>Schema</dt><dd>v{stores.database.schemaVersion}</dd></div><div><dt>Size</dt><dd>{formatBytes(stores.database.sizeBytes)}</dd></div><div><dt>Latest backup</dt><dd>{stores.database.latestBackup ?? "—"}</dd></div></dl>
-                <div className="settings-actions">
-                  <button className="button" disabled={busy} type="button" onClick={() => void perform(async () => { const result = await window.desktop.stores.backupNow(); setNotice(`Validated backup created: ${result.path}`); const next = await window.desktop.stores.getState(); setStores(next); })}>Back Up Now</button>
-                  <button className="button button--secondary" disabled={busy} type="button" onClick={() => void perform(async () => { const next = await window.desktop.stores.chooseFolder("backup"); if (next) setStores(next); }, "Backup folder updated.")}>Choose backup folder</button>
-                  <button className="button button--secondary" type="button" onClick={() => void window.desktop.stores.openPath(stores.database.backupFolder)}>Open backups</button>
-                </div>
+                <dl className="settings-details"><div><dt>Path</dt><dd>{stores.database.path}</dd></div><div><dt>Schema</dt><dd>v{stores.database.schemaVersion}</dd></div><div><dt>Size</dt><dd>{formatBytes(stores.database.sizeBytes)}</dd></div><div><dt>Latest backup</dt><dd>{stores.database.latestBackup ?? "—"}</dd></div><div><dt>Host ID</dt><dd><code>{stores.database.hostId}</code></dd></div><div><dt>Writer mode</dt><dd>Authoritative desktop host</dd></div></dl>
+                <p className="muted">All domain modules use one application-owned SQLite connection. Phones and future production clients write through this desktop API; do not place the live database on a shared or cloud-synchronized drive.</p>
               </article>
             </div>
+
+            <BackupRestorePanel
+              stores={stores}
+              onChanged={setStores}
+              onNotice={setNotice}
+              onError={setError}
+            />
 
             <article className="panel settings-wide-panel">
               <div className="panel__header"><div><p className="eyebrow">LEGACY EXCEL AUDIT</p><h2>Existing workbook location</h2></div></div>
