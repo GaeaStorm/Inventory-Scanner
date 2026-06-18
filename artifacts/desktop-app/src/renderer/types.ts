@@ -1,8 +1,11 @@
+export type AppTab = "tracker" | "dashboard" | "qr" | "settings" | "tally";
+
 export interface DesktopInfo {
   appVersion: string;
   apiBaseUrl: string;
   dataDirectory: string;
   excelPath: string;
+  databasePath: string;
   port: number;
   scannerUrls: string[];
 }
@@ -13,34 +16,53 @@ export interface Product {
   unit: string;
 }
 
-export type MovementType = "Restock" | "Use" | "Adjustment";
-export type AdjustmentDirection = "in" | "out";
+export type WorkbookCell = string | number | boolean | null;
+export type WorkbookRow = Record<string, WorkbookCell>;
 
-export interface InventoryTransaction {
-  id: string;
-  refNo: string;
-  movementType: MovementType;
-  itemCode: string;
-  itemName: string;
-  quantity: number;
-  unitRate: string;
-  godown: string;
-  batchNo: string;
-  usedIn: string;
-  adjustmentDirection?: AdjustmentDirection;
-  timestamp: string;
+export interface WorkbookPreview {
+  exists: boolean;
+  path: string;
+  fileName: string;
+  modifiedAt: string | null;
+  totalRows: number;
+  rows: WorkbookRow[];
+  error: string | null;
 }
 
-export interface CreateTransactionInput {
-  refNo: string;
-  movementType: MovementType;
-  itemCode: string;
-  itemName: string;
-  quantity: number;
-  unitRate: string;
-  godown: string;
-  batchNo: string;
-  usedIn: string;
-  adjustmentDirection?: AdjustmentDirection;
-  timestamp: string;
+export interface DashboardState {
+  status: "ok";
+  scannerUrls: string[];
+  workbook: WorkbookPreview;
 }
+
+export interface WorkbookLocationResponse {
+  created: boolean;
+  workbook: WorkbookPreview;
+}
+
+export type {
+  TallyCompany,
+  TallyConnectionResult,
+  TallyConnectionSettings,
+  TallyState,
+  TallyStoresSnapshot,
+} from "../tally/types";
+
+export type {
+  BulkVendorReceiptInput,
+  BulkVendorReceiptLineInput,
+  BulkVendorReceiptResult,
+  ConfirmImportInput,
+  ExportBatchInput,
+  ExportBatchResult,
+  ReviewDecisionInput,
+  SaveBoxInput,
+  StoresBackupResult,
+  StoresBox,
+  StoresState,
+  StoresStockItem,
+  StoresSupplier,
+  VendorReceiptInput,
+  MaterialOutInput,
+  ReturnUnusedInput,
+} from "../stores/types";

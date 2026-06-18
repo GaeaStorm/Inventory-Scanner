@@ -11,14 +11,20 @@ import {
   ipcMain,
   Menu,
   shell,
+  type OpenDialogOptions,
 } from "electron";
-import type { Express } from "express";
+import express, { type Express } from "express";
+
+import { TallyService } from "./tally/service";
+import { createStoresRouter } from "./stores/router";
+import { StoresService } from "./stores/service";
 
 interface DesktopInfo {
   appVersion: string;
   apiBaseUrl: string;
   dataDirectory: string;
   excelPath: string;
+  databasePath: string;
   port: number;
   scannerUrls: string[];
 }
@@ -26,9 +32,17 @@ interface DesktopInfo {
 const DEFAULT_PORT = 5000;
 const developmentRendererUrl = process.env.ELECTRON_RENDERER_URL;
 
+function applicationIconPath(): string {
+  return app.isPackaged
+    ? path.join(process.resourcesPath, "app-logo.png")
+    : path.join(__dirname, "..", "build", "public", "logo.png");
+}
+
 let mainWindow: BrowserWindow | null = null;
 let apiServer: Server | null = null;
 let desktopInfo: DesktopInfo | null = null;
+let tallyService: TallyService | null = null;
+let storesService: StoresService | null = null;
 
 function preferredPort(): number {
   const configured = Number(process.env.INVENTORY_SCANNER_PORT ?? DEFAULT_PORT);
@@ -74,19 +88,51 @@ async function startApi(): Promise<DesktopInfo> {
 
   await mkdir(dataDirectory, { recursive: true });
 
-  // This must be assigned before importing the API because the transactions
-  // route reads EXCEL_PATH when its module is initialized.
+  // This must be assigned before importing the API because the workbook
+  // module reads its initial location when it is loaded.
   process.env.EXCEL_PATH = excelPath;
 
   const { default: inventoryApi } = await import("../../api-server/src/app");
+  const desktopApi = express();
 
+  desktopApi.use(express.json({ limit: "2mb" }));
+  desktopApi.use(express.urlencoded({ extended: true }));
+  desktopApi.use((_request, response, next) => {
+    response.setHeader("Access-Control-Allow-Origin", "*");
+    response.setHeader("Access-Control-Allow-Headers", "Content-Type");
+    response.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,OPTIONS");
+    if (_request.method === "OPTIONS") {
+      response.sendStatus(204);
+      return;
+    }
+    next();
+  });
+
+  if (!storesService) throw new Error("The Local Stores Database is unavailable.");
+  desktopApi.use("/api/stores", createStoresRouter(storesService));
+
+  // Keep the original endpoint compatible with older clients, but make the
+  // SQLite Stores Catalog authoritative after Tally synchronization.
+  desktopApi.get("/api/products", (_request, response, next) => {
+    const stockItems = storesService?.getState().stockItems ?? [];
+    if (stockItems.length === 0) {
+      next();
+      return;
+    }
+    response.json(stockItems.map((item) => ({
+      id: item.tallyGuid,
+      name: item.name,
+      unit: "count",
+    })));
+  });
+  desktopApi.use(inventoryApi);
 
   const requestedPort = preferredPort();
   try {
-    apiServer = await listen(inventoryApi, requestedPort);
+    apiServer = await listen(desktopApi, requestedPort);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "EADDRINUSE") throw error;
-    apiServer = await listen(inventoryApi, 0);
+    apiServer = await listen(desktopApi, 0);
   }
 
   const address = apiServer.address() as AddressInfo;
@@ -97,11 +143,19 @@ async function startApi(): Promise<DesktopInfo> {
     apiBaseUrl: `http://127.0.0.1:${port}`,
     dataDirectory,
     excelPath,
+    databasePath: storesService.database.databasePath,
     port,
     scannerUrls: localIpv4Addresses().map(
       (addressValue) => `http://${addressValue}:${port}`,
     ),
   };
+}
+
+function absolutePath(value: unknown, label: string): string {
+  if (typeof value !== "string" || !path.isAbsolute(value)) {
+    throw new Error(`${label} must be an absolute path.`);
+  }
+  return path.normalize(value);
 }
 
 function registerIpcHandlers(): void {
@@ -110,21 +164,135 @@ function registerIpcHandlers(): void {
     return desktopInfo;
   });
 
-  ipcMain.handle("desktop:open-data-folder", async () => {
-    if (!desktopInfo) return "The local server has not started yet.";
-    return shell.openPath(desktopInfo.dataDirectory);
+  ipcMain.handle(
+    "desktop:choose-workbook-folder",
+    async (_event, currentWorkbookPath?: string) => {
+      const fallbackPath = desktopInfo?.dataDirectory ?? app.getPath("documents");
+      const requestedPath =
+        typeof currentWorkbookPath === "string" &&
+        path.isAbsolute(currentWorkbookPath)
+          ? path.dirname(currentWorkbookPath)
+          : fallbackPath;
+      const options: OpenDialogOptions = {
+        title: "Choose the Inventory Scanner data folder",
+        buttonLabel: "Use this folder",
+        defaultPath: requestedPath,
+        properties: ["openDirectory", "createDirectory"],
+      };
+      const result = mainWindow
+        ? await dialog.showOpenDialog(mainWindow, options)
+        : await dialog.showOpenDialog(options);
+
+      return result.canceled ? null : (result.filePaths[0] ?? null);
+    },
+  );
+
+  ipcMain.handle(
+    "desktop:open-workbook-folder",
+    async (_event, workbookPath: unknown) => {
+      const resolvedPath = absolutePath(workbookPath, "Workbook path");
+      return shell.openPath(path.dirname(resolvedPath));
+    },
+  );
+
+  ipcMain.handle(
+    "desktop:open-excel-file",
+    async (_event, workbookPath: unknown) => {
+      const resolvedPath = absolutePath(workbookPath, "Workbook path");
+      return shell.openPath(resolvedPath);
+    },
+  );
+
+  ipcMain.handle(
+    "desktop:show-excel-file",
+    async (_event, workbookPath: unknown) => {
+      const resolvedPath = absolutePath(workbookPath, "Workbook path");
+      if (existsSync(resolvedPath)) {
+        shell.showItemInFolder(resolvedPath);
+        return true;
+      }
+      await shell.openPath(path.dirname(resolvedPath));
+      return false;
+    },
+  );
+
+  ipcMain.handle("tally:get-state", async () => {
+    if (!tallyService) throw new Error("The Tally service is unavailable.");
+    return tallyService.getState();
   });
 
-  ipcMain.handle("desktop:show-excel-file", async () => {
-    if (!desktopInfo) return false;
+  ipcMain.handle("tally:test-connection", async (_event, settings: unknown) => {
+    if (!tallyService) throw new Error("The Tally service is unavailable.");
+    return tallyService.testConnection(settings);
+  });
 
-    if (existsSync(desktopInfo.excelPath)) {
-      shell.showItemInFolder(desktopInfo.excelPath);
-    } else {
-      await shell.openPath(desktopInfo.dataDirectory);
-    }
+  ipcMain.handle("tally:sync-stores", async (_event, settings: unknown) => {
+    if (!tallyService || !storesService) throw new Error("The Tally or Stores service is unavailable.");
+    const snapshot = await tallyService.syncStores(settings);
+    const summary = storesService.sync(snapshot);
+    return { snapshot, summary, state: storesService.getState() };
+  });
 
-    return true;
+  ipcMain.handle("stores:get-state", () => {
+    if (!storesService) throw new Error("The Local Stores Database is unavailable.");
+    return storesService.getState();
+  });
+
+  ipcMain.handle("stores:save-box", (_event, input: unknown) => {
+    if (!storesService) throw new Error("The Local Stores Database is unavailable.");
+    return storesService.saveBox(input as never);
+  });
+
+  ipcMain.handle("stores:bulk-vendor-receipt", (_event, input: unknown) => {
+    if (!storesService) throw new Error("The Local Stores Database is unavailable.");
+    return storesService.bulkVendorReceipt(input as never);
+  });
+
+  ipcMain.handle("stores:review", (_event, input: unknown) => {
+    if (!storesService) throw new Error("The Local Stores Database is unavailable.");
+    return storesService.review(input as never);
+  });
+
+  ipcMain.handle("stores:export-batch", (_event, input: unknown) => {
+    if (!storesService) throw new Error("The Local Stores Database is unavailable.");
+    return storesService.exportBatch(input as never);
+  });
+
+  ipcMain.handle("stores:confirm-import", (_event, input: unknown) => {
+    if (!storesService) throw new Error("The Local Stores Database is unavailable.");
+    return storesService.confirmImport(input as never);
+  });
+
+  ipcMain.handle("stores:backup-now", () => {
+    if (!storesService) throw new Error("The Local Stores Database is unavailable.");
+    return storesService.backup("manual");
+  });
+
+  ipcMain.handle("stores:choose-folder", async (_event, kind: "backup" | "export") => {
+    if (!storesService) throw new Error("The Local Stores Database is unavailable.");
+    const state = storesService.getState();
+    const defaultPath = kind === "backup"
+      ? state.database.backupFolder
+      : path.join(app.getPath("userData"), "exports");
+    const options: OpenDialogOptions = {
+      title: kind === "backup" ? "Choose SQLite backup folder" : "Choose Tally export folder",
+      buttonLabel: "Use this folder",
+      defaultPath,
+      properties: ["openDirectory", "createDirectory"],
+    };
+    const result = mainWindow
+      ? await dialog.showOpenDialog(mainWindow, options)
+      : await dialog.showOpenDialog(options);
+    if (result.canceled || !result.filePaths[0]) return null;
+    const folder = result.filePaths[0];
+    return kind === "backup"
+      ? storesService.setBackupFolder(folder)
+      : storesService.setExportFolder(folder);
+  });
+
+  ipcMain.handle("stores:open-path", async (_event, targetPath: unknown) => {
+    const resolvedPath = absolutePath(targetPath, "Path");
+    return shell.openPath(existsSync(resolvedPath) ? resolvedPath : path.dirname(resolvedPath));
   });
 }
 
@@ -139,6 +307,7 @@ async function createWindow(): Promise<void> {
     minHeight: 700,
     show: false,
     backgroundColor: "#f5f7fb",
+    icon: applicationIconPath(),
     webPreferences: {
       preload: path.join(__dirname, "preload.cjs"),
       contextIsolation: true,
@@ -162,14 +331,17 @@ async function createWindow(): Promise<void> {
   if (developmentRendererUrl) {
     await mainWindow.loadURL(developmentRendererUrl);
   } else {
-    await mainWindow.loadFile(
-      path.join(__dirname, "renderer", "index.html"),
-    );
+    await mainWindow.loadFile(path.join(__dirname, "renderer", "index.html"));
   }
 }
 
 async function bootstrap(): Promise<void> {
   Menu.setApplicationMenu(null);
+  storesService = new StoresService(app.getPath("userData"));
+  storesService.ensureDemoData();
+  tallyService = new TallyService(app.getPath("userData"));
+  if (process.platform === "darwin") app.dock?.setIcon(applicationIconPath());
+  process.env.TALLY_CACHE_PATH = tallyService.cachePath;
   desktopInfo = await startApi();
   registerIpcHandlers();
   await createWindow();
@@ -187,7 +359,8 @@ if (!hasSingleInstanceLock) {
   });
 
   app.whenReady().then(bootstrap).catch((error: unknown) => {
-    const message = error instanceof Error ? error.stack ?? error.message : String(error);
+    const message =
+      error instanceof Error ? error.stack ?? error.message : String(error);
     dialog.showErrorBox("Inventory Scanner could not start", message);
     app.quit();
   });
@@ -206,4 +379,6 @@ app.on("window-all-closed", () => {
 app.on("before-quit", () => {
   apiServer?.close();
   apiServer = null;
+  storesService?.close();
+  storesService = null;
 });

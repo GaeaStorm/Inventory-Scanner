@@ -79,14 +79,15 @@ when a `v*` tag is pushed or the workflow is started manually.
 
 ## Local data
 
-The workbook is stored below Electron's per-user application-data folder instead
-of beside the installed executable:
+The operational database is stored under Electron's per-user application-data folder:
 
-- Windows: `%APPDATA%/Inventory Scanner/data/stock_transactions.xlsx`
-- macOS: `~/Library/Application Support/Inventory Scanner/data/stock_transactions.xlsx`
-- Linux: `~/.config/Inventory Scanner/data/stock_transactions.xlsx`
+- Windows: `%APPDATA%/Inventory Scanner/data/inventory-scanner.sqlite`
+- macOS: `~/Library/Application Support/Inventory Scanner/data/inventory-scanner.sqlite`
+- Linux: `~/.config/Inventory Scanner/data/inventory-scanner.sqlite`
 
-Use **Open data folder** or **Show Excel file** in the dashboard to reveal it.
+Do not move the active database into Dropbox, OneDrive, Google Drive, or a shared network folder. Use the Settings tab to choose a separate backup folder and to create a validated manual backup. The app also backs up before migrations and before export generation, retaining the 30 most recent SQLite backups.
+
+Excel and optional CSV files are generated as review/audit outputs. The legacy `stock_transactions.xlsx` path remains available for compatibility but is no longer authoritative.
 
 ## Phone scanner connection
 

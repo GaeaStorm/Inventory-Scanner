@@ -8,6 +8,7 @@ const appDirectory = path.dirname(fileURLToPath(import.meta.url));
 export default defineConfig({
   base: "./",
   root: path.join(appDirectory, "src", "renderer"),
+  publicDir: path.join(appDirectory, "build", "public"),
   plugins: [react()],
   build: {
     outDir: path.join(appDirectory, "dist", "renderer"),

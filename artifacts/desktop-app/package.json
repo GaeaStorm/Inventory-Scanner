@@ -20,26 +20,31 @@
     "@types/node": "catalog:",
     "@types/react": "catalog:",
     "@types/react-dom": "catalog:",
+    "@types/qrcode": "^1.5.5",
     "@vitejs/plugin-react": "catalog:",
     "electron": "^42.4.0",
     "electron-builder": "^26.15.3",
     "esbuild": "0.27.3",
     "esbuild-plugin-pino": "^2.3.3",
     "express": "^5.2.1",
+    "fast-xml-parser": "5.2.5",
     "pino": "9.14.0",
     "pino-pretty": "13.1.3",
+    "qrcode": "^1.5.4",
     "react": "catalog:",
     "react-dom": "catalog:",
     "thread-stream": "3.1.0",
     "typescript": "~5.9.3",
-    "vite": "catalog:"
+    "vite": "catalog:",
+    "xlsx": "^0.18.5"
   },
   "build": {
     "appId": "com.gaeastorm.inventoryscanner",
     "productName": "Inventory Scanner",
     "artifactName": "${productName}-${version}-${os}-${arch}.${ext}",
     "directories": {
-      "output": "release"
+      "output": "release",
+      "buildResources": "build"
     },
     "files": [
       "dist/**/*",
@@ -50,7 +55,8 @@
     "win": {
       "target": [
         "nsis"
-      ]
+      ],
+      "icon": "build/icon.ico"
     },
     "nsis": {
       "oneClick": false,
@@ -63,14 +69,22 @@
         "dmg",
         "zip"
       ],
-      "category": "public.app-category.business"
+      "category": "public.app-category.business",
+      "icon": "build/icon.icns"
     },
     "linux": {
       "target": [
         "AppImage",
         "deb"
       ],
-      "category": "Office"
-    }
+      "category": "Office",
+      "icon": "build/public/logo.png"
+    },
+    "extraResources": [
+      {
+        "from": "build/public/logo.png",
+        "to": "app-logo.png"
+      }
+    ]
   }
 }
