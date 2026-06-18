@@ -13,7 +13,14 @@
       "backgroundColor": "#ffffff"
     },
     "ios": {
-      "supportsTablet": false
+      "supportsTablet": false,
+      "bundleIdentifier": "com.gaeastorm.inventoryscanner",
+      "infoPlist": {
+        "NSLocalNetworkUsageDescription": "Stock Scanner connects to your inventory server on this Wi-Fi network.",
+        "NSAppTransportSecurity": {
+          "NSAllowsLocalNetworking": true
+        }
+      }
     },
     "android": {},
     "web": {
@@ -22,7 +29,13 @@
     "plugins": [
       "expo-router",
       "expo-font",
-      "expo-web-browser"
+      "expo-web-browser",
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "Allow Stock Scanner to use the camera to scan inventory QR codes."
+        }
+      ]
     ]
   }
 }
