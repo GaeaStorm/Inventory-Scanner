@@ -23,8 +23,10 @@ import type {
   ExportBatchInput,
   MaterialOutInput,
   OpeningQuantityInput,
+  RenameStockItemInput,
   ReviewDecisionInput,
   SaveBoxInput,
+  SetCatalogStatusInput,
   StoresBackupInfo,
   StoresBackupResult,
   StoresRestoreResult,
@@ -44,9 +46,10 @@ import type {
   VendorReceiptInput,
 } from "./types";
 
-const SCHEMA_VERSION = 5;
+const SCHEMA_VERSION = 7;
 const BACKUP_RETENTION = 30;
 const LEGACY_SUPPLIER_NAME = "Opening Legacy Stock";
+const LEGACY_SUPPLIER_GUID = "LOCAL:LEGACY_OPENING";
 
 type Row = Record<string, any>;
 
@@ -597,6 +600,35 @@ export class StoresDatabase {
         this.db.prepare("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)").run(5, nowIso());
       }, "migrating the Local Stores Database to schema 5");
     }
+
+    if (current < 6) {
+      this.transaction(() => {
+        this.db.exec(`
+          ALTER TABLE tally_stock_items
+            ADD COLUMN catalog_status TEXT NOT NULL DEFAULT 'ACTIVE'
+            CHECK (catalog_status IN ('ACTIVE','DUPLICATE','OBSOLETE'));
+          ALTER TABLE tally_stock_items
+            ADD COLUMN duplicate_of_item_id INTEGER REFERENCES tally_stock_items(id);
+          ALTER TABLE tally_stock_items
+            ADD COLUMN catalog_updated_at TEXT;
+          CREATE INDEX idx_stock_items_catalog_status
+            ON tally_stock_items(catalog_status, duplicate_of_item_id, active, name);
+        `);
+        this.db.prepare("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)").run(6, nowIso());
+      }, "migrating the Local Stores Database to schema 6");
+    }
+
+    if (current < 7) {
+      this.transaction(() => {
+        this.db.exec(`
+          ALTER TABLE tally_stock_items
+            ADD COLUMN local_name_override TEXT;
+          CREATE INDEX idx_stock_items_local_name_override
+            ON tally_stock_items(local_name_override COLLATE NOCASE);
+        `);
+        this.db.prepare("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)").run(7, nowIso());
+      }, "migrating the Local Stores Database to schema 7");
+    }
   }
 
   transaction<T>(work: () => T, operation = "updating inventory"): T {
@@ -838,7 +870,8 @@ export class StoresDatabase {
     const closingQuantity = Number.isInteger(item.closingQuantity) ? item.closingQuantity ?? 0 : 0;
     const localByName = this.db.prepare(`
       SELECT id FROM tally_stock_items
-      WHERE name = ? COLLATE NOCASE AND source = 'LOCAL'
+      WHERE COALESCE(NULLIF(local_name_override, ''), name) = ? COLLATE NOCASE
+        AND source = 'LOCAL'
     `).get(item.name) as Row | undefined;
     if (localByName) {
       // A locally introduced component can be promoted to its real Tally
@@ -846,7 +879,8 @@ export class StoresDatabase {
       this.db.prepare(`
         UPDATE tally_stock_items SET
           tally_guid = ?, name = ?, parent_name = ?, has_bom = ?,
-          tally_closing_quantity = ?, active = 1, source = 'TALLY', synced_at = ?
+          tally_closing_quantity = ?, active = 1, source = 'TALLY',
+          local_name_override = NULL, synced_at = ?
         WHERE id = ?
       `).run(guid, item.name, item.parent, item.hasBom ? 1 : 0, closingQuantity, syncedAt, localByName.id);
       return Number(localByName.id);
@@ -864,6 +898,12 @@ export class StoresDatabase {
         source = 'TALLY',
         synced_at = excluded.synced_at
     `).run(guid, item.name, item.parent, item.hasBom ? 1 : 0, closingQuantity, syncedAt);
+    this.db.prepare(`
+      UPDATE tally_stock_items
+      SET local_name_override = NULL
+      WHERE tally_guid = ?
+        AND local_name_override = name COLLATE NOCASE
+    `).run(guid);
     const row = this.db.prepare("SELECT id FROM tally_stock_items WHERE tally_guid = ?").get(guid) as Row;
     return Number(row.id);
   }
@@ -890,8 +930,114 @@ export class StoresDatabase {
     }, "creating a local Stores Catalog item");
   }
 
+  setCatalogStatus(input: SetCatalogStatusInput): void {
+    const tallyItemGuid = text(input.tallyItemGuid);
+    const status = text(input.status);
+    if (!tallyItemGuid) throw new Error("Choose a Stock Item to update.");
+    if (!["ACTIVE", "DUPLICATE", "OBSOLETE"].includes(status)) {
+      throw new Error("Choose whether the Stock Item is active, duplicate, or obsolete.");
+    }
+
+    this.transaction(() => {
+      const item = this.db.prepare(`
+        SELECT id, name FROM tally_stock_items WHERE tally_guid = ? AND active = 1
+      `).get(tallyItemGuid) as Row | undefined;
+      if (!item) throw new Error("The selected Stock Item is no longer available.");
+
+      const aliases = Number((this.db.prepare(`
+        SELECT COUNT(*) AS count FROM tally_stock_items
+        WHERE duplicate_of_item_id = ? AND catalog_status = 'DUPLICATE'
+      `).get(item.id) as Row).count);
+      if (status !== "ACTIVE" && aliases > 0) {
+        throw new Error(
+          `${text(item.name)} is the primary item for ${aliases} duplicate entr${aliases === 1 ? "y" : "ies"}. Restore or redirect those duplicates first.`,
+        );
+      }
+
+      let duplicateOfId: number | null = null;
+      if (status === "DUPLICATE") {
+        const duplicateOfTallyGuid = text(input.duplicateOfTallyGuid);
+        if (!duplicateOfTallyGuid) throw new Error("Choose the primary Stock Item for this duplicate.");
+        const primary = this.db.prepare(`
+          SELECT id, name, catalog_status FROM tally_stock_items
+          WHERE tally_guid = ? AND active = 1
+        `).get(duplicateOfTallyGuid) as Row | undefined;
+        if (!primary) throw new Error("The selected primary Stock Item is no longer available.");
+        if (Number(primary.id) === Number(item.id)) {
+          throw new Error("A Stock Item cannot be marked as a duplicate of itself.");
+        }
+        if (text(primary.catalog_status) !== "ACTIVE") {
+          throw new Error("Choose an active, primary Stock Item—not another duplicate or obsolete item.");
+        }
+        const available = Number((this.db.prepare(`
+          SELECT COALESCE(SUM(quantity_remaining), 0) AS quantity
+          FROM purchase_lots WHERE stock_item_id = ?
+        `).get(item.id) as Row).quantity);
+        if (available > 0) {
+          throw new Error(
+            `${text(item.name)} still has ${available} units in local stock. Reduce its opening count to zero or issue the stock before hiding it as a duplicate.`,
+          );
+        }
+        duplicateOfId = Number(primary.id);
+      }
+
+      this.db.prepare(`
+        UPDATE tally_stock_items
+        SET catalog_status = ?, duplicate_of_item_id = ?, catalog_updated_at = ?
+        WHERE id = ?
+      `).run(status, duplicateOfId, nowIso(), item.id);
+    }, "updating the local Stock Item catalog");
+  }
+
+  renameStockItem(input: RenameStockItemInput): void {
+    const tallyItemGuid = text(input.tallyItemGuid);
+    const requestedName = text(input.name);
+    if (!tallyItemGuid) throw new Error("Choose a Stock Item to rename.");
+    if (!requestedName) throw new Error("Enter a new Stock Item name.");
+
+    this.transaction(() => {
+      const item = this.db.prepare(`
+        SELECT id, name FROM tally_stock_items WHERE tally_guid = ? AND active = 1
+      `).get(tallyItemGuid) as Row | undefined;
+      if (!item) throw new Error("The selected Stock Item is no longer available.");
+      const conflict = this.db.prepare(`
+        SELECT id FROM tally_stock_items
+        WHERE id <> ? AND active = 1
+          AND (
+            name = ? COLLATE NOCASE
+            OR COALESCE(NULLIF(local_name_override, ''), name) = ? COLLATE NOCASE
+          )
+      `).get(item.id, requestedName, requestedName) as Row | undefined;
+      if (conflict) throw new Error("Another active Stock Item already uses that local name.");
+      const override = requestedName.toLocaleLowerCase() === text(item.name).toLocaleLowerCase()
+        ? null
+        : requestedName;
+      this.db.prepare(`
+        UPDATE tally_stock_items
+        SET local_name_override = ?, catalog_updated_at = ?
+        WHERE id = ?
+      `).run(override, nowIso(), item.id);
+    }, "renaming a local Stock Item");
+  }
+
   private upsertSupplier(name: string, guid: string, syncedAt: string): number {
     const identity = supplierIdentity(guid, name);
+    const existingByName = this.db.prepare(`
+      SELECT id, tally_guid FROM suppliers WHERE name = ? COLLATE NOCASE
+    `).get(name) as Row | undefined;
+    if (existingByName && text(existingByName.tally_guid) !== identity) {
+      // Supplier names are unique locally. Reuse the existing row when its
+      // identity changes so linked POs, GRNs, and lots keep the same FK.
+      const identityOwner = this.db.prepare(
+        "SELECT id FROM suppliers WHERE tally_guid = ?",
+      ).get(identity) as Row | undefined;
+      if (!identityOwner || Number(identityOwner.id) === Number(existingByName.id)) {
+        this.db.prepare(`
+          UPDATE suppliers SET tally_guid = ?, name = ?, synced_at = ? WHERE id = ?
+        `).run(identity, name, syncedAt, existingByName.id);
+        return Number(existingByName.id);
+      }
+    }
     this.db.prepare(`
       INSERT INTO suppliers(tally_guid, name, synced_at) VALUES (?, ?, ?)
       ON CONFLICT(tally_guid) DO UPDATE SET name = excluded.name, synced_at = excluded.synced_at
@@ -939,7 +1085,7 @@ export class StoresDatabase {
         supplierIdByGuid.set(supplierIdentity(supplier.guid, supplier.name), id);
         supplierIdByName.set(supplier.name.toLocaleLowerCase(), id);
       }
-      const legacySupplierId = this.upsertSupplier(LEGACY_SUPPLIER_NAME, "LOCAL:LEGACY_OPENING", snapshot.syncedAt);
+      const legacySupplierId = this.upsertSupplier(LEGACY_SUPPLIER_NAME, LEGACY_SUPPLIER_GUID, snapshot.syncedAt);
 
       const poIdByNumber = new Map<string, number>();
       for (const order of snapshot.purchaseOrders) {
@@ -1149,9 +1295,7 @@ export class StoresDatabase {
         throw new Error("This box was changed elsewhere. Refresh it before saving again.");
       }
       const ids = itemGuids.map((guid) => {
-        const row = this.db.prepare("SELECT id FROM tally_stock_items WHERE tally_guid = ? AND active = 1").get(guid) as Row | undefined;
-        if (!row) throw new Error(`Tally Stock Item ${guid} is not in the synchronized Stores Catalog.`);
-        return Number(row.id);
+        return this.itemId(guid);
       });
       const revision = existing ? Number(existing.revision) + 1 : 1;
       const timestamp = nowIso();
@@ -1190,7 +1334,8 @@ export class StoresDatabase {
     const row = this.db.prepare("SELECT * FROM boxes WHERE box_id = ? AND active = 1").get(boxId) as Row | undefined;
     if (!row) return null;
     const items = this.db.prepare(`
-      SELECT tsi.id AS stock_item_id, tsi.tally_guid, tsi.name, bi.sort_order
+      SELECT tsi.id AS stock_item_id, tsi.tally_guid,
+        COALESCE(NULLIF(tsi.local_name_override, ''), tsi.name) AS name, bi.sort_order
       FROM box_items bi JOIN tally_stock_items tsi ON tsi.id = bi.stock_item_id
       WHERE bi.box_id = ? ORDER BY bi.sort_order
     `).all(boxId) as Row[];
@@ -1210,8 +1355,19 @@ export class StoresDatabase {
   }
 
   private itemId(guid: string): number {
-    const row = this.db.prepare("SELECT id FROM tally_stock_items WHERE tally_guid = ? AND active = 1").get(guid) as Row | undefined;
+    const row = this.db.prepare(`
+      SELECT item.id, item.name, item.catalog_status,
+        COALESCE((SELECT SUM(quantity_remaining) FROM purchase_lots WHERE stock_item_id = item.id), 0) AS local_available
+      FROM tally_stock_items item
+      WHERE item.tally_guid = ? AND item.active = 1
+    `).get(guid) as Row | undefined;
     if (!row) throw new Error("The selected Tally Stock Item is not available in the synchronized Stores Catalog.");
+    if (text(row.catalog_status) === "DUPLICATE") {
+      throw new Error(`${text(row.name)} is marked as a duplicate and is not available for new operations.`);
+    }
+    if (text(row.catalog_status) === "OBSOLETE" && Number(row.local_available) <= 0) {
+      throw new Error(`${text(row.name)} is obsolete and has no remaining local stock.`);
+    }
     return Number(row.id);
   }
 
@@ -1223,8 +1379,9 @@ export class StoresDatabase {
 
   private movementsForGrn(grnId: number): StoresMovement[] {
     const rows = this.db.prepare(`
-      SELECT m.*, item.tally_guid, item.name AS item_name,
-        destination.name AS destination_name,
+      SELECT m.*, item.tally_guid,
+        COALESCE(NULLIF(item.local_name_override, ''), item.name) AS item_name,
+        COALESCE(NULLIF(destination.local_name_override, ''), destination.name) AS destination_name,
         supplier.name AS supplier_name,
         po.voucher_number AS po_number,
         grn.challan_number
@@ -1537,7 +1694,7 @@ export class StoresDatabase {
         if (legacyDelta > 0) {
           const supplierId = this.upsertSupplier(
             LEGACY_SUPPLIER_NAME,
-            "LOCAL:OPENING_LEGACY",
+            LEGACY_SUPPLIER_GUID,
             timestamp,
           );
           this.db.prepare(`
@@ -1626,7 +1783,9 @@ export class StoresDatabase {
     eventDate: string,
   ): AdjustmentContext | null {
     const group = this.db.prepare(`
-      SELECT mov.*, issued.name AS issued_name, destination.name AS destination_name
+      SELECT mov.*,
+        COALESCE(NULLIF(issued.local_name_override, ''), issued.name) AS issued_name,
+        COALESCE(NULLIF(destination.local_name_override, ''), destination.name) AS destination_name
       FROM material_out_vouchers mov
       JOIN tally_stock_items issued ON issued.id = mov.issued_item_id
       JOIN tally_stock_items destination ON destination.id = mov.destination_item_id
@@ -1925,8 +2084,9 @@ export class StoresDatabase {
 
   private getMovement(id: string): StoresMovement | null {
     const row = this.db.prepare(`
-      SELECT m.*, item.tally_guid, item.name AS item_name,
-        destination.name AS destination_name,
+      SELECT m.*, item.tally_guid,
+        COALESCE(NULLIF(item.local_name_override, ''), item.name) AS item_name,
+        COALESCE(NULLIF(destination.local_name_override, ''), destination.name) AS destination_name,
         supplier.name AS supplier_name,
         po.voucher_number AS po_number,
         grn.challan_number
@@ -2001,20 +2161,29 @@ export class StoresDatabase {
 
   getState(): StoresState {
     const stockRows = this.db.prepare(`
-      SELECT tsi.*,
+      SELECT tsi.*, primary_item.tally_guid AS duplicate_of_tally_guid,
+        COALESCE(NULLIF(primary_item.local_name_override, ''), primary_item.name) AS duplicate_of_name,
         COALESCE((SELECT SUM(pl.quantity_remaining) FROM purchase_lots pl WHERE pl.stock_item_id = tsi.id), 0) AS local_available
-      FROM tally_stock_items tsi WHERE tsi.active = 1 ORDER BY tsi.name
+      FROM tally_stock_items tsi
+      LEFT JOIN tally_stock_items primary_item ON primary_item.id = tsi.duplicate_of_item_id
+      WHERE tsi.active = 1 ORDER BY COALESCE(NULLIF(tsi.local_name_override, ''), tsi.name)
     `).all() as Row[];
     const stockItems: StoresStockItem[] = stockRows.map((row) => ({
       id: Number(row.id),
       tallyGuid: text(row.tally_guid),
-      name: text(row.name),
+      tallyName: text(row.name),
+      name: text(row.local_name_override) || text(row.name),
       parentName: text(row.parent_name),
       hasBom: Number(row.has_bom) === 1,
       tallyClosingQuantity: Number(row.tally_closing_quantity),
       localAvailableQuantity: Number(row.local_available),
       active: Number(row.active) === 1,
       source: text(row.source) === "LOCAL" ? "LOCAL" : "TALLY",
+      catalogStatus: ["DUPLICATE", "OBSOLETE"].includes(text(row.catalog_status))
+        ? text(row.catalog_status) as StoresStockItem["catalogStatus"]
+        : "ACTIVE",
+      duplicateOfTallyGuid: row.duplicate_of_tally_guid == null ? null : text(row.duplicate_of_tally_guid),
+      duplicateOfName: row.duplicate_of_name == null ? null : text(row.duplicate_of_name),
     }));
 
     const suppliers: StoresSupplier[] = (this.db.prepare("SELECT id, tally_guid, name FROM suppliers WHERE name <> ? ORDER BY name").all(LEGACY_SUPPLIER_NAME) as Row[]).map((row) => ({
@@ -2027,7 +2196,7 @@ export class StoresDatabase {
       WHERE po.status = 'OPEN' ORDER BY po.voucher_date DESC, po.voucher_number
     `).all() as Row[]).map((row) => {
       const lines = this.db.prepare(`
-        SELECT pol.*, item.name AS item_name, item.tally_guid
+        SELECT pol.*, COALESCE(NULLIF(item.local_name_override, ''), item.name) AS item_name, item.tally_guid
         FROM purchase_order_lines pol JOIN tally_stock_items item ON item.id = pol.stock_item_id
         WHERE pol.purchase_order_id = ? ORDER BY item.name
       `).all(row.id) as Row[];
@@ -2058,7 +2227,8 @@ export class StoresDatabase {
       .filter((value): value is StoresBox => value !== null);
 
     const purchaseLots: StoresPurchaseLot[] = (this.db.prepare(`
-      SELECT pl.*, item.name AS item_name, item.tally_guid, supplier.name AS supplier_name
+      SELECT pl.*, COALESCE(NULLIF(item.local_name_override, ''), item.name) AS item_name,
+        item.tally_guid, supplier.name AS supplier_name
       FROM purchase_lots pl
       JOIN tally_stock_items item ON item.id = pl.stock_item_id
       LEFT JOIN suppliers supplier ON supplier.id = pl.supplier_id
@@ -2082,8 +2252,10 @@ export class StoresDatabase {
     }));
 
     const recentMovements = (this.db.prepare(`
-      SELECT m.*, item.tally_guid, item.name AS item_name,
-        destination.name AS destination_name, supplier.name AS supplier_name,
+      SELECT m.*, item.tally_guid,
+        COALESCE(NULLIF(item.local_name_override, ''), item.name) AS item_name,
+        COALESCE(NULLIF(destination.local_name_override, ''), destination.name) AS destination_name,
+        supplier.name AS supplier_name,
         po.voucher_number AS po_number, grn.challan_number
       FROM inventory_movements m
       JOIN tally_stock_items item ON item.id = m.stock_item_id
@@ -2096,7 +2268,8 @@ export class StoresDatabase {
 
     const reviewEntries = this.reviewEntries();
     const openingQuantityAdjustments: StoresOpeningQuantityAdjustment[] = (this.db.prepare(`
-      SELECT adjustment.*, item.tally_guid, item.name AS item_name
+      SELECT adjustment.*, item.tally_guid,
+        COALESCE(NULLIF(item.local_name_override, ''), item.name) AS item_name
       FROM opening_quantity_adjustments adjustment
       JOIN tally_stock_items item ON item.id = adjustment.stock_item_id
       ORDER BY adjustment.created_at DESC LIMIT 100
@@ -2162,7 +2335,7 @@ export class StoresDatabase {
         const row = this.db.prepare(`
           SELECT g.*, supplier.name AS supplier_name,
             COALESCE((SELECT SUM(quantity) FROM grn_lines WHERE grn_id = g.id), 0) AS quantity,
-            COALESCE((SELECT GROUP_CONCAT(item.name || ' × ' || gl.quantity, ', ') FROM grn_lines gl JOIN tally_stock_items item ON item.id = gl.stock_item_id WHERE gl.grn_id = g.id), '') AS items
+            COALESCE((SELECT GROUP_CONCAT(COALESCE(NULLIF(item.local_name_override, ''), item.name) || ' × ' || gl.quantity, ', ') FROM grn_lines gl JOIN tally_stock_items item ON item.id = gl.stock_item_id WHERE gl.grn_id = g.id), '') AS items
           FROM grns g LEFT JOIN suppliers supplier ON supplier.id = g.supplier_id WHERE g.id = ?
         `).get(Number(entry.entity_id)) as Row;
         return {
@@ -2172,7 +2345,9 @@ export class StoresDatabase {
       }
       if (entry.entity_type === "MATERIAL_OUT") {
         const row = this.db.prepare(`
-          SELECT mov.*, issued.name AS issued_name, destination.name AS destination_name,
+          SELECT mov.*,
+            COALESCE(NULLIF(issued.local_name_override, ''), issued.name) AS issued_name,
+            COALESCE(NULLIF(destination.local_name_override, ''), destination.name) AS destination_name,
             (SELECT COUNT(*) FROM material_out_movement_links WHERE material_out_voucher_id = mov.id) AS transaction_count
           FROM material_out_vouchers mov
           JOIN tally_stock_items issued ON issued.id = mov.issued_item_id
@@ -2266,7 +2441,10 @@ export class StoresDatabase {
     const placeholders = groupIds.map(() => "?").join(",") || "NULL";
     const movementRows = groupIds.length
       ? (this.db.prepare(`
-          SELECT m.*, item.tally_guid, item.name AS item_name, destination.name AS destination_name, supplier.name AS supplier_name, po.voucher_number AS po_number, grn.challan_number
+          SELECT m.*, item.tally_guid,
+            COALESCE(NULLIF(item.local_name_override, ''), item.name) AS item_name,
+            COALESCE(NULLIF(destination.local_name_override, ''), destination.name) AS destination_name,
+            supplier.name AS supplier_name, po.voucher_number AS po_number, grn.challan_number
           FROM inventory_movements m
           JOIN material_out_movement_links ml ON ml.movement_id = m.id
           JOIN tally_stock_items item ON item.id = m.stock_item_id
@@ -2279,7 +2457,10 @@ export class StoresDatabase {
       : [];
     const grnMovementRows = grnIds.length
       ? (this.db.prepare(`
-          SELECT m.*, item.tally_guid, item.name AS item_name, destination.name AS destination_name, supplier.name AS supplier_name, po.voucher_number AS po_number, grn.challan_number
+          SELECT m.*, item.tally_guid,
+            COALESCE(NULLIF(item.local_name_override, ''), item.name) AS item_name,
+            COALESCE(NULLIF(destination.local_name_override, ''), destination.name) AS destination_name,
+            supplier.name AS supplier_name, po.voucher_number AS po_number, grn.challan_number
           FROM inventory_movements m
           JOIN tally_stock_items item ON item.id = m.stock_item_id
           LEFT JOIN tally_stock_items destination ON destination.id = m.destination_item_id
@@ -2293,7 +2474,8 @@ export class StoresDatabase {
     const movementIds = movements.map((movement) => movement.id);
     const allocationRows = movementIds.length
       ? (this.db.prepare(`
-          SELECT fa.*, item.name AS item_name, supplier.name AS supplier_name, pl.grn_number, pl.receipt_date
+          SELECT fa.*, COALESCE(NULLIF(item.local_name_override, ''), item.name) AS item_name,
+            supplier.name AS supplier_name, pl.grn_number, pl.receipt_date
           FROM fifo_allocations fa
           JOIN purchase_lots pl ON pl.id = fa.purchase_lot_id
           JOIN tally_stock_items item ON item.id = pl.stock_item_id

@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import QRCode from "qrcode";
 
+import { operationalStockItems } from "./stock-item-visibility";
 import type { StoresBox, StoresState } from "./types";
 import "./BoxQrCodeCreatorTab.css";
 
@@ -73,18 +74,22 @@ export default function BoxQrCodeCreatorTab({ stores, onChanged }: Props) {
   const [printing, setPrinting] = useState(false);
   const [notice, setNotice] = useState("");
   const [error, setError] = useState("");
+  const selectableItems = useMemo(
+    () => operationalStockItems(stores.stockItems),
+    [stores.stockItems],
+  );
 
   const selectedItems = useMemo(
     () => selectedGuids.map((guid) => stores.stockItems.find((item) => item.tallyGuid === guid)).filter(Boolean),
     [selectedGuids, stores.stockItems],
   );
   const groupOptions = useMemo(
-    () => [...new Set(stores.stockItems.map((item) => item.parentName || "Ungrouped"))].sort((left, right) => left.localeCompare(right)),
-    [stores.stockItems],
+    () => [...new Set(selectableItems.map((item) => item.parentName || "Ungrouped"))].sort((left, right) => left.localeCompare(right)),
+    [selectableItems],
   );
   const filtered = useMemo(() => {
     const query = search.trim().toLocaleLowerCase();
-    return stores.stockItems.filter((item) => {
+    return selectableItems.filter((item) => {
       if (selectedGuids.includes(item.tallyGuid)) return false;
       if (groupFilter !== "ALL" && (item.parentName || "Ungrouped") !== groupFilter) return false;
       if (stockFilter === "AVAILABLE" && item.localAvailableQuantity <= 0) return false;
@@ -93,7 +98,7 @@ export default function BoxQrCodeCreatorTab({ stores, onChanged }: Props) {
       if (bomFilter === "NO_BOM" && item.hasBom) return false;
       return !query || [item.name, item.parentName, item.tallyGuid].some((value) => value.toLocaleLowerCase().includes(query));
     });
-  }, [bomFilter, groupFilter, search, selectedGuids, stockFilter, stores.stockItems]);
+  }, [bomFilter, groupFilter, search, selectedGuids, stockFilter, selectableItems]);
 
   useEffect(() => {
     setQrDataUrl("");
@@ -258,7 +263,7 @@ export default function BoxQrCodeCreatorTab({ stores, onChanged }: Props) {
             <label>Product type<select value={bomFilter} onChange={(event) => setBomFilter(event.target.value as typeof bomFilter)}><option value="ALL">All items</option><option value="BOM">Has BOM</option><option value="NO_BOM">No BOM</option></select></label>
             <button type="button" className="text-button" onClick={() => { setSearch(""); setGroupFilter("ALL"); setStockFilter("ALL"); setBomFilter("ALL"); }}>Clear filters</button>
           </div>
-          <div className="box-qr-catalog-result-count">Showing {filtered.length} of {stores.stockItems.length} catalog items</div>
+          <div className="box-qr-catalog-result-count">Showing {filtered.length} of {selectableItems.length} catalog items</div>
           <div className="box-qr-catalog-scroll" tabIndex={0}>
             {filtered.map((item) => (
               <button key={item.tallyGuid} type="button" className="box-qr-catalog-action" disabled={selectedGuids.length >= 5} onClick={() => setSelectedGuids((current) => [...current, item.tallyGuid])}>

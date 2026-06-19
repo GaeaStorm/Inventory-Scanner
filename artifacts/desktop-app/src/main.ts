@@ -319,6 +319,21 @@ function registerIpcHandlers(): void {
     return storesService.createLocalStockItem(input as never);
   });
 
+  ipcMain.handle("stores:set-catalog-status", (_event, input: unknown) => {
+    if (!storesService) throw new Error("The Local Stores Database is unavailable.");
+    return storesService.setCatalogStatus(input as never);
+  });
+
+  ipcMain.handle("stores:rename-stock-item", (_event, input: unknown) => {
+    if (!storesService) throw new Error("The Local Stores Database is unavailable.");
+    return storesService.renameStockItem(input as never);
+  });
+
+  ipcMain.handle("stores:export-catalog-cleanup", () => {
+    if (!storesService) throw new Error("The Local Stores Database is unavailable.");
+    return storesService.exportCatalogCleanup();
+  });
+
   ipcMain.handle("stores:save-box", (_event, input: unknown) => {
     if (!storesService) throw new Error("The Local Stores Database is unavailable.");
     return storesService.saveBox(input as never);

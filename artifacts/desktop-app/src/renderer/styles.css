@@ -1940,6 +1940,10 @@ code {
   margin-bottom: 18px;
 }
 
+.catalog-status-panel {
+  margin-bottom: 18px;
+}
+
 .opening-form-grid {
   display: grid;
   grid-template-columns: minmax(260px, 2fr) minmax(150px, 0.8fr) minmax(180px, 1fr);
@@ -1960,6 +1964,7 @@ code {
 }
 
 .opening-history,
+.catalog-status-list,
 .backup-list {
   max-height: 280px;
   margin-top: 16px;
@@ -1978,9 +1983,81 @@ code {
   font-size: 11pt;
 }
 
+.catalog-status-grid {
+  display: grid;
+  grid-template-columns: minmax(260px, 1.5fr) minmax(220px, 1fr) minmax(260px, 1.5fr);
+  gap: 12px;
+  margin-top: 16px;
+}
+
+.catalog-status-grid label {
+  display: grid;
+  gap: 6px;
+  color: #647087;
+  font-size: 11pt;
+  font-weight: 700;
+}
+
+.catalog-status-warning {
+  margin: 14px 0 0;
+  padding: 10px 12px;
+  border: 1px solid #f0c36c;
+  border-radius: 8px;
+  background: #fff8e7;
+  color: #78520a;
+}
+
+.catalog-rename-row {
+  display: flex;
+  align-items: end;
+  gap: 16px;
+  margin-top: 14px;
+  padding: 14px;
+  border: 1px solid #e3e8f2;
+  border-radius: 10px;
+  background: #f8fafc;
+}
+
+.catalog-rename-row label {
+  display: grid;
+  flex: 1;
+  gap: 6px;
+  color: #647087;
+  font-size: 11pt;
+  font-weight: 700;
+}
+
+.catalog-rename-row > div {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.review-status--duplicate {
+  background: #eef1f6;
+  color: #526078;
+}
+
+.review-status--renamed {
+  background: #e5f0ff;
+  color: #245b9b;
+}
+
+.review-status--obsolete {
+  background: #fff1df;
+  color: #8a5208;
+}
+
 @media (max-width: 900px) {
-  .opening-form-grid {
+  .opening-form-grid,
+  .catalog-status-grid {
     grid-template-columns: 1fr;
+  }
+
+  .catalog-rename-row {
+    align-items: stretch;
+    flex-direction: column;
   }
 
   .opening-reason {

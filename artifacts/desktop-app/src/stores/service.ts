@@ -3,6 +3,7 @@ import path from "node:path";
 import type { TallyStoresSnapshot } from "../tally/types";
 import { ApplicationDatabase, DatabaseBusyError } from "../database/application-database";
 import { createDemoStoresSnapshot } from "./demo-data";
+import { CatalogExporter } from "./catalog-exporter";
 import { StoresDatabase } from "./database";
 import { StoresExporter } from "./exporter";
 import type {
@@ -13,8 +14,10 @@ import type {
   ExportBatchInput,
   MaterialOutInput,
   OpeningQuantityInput,
+  RenameStockItemInput,
   ReviewDecisionInput,
   SaveBoxInput,
+  SetCatalogStatusInput,
   StoresOfflineBatchInput,
   StoresOfflineBatchResult,
   VendorReceiptInput,
@@ -24,11 +27,16 @@ export class StoresService {
   readonly databaseHost: ApplicationDatabase;
   readonly database: StoresDatabase;
   readonly exporter: StoresExporter;
+  readonly catalogExporter: CatalogExporter;
 
   constructor(userDataDirectory: string, databaseHost: ApplicationDatabase) {
     this.databaseHost = databaseHost;
     this.database = new StoresDatabase(userDataDirectory, this.databaseHost);
     this.exporter = new StoresExporter(
+      this.database,
+      path.join(userDataDirectory, "exports"),
+    );
+    this.catalogExporter = new CatalogExporter(
       this.database,
       path.join(userDataDirectory, "exports"),
     );
@@ -75,6 +83,20 @@ export class StoresService {
   createLocalStockItem(input: CreateLocalStockItemInput) {
     this.database.createLocalStockItem(input);
     return this.getState();
+  }
+
+  setCatalogStatus(input: SetCatalogStatusInput) {
+    this.database.setCatalogStatus(input);
+    return this.getState();
+  }
+
+  renameStockItem(input: RenameStockItemInput) {
+    this.database.renameStockItem(input);
+    return this.getState();
+  }
+
+  exportCatalogCleanup() {
+    return this.catalogExporter.generate();
   }
 
   getBox(boxId: string) {

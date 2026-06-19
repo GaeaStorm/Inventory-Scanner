@@ -7,8 +7,11 @@ import type {
   ExportBatchInput,
   ExportBatchResult,
   OpeningQuantityInput,
+  RenameStockItemInput,
+  CatalogCleanupExportResult,
   ReviewDecisionInput,
   SaveBoxInput,
+  SetCatalogStatusInput,
   StoresBackupResult,
   StoresRestoreResult,
   StoresBox,
@@ -48,6 +51,9 @@ declare global {
       stores: {
         getState: () => Promise<StoresState>;
         createLocalStockItem: (input: CreateLocalStockItemInput) => Promise<StoresState>;
+        setCatalogStatus: (input: SetCatalogStatusInput) => Promise<StoresState>;
+        renameStockItem: (input: RenameStockItemInput) => Promise<StoresState>;
+        exportCatalogCleanup: () => Promise<CatalogCleanupExportResult>;
         saveBox: (input: SaveBoxInput) => Promise<StoresBox>;
         deleteBox: (boxId: string, expectedRevision?: number) => Promise<StoresState>;
         bulkVendorReceipt: (input: BulkVendorReceiptInput) => Promise<BulkVendorReceiptResult>;

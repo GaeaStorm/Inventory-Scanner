@@ -1,6 +1,12 @@
 import { Fragment, useMemo, useState } from "react";
 import * as XLSX from "xlsx";
 
+import {
+  matchBomCatalogItem,
+  parseBomWorkbook,
+  type ParsedBomRow,
+} from "./bom-import";
+import { operationalStockItems } from "./stock-item-visibility";
 import type { PlanningState, SaveBomInput, StoresState } from "./types";
 
 interface Props {
@@ -18,51 +24,30 @@ interface DraftLine {
   lossBufferPercent: number;
 }
 
-interface ParsedBomRow {
-  rowNumber: number;
-  productName: string;
-  componentName: string;
-  quantity: number;
-  lossBufferPercent: number;
-  productGuid: string;
-  componentGuid: string;
-  error: string;
-}
-
-function normalizeHeader(value: unknown): string {
-  return String(value ?? "").trim().toLocaleLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
-}
-
-function field(row: Record<string, unknown>, aliases: string[]): unknown {
-  for (const [key, value] of Object.entries(row)) {
-    if (aliases.includes(normalizeHeader(key))) return value;
-  }
-  return "";
-}
-
 export default function BomManager({ planning, stores, onChanged, onStoresChanged, onNotice, onError }: Props) {
   const [productGuid, setProductGuid] = useState("");
   const [label, setLabel] = useState("");
   const [validFrom, setValidFrom] = useState(new Date().toISOString().slice(0, 10));
   const [lines, setLines] = useState<DraftLine[]>([{ componentTallyGuid: "", quantityPerProduct: 1, lossBufferPercent: 0 }]);
   const [parsedRows, setParsedRows] = useState<ParsedBomRow[]>([]);
+  const [importDetails, setImportDetails] = useState("");
   const [busy, setBusy] = useState(false);
   const [expandedBom, setExpandedBom] = useState("");
   const [localComponentGroup, setLocalComponentGroup] = useState("Local Components");
   const [localProductGroup, setLocalProductGroup] = useState("Local Products");
-
-  const itemByName = useMemo(
-    () => new Map(stores.stockItems.map((item) => [item.name.toLocaleLowerCase(), item])),
+  const selectableItems = useMemo(
+    () => operationalStockItems(stores.stockItems),
     [stores.stockItems],
   );
+
   const products = useMemo(() => {
     const activeBomProducts = new Set(planning.boms.filter((bom) => bom.status === "ACTIVE").map((bom) => bom.productTallyGuid));
-    return [...stores.stockItems].sort((left, right) => {
+    return [...selectableItems].sort((left, right) => {
       const leftPriority = left.hasBom || activeBomProducts.has(left.tallyGuid) ? 1 : 0;
       const rightPriority = right.hasBom || activeBomProducts.has(right.tallyGuid) ? 1 : 0;
       return rightPriority - leftPriority || left.name.localeCompare(right.name);
     });
-  }, [stores.stockItems, planning.boms]);
+  }, [selectableItems, planning.boms]);
 
   async function saveManualBom() {
     if (!productGuid) {
@@ -98,35 +83,16 @@ export default function BomManager({ planning, stores, onChanged, onStoresChange
 
   async function parseFile(file: File) {
     onError("");
+    setParsedRows([]);
+    setImportDetails("");
     try {
       const workbook = XLSX.read(await file.arrayBuffer(), { type: "array", cellDates: false });
-      const sheet = workbook.Sheets[workbook.SheetNames[0]];
-      const records = XLSX.utils.sheet_to_json<Record<string, unknown>>(sheet, { defval: "" });
-      const parsed = records.map((row, index): ParsedBomRow => {
-        const productName = String(field(row, ["product", "product name", "finished product", "assembly"])).trim();
-        const componentName = String(field(row, ["component", "component name", "material", "stock item"])).trim();
-        const quantity = Number(field(row, ["quantity", "quantity per product", "qty per product", "component quantity"]));
-        const loss = Number(field(row, ["loss buffer", "loss buffer percent", "loss percent", "wastage percent"]) || 0);
-        const product = itemByName.get(productName.toLocaleLowerCase());
-        const component = itemByName.get(componentName.toLocaleLowerCase());
-        const errors: string[] = [];
-        if (!productName || !product) errors.push("Product not matched");
-        if (!componentName || !component) errors.push("Component not matched");
-        if (!Number.isInteger(quantity) || quantity <= 0) errors.push("Quantity must be a positive whole number");
-        if (!Number.isFinite(loss) || loss < 0 || loss > 100) errors.push("Loss buffer must be 0–100");
-        return {
-          rowNumber: index + 2,
-          productName,
-          componentName,
-          quantity,
-          lossBufferPercent: loss,
-          productGuid: product?.tallyGuid ?? "",
-          componentGuid: component?.tallyGuid ?? "",
-          error: errors.join("; "),
-        };
-      });
-      setParsedRows(parsed);
-      if (parsed.length === 0) onError("The selected file did not contain any BOM rows.");
+      const result = parseBomWorkbook(workbook, selectableItems, file.name);
+      setParsedRows(result.rows);
+      setImportDetails(
+        `${result.sheetName} · product ${result.productName || "not detected"}${result.skippedNotFitted ? ` · skipped ${result.skippedNotFitted} NC/DNA row${result.skippedNotFitted === 1 ? "" : "s"}` : ""}`,
+      );
+      if (result.rows.length === 0) onError("The selected file did not contain any fitted BOM component rows.");
     } catch (error) {
       onError(error instanceof Error ? error.message : String(error));
     }
@@ -149,10 +115,14 @@ export default function BomManager({ planning, stores, onChanged, onStoresChange
         onStoresChanged(currentStores);
       }
 
-      const refreshedByName = new Map(currentStores.stockItems.map((item) => [item.name.toLocaleLowerCase(), item]));
+      const refreshedItems = operationalStockItems(currentStores.stockItems);
       const refreshedRows = parsedRows.map((row) => {
-        const product = row.productGuid ? currentStores.stockItems.find((item) => item.tallyGuid === row.productGuid) : refreshedByName.get(row.productName.toLocaleLowerCase());
-        const component = row.componentGuid ? currentStores.stockItems.find((item) => item.tallyGuid === row.componentGuid) : refreshedByName.get(row.componentName.toLocaleLowerCase());
+        const product = row.productGuid
+          ? refreshedItems.find((item) => item.tallyGuid === row.productGuid)
+          : matchBomCatalogItem(refreshedItems, row.productName);
+        const component = row.componentGuid
+          ? refreshedItems.find((item) => item.tallyGuid === row.componentGuid)
+          : matchBomCatalogItem(refreshedItems, row.componentName);
         const errors: string[] = [];
         if (!product) errors.push("Product not matched");
         if (!component) errors.push("Component not matched");
@@ -174,7 +144,13 @@ export default function BomManager({ planning, stores, onChanged, onStoresChange
       for (const row of valid) grouped.set(row.productGuid, [...(grouped.get(row.productGuid) ?? []), row]);
       let state = planning;
       for (const [guid, rows] of grouped) {
-        const uniqueComponents = new Map(rows.map((row) => [row.componentGuid, row]));
+        const uniqueComponents = new Map<string, ParsedBomRow>();
+        for (const row of rows) {
+          const previous = uniqueComponents.get(row.componentGuid);
+          uniqueComponents.set(row.componentGuid, previous
+            ? { ...row, quantity: previous.quantity + row.quantity }
+            : row);
+        }
         state = await window.desktop.planning.saveBom({
           productTallyGuid: guid,
           label: `Imported ${new Date().toLocaleDateString("en-IN")}`,
@@ -189,6 +165,7 @@ export default function BomManager({ planning, stores, onChanged, onStoresChange
       }
       onChanged(state);
       setParsedRows([]);
+      setImportDetails("");
       onNotice(`Imported ${grouped.size} BOM version${grouped.size === 1 ? "" : "s"}.`);
     } catch (error) {
       onError(error instanceof Error ? error.message : String(error));
@@ -223,7 +200,7 @@ export default function BomManager({ planning, stores, onChanged, onStoresChange
           <div className="bom-line-editor">
             <div className="bom-line-editor__head"><span>Component</span><span>Qty / product</span><span>Loss buffer %</span><span /></div>
             {lines.map((line, index) => <div className="bom-line-editor__row" key={index}>
-              <select value={line.componentTallyGuid} onChange={(event) => setLines(lines.map((entry, rowIndex) => rowIndex === index ? { ...entry, componentTallyGuid: event.target.value } : entry))}><option value="">Select component…</option>{stores.stockItems.filter((item) => item.tallyGuid !== productGuid).map((item) => <option key={item.tallyGuid} value={item.tallyGuid}>{item.name}</option>)}</select>
+              <select value={line.componentTallyGuid} onChange={(event) => setLines(lines.map((entry, rowIndex) => rowIndex === index ? { ...entry, componentTallyGuid: event.target.value } : entry))}><option value="">Select component…</option>{selectableItems.filter((item) => item.tallyGuid !== productGuid).map((item) => <option key={item.tallyGuid} value={item.tallyGuid}>{item.name}</option>)}</select>
               <input type="number" min={1} step={1} value={line.quantityPerProduct} onChange={(event) => setLines(lines.map((entry, rowIndex) => rowIndex === index ? { ...entry, quantityPerProduct: Number(event.target.value) } : entry))} />
               <input type="number" min={0} max={100} step={0.1} value={line.lossBufferPercent} onChange={(event) => setLines(lines.map((entry, rowIndex) => rowIndex === index ? { ...entry, lossBufferPercent: Number(event.target.value) } : entry))} />
               <button className="icon-button" type="button" aria-label="Remove component" onClick={() => setLines(lines.filter((_, rowIndex) => rowIndex !== index))}>×</button>
@@ -236,10 +213,10 @@ export default function BomManager({ planning, stores, onChanged, onStoresChange
           <div className="panel__header"><div><p className="eyebrow">IMPORT</p><h2>Upload component lists</h2></div></div>
           <label className="file-drop">Choose BOM spreadsheet<input type="file" accept=".xlsx,.xls,.csv" onChange={(event) => { const file = event.target.files?.[0]; if (file) void parseFile(file); event.currentTarget.value = ""; }} /></label>
           {parsedRows.length > 0 && <>
-            <div className="import-summary"><strong>{parsedRows.filter((row) => !row.error).length} matched</strong><span>{parsedRows.filter((row) => row.error).length} need mapping or correction</span></div>
+            <div className="import-summary"><strong>{parsedRows.filter((row) => !row.error).length} matched</strong><span>{parsedRows.filter((row) => row.error).length} need mapping or correction</span>{importDetails && <span>{importDetails}</span>}</div>
             <div className="table-scroll import-preview"><table><thead><tr><th>Row</th><th>Product</th><th>Component</th><th>Qty</th><th>Loss</th><th>Result</th></tr></thead><tbody>{parsedRows.map((row) => <tr key={row.rowNumber} className={row.error ? "row-error" : ""}><td>{row.rowNumber}</td><td>{row.productName || "—"}</td><td>{row.componentName || "—"}</td><td>{Number.isFinite(row.quantity) ? row.quantity : "—"}</td><td>{Number.isFinite(row.lossBufferPercent) ? `${row.lossBufferPercent}%` : "—"}</td><td>{row.error || "Matched"}</td></tr>)}</tbody></table></div>
             {parsedRows.some((row) => !row.productGuid || !row.componentGuid) && <div className="local-item-controls"><label>New component group<input value={localComponentGroup} onChange={(event) => setLocalComponentGroup(event.target.value)} /></label><label>New product group<input value={localProductGroup} onChange={(event) => setLocalProductGroup(event.target.value)} /></label><p>Unmatched names can be created locally and linked to Tally later.</p></div>}
-            <div className="inline-actions"><button className="button button--secondary" type="button" onClick={() => setParsedRows([])}>Clear preview</button><button className="button button--secondary" disabled={busy || parsedRows.every((row) => row.error)} type="button" onClick={() => void importRows(false)}>Import matched only</button>{parsedRows.some((row) => !row.productGuid || !row.componentGuid) && <button className="button" disabled={busy} type="button" onClick={() => void importRows(true)}>Create missing locally and import</button>}</div>
+            <div className="inline-actions"><button className="button button--secondary" type="button" onClick={() => { setParsedRows([]); setImportDetails(""); }}>Clear preview</button><button className="button button--secondary" disabled={busy || parsedRows.every((row) => row.error)} type="button" onClick={() => void importRows(false)}>Import matched only</button>{parsedRows.some((row) => !row.productGuid || !row.componentGuid) && <button className="button" disabled={busy} type="button" onClick={() => void importRows(true)}>Create missing locally and import</button>}</div>
           </>}
         </article>
       </section>

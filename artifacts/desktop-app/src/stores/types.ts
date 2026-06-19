@@ -24,6 +24,7 @@ export type ReviewStatus =
 export interface StoresStockItem {
   id: number;
   tallyGuid: string;
+  tallyName: string;
   name: string;
   parentName: string;
   hasBom: boolean;
@@ -31,6 +32,9 @@ export interface StoresStockItem {
   localAvailableQuantity: number;
   active: boolean;
   source: "TALLY" | "LOCAL";
+  catalogStatus: "ACTIVE" | "DUPLICATE" | "OBSOLETE";
+  duplicateOfTallyGuid: string | null;
+  duplicateOfName: string | null;
 }
 
 export interface StoresSupplier {
@@ -219,6 +223,26 @@ export interface StoresState {
 export interface CreateLocalStockItemInput {
   name: string;
   parentName?: string;
+}
+
+export interface SetCatalogStatusInput {
+  tallyItemGuid: string;
+  status: "ACTIVE" | "DUPLICATE" | "OBSOLETE";
+  duplicateOfTallyGuid?: string | null;
+}
+
+export interface RenameStockItemInput {
+  tallyItemGuid: string;
+  name: string;
+}
+
+export interface CatalogCleanupExportResult {
+  workbookPath: string;
+  renameXmlPath: string | null;
+  renameCount: number;
+  duplicateCount: number;
+  obsoleteCount: number;
+  warnings: string[];
 }
 
 export interface SaveBoxInput {

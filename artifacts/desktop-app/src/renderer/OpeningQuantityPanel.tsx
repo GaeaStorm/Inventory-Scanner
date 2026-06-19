@@ -1,6 +1,7 @@
 import { useMemo, useState } from "react";
 
 import InfoTip from "./InfoTip";
+import { operationalStockItems } from "./stock-item-visibility";
 import type { StoresState } from "./types";
 
 function transactionId(): string {
@@ -22,6 +23,10 @@ export default function OpeningQuantityPanel(props: {
   const [reason, setReason] = useState("");
   const [adjustedBy, setAdjustedBy] = useState("");
   const [busy, setBusy] = useState(false);
+  const selectableItems = useMemo(
+    () => operationalStockItems(props.stores.stockItems),
+    [props.stores.stockItems],
+  );
 
   async function save(): Promise<void> {
     if (!selected) return;
@@ -78,7 +83,7 @@ export default function OpeningQuantityPanel(props: {
             }}
           >
             <option value="">Select Stock Item…</option>
-            {props.stores.stockItems.map((item) => (
+            {selectableItems.map((item) => (
               <option key={item.tallyGuid} value={item.tallyGuid}>
                 {item.name} · local {item.localAvailableQuantity} · Tally {item.tallyClosingQuantity}
               </option>

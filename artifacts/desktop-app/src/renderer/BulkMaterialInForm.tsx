@@ -1,5 +1,6 @@
 import { useMemo, useState } from "react";
 
+import { isOperationalStockItem, operationalStockItems } from "./stock-item-visibility";
 import type { StoresState } from "./types";
 
 interface Props {
@@ -41,9 +42,13 @@ export default function BulkMaterialInForm({ stores, onChanged, onNotice, onErro
     () => stores.purchaseOrders.filter((order) => selectedSupplierId === null || order.supplierId === selectedSupplierId),
     [selectedSupplierId, stores.purchaseOrders],
   );
+  const visibleGuids = useMemo(
+    () => new Set(operationalStockItems(stores.stockItems).map((item) => item.tallyGuid)),
+    [stores.stockItems],
+  );
   const allowedItems = selectedPo
-    ? selectedPo.lines.filter((line) => line.outstandingQuantity > 0)
-    : stores.stockItems.map((item) => ({
+    ? selectedPo.lines.filter((line) => line.outstandingQuantity > 0 && visibleGuids.has(line.tallyItemGuid))
+    : stores.stockItems.filter(isOperationalStockItem).map((item) => ({
         tallyItemGuid: item.tallyGuid,
         itemName: item.name,
         orderedQuantity: 0,
@@ -85,7 +90,7 @@ export default function BulkMaterialInForm({ stores, onChanged, onNotice, onErro
     setNonPoException(false);
     setRows(
       order.lines
-        .filter((line) => line.outstandingQuantity > 0)
+        .filter((line) => line.outstandingQuantity > 0 && visibleGuids.has(line.tallyItemGuid))
         .map((line) => ({ tallyItemGuid: line.tallyItemGuid, quantity: "" })),
     );
   }
@@ -139,7 +144,7 @@ export default function BulkMaterialInForm({ stores, onChanged, onNotice, onErro
       const nextOrder = selectedPo ? next.purchaseOrders.find((order) => order.id === selectedPo.id) : null;
       if (selectedPo && !nextOrder) setPurchaseOrderId("");
       setRows(nextOrder
-        ? nextOrder.lines.filter((line) => line.outstandingQuantity > 0).map((line) => ({ tallyItemGuid: line.tallyItemGuid, quantity: "" }))
+        ? nextOrder.lines.filter((line) => line.outstandingQuantity > 0 && visibleGuids.has(line.tallyItemGuid)).map((line) => ({ tallyItemGuid: line.tallyItemGuid, quantity: "" }))
         : [emptyRow()]);
       onNotice(`Recorded ${result.grnNumber} with ${result.movements.length} received item line${result.movements.length === 1 ? "" : "s"}. It is now pending Tally review.`);
     } catch (reason) {

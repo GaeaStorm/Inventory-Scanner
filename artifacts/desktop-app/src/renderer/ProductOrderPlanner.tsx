@@ -1,6 +1,7 @@
 import { Fragment, useMemo, useState } from "react";
 import * as XLSX from "xlsx";
 
+import { operationalStockItems } from "./stock-item-visibility";
 import type { PlanningState, SaveProductOrderInput, StoresState } from "./types";
 
 interface Props {
@@ -61,17 +62,21 @@ export default function ProductOrderPlanner({ planning, stores, onChanged, onNot
   const [parsedRows, setParsedRows] = useState<ParsedOrderRow[]>([]);
   const [expanded, setExpanded] = useState("");
   const [busy, setBusy] = useState(false);
+  const selectableItems = useMemo(
+    () => operationalStockItems(stores.stockItems),
+    [stores.stockItems],
+  );
   const activeBomProducts = useMemo(
     () => new Set(planning.boms.filter((bom) => bom.status === "ACTIVE").map((bom) => bom.productTallyGuid)),
     [planning.boms],
   );
   const itemByName = useMemo(
-    () => new Map(stores.stockItems.map((item) => [item.name.toLocaleLowerCase(), item])),
-    [stores.stockItems],
+    () => new Map(selectableItems.map((item) => [item.name.toLocaleLowerCase(), item])),
+    [selectableItems],
   );
   const products = useMemo(
-    () => [...stores.stockItems].sort((left, right) => Number(activeBomProducts.has(right.tallyGuid)) - Number(activeBomProducts.has(left.tallyGuid)) || left.name.localeCompare(right.name)),
-    [stores.stockItems, activeBomProducts],
+    () => [...selectableItems].sort((left, right) => Number(activeBomProducts.has(right.tallyGuid)) - Number(activeBomProducts.has(left.tallyGuid)) || left.name.localeCompare(right.name)),
+    [selectableItems, activeBomProducts],
   );
 
   async function saveOrder(input = draft) {

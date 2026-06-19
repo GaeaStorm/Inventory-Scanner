@@ -14,11 +14,27 @@ export function createStoresRouter(service: StoresService): Router {
     response.status(201).json(service.createLocalStockItem(request.body));
   });
 
+  router.post("/catalog/status", (request, response) => {
+    response.json(service.setCatalogStatus(request.body));
+  });
+
+  router.post("/catalog/rename", (request, response) => {
+    response.json(service.renameStockItem(request.body));
+  });
+
+  router.post("/catalog/export-cleanup", (_request, response) => {
+    response.json(service.exportCatalogCleanup());
+  });
+
   router.get("/catalog", (_request, response) => {
     const state = service.getState();
+    const selectable = state.stockItems.filter((item) =>
+      item.catalogStatus !== "DUPLICATE"
+      && (item.catalogStatus !== "OBSOLETE" || item.localAvailableQuantity > 0)
+    );
     response.json({
-      stockItems: state.stockItems,
-      destinations: [...state.stockItems].sort((left, right) => {
+      stockItems: selectable,
+      destinations: [...selectable].sort((left, right) => {
         if (left.hasBom !== right.hasBom) return left.hasBom ? -1 : 1;
         return left.name.localeCompare(right.name);
       }),

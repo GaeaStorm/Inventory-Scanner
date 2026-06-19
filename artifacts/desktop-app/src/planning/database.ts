@@ -504,13 +504,15 @@ export class PlanningDatabase {
 
   private getBoms(): BomVersion[] {
     const rows = this.db.prepare(`
-      SELECT b.*, item.tally_guid AS product_tally_guid, item.name AS product_name
+      SELECT b.*, item.tally_guid AS product_tally_guid,
+        COALESCE(NULLIF(item.local_name_override, ''), item.name) AS product_name
       FROM planning_bom_versions b
       JOIN tally_stock_items item ON item.id = b.product_item_id
       ORDER BY item.name, b.version_number DESC
     `).all() as Row[];
     const lineStatement = this.db.prepare(`
-      SELECT l.*, item.tally_guid AS component_tally_guid, item.name AS component_name
+      SELECT l.*, item.tally_guid AS component_tally_guid,
+        COALESCE(NULLIF(item.local_name_override, ''), item.name) AS component_name
       FROM planning_bom_lines l
       JOIN tally_stock_items item ON item.id = l.component_item_id
       WHERE l.bom_version_id = ? ORDER BY item.name
@@ -540,7 +542,8 @@ export class PlanningDatabase {
 
   private getProductOrders(): ProductOrder[] {
     const rows = this.db.prepare(`
-      SELECT o.*, item.tally_guid AS product_tally_guid, item.name AS product_name,
+      SELECT o.*, item.tally_guid AS product_tally_guid,
+        COALESCE(NULLIF(item.local_name_override, ''), item.name) AS product_name,
         bom.label AS bom_label, bom.version_number AS bom_version_number
       FROM planning_product_orders o
       JOIN tally_stock_items item ON item.id = o.product_item_id
@@ -549,7 +552,8 @@ export class PlanningDatabase {
         o.required_date, o.created_at DESC
     `).all() as Row[];
     const requirementsStatement = this.db.prepare(`
-      SELECT r.*, item.tally_guid AS component_tally_guid, item.name AS component_name,
+      SELECT r.*, item.tally_guid AS component_tally_guid,
+        COALESCE(NULLIF(item.local_name_override, ''), item.name) AS component_name,
         line.quantity_per_product, line.loss_buffer_percent,
         COALESCE((SELECT SUM(quantity_remaining) FROM purchase_lots WHERE stock_item_id = r.component_item_id), 0) AS on_hand,
         COALESCE((SELECT service_reserve FROM planning_restock_policies WHERE stock_item_id = r.component_item_id), 0) AS service_reserve,
@@ -654,7 +658,9 @@ export class PlanningDatabase {
 
   private getPlanningItems(): RestockPlanningItem[] {
     const rows = this.db.prepare(`
-      SELECT item.id, item.tally_guid, item.name, item.parent_name, item.source,
+      SELECT item.id, item.tally_guid,
+        COALESCE(NULLIF(item.local_name_override, ''), item.name) AS name,
+        item.parent_name, item.source,
         policy.planning_method, policy.reorder_point, policy.target_stock,
         policy.service_reserve, policy.preferred_supplier_id,
         supplier.name AS preferred_supplier_name, policy.lead_time_days,
@@ -672,6 +678,15 @@ export class PlanningDatabase {
       LEFT JOIN suppliers supplier ON supplier.id = policy.preferred_supplier_id
       LEFT JOIN planning_recommendations recommendation ON recommendation.stock_item_id = item.id
       WHERE item.active = 1
+        AND item.catalog_status <> 'DUPLICATE'
+        AND (
+          item.catalog_status <> 'OBSOLETE'
+          OR EXISTS (
+            SELECT 1 FROM purchase_lots stocked_lot
+            WHERE stocked_lot.stock_item_id = item.id
+              AND stocked_lot.quantity_remaining > 0
+          )
+        )
       ORDER BY item.name
     `).all() as Row[];
     return rows.map((row) => {

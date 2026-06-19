@@ -3,6 +3,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import BackupRestorePanel from "./BackupRestorePanel";
 import BoxQrCodeCreatorTab from "./BoxQrCodeCreatorTab";
 import BulkMaterialInForm from "./BulkMaterialInForm";
+import CatalogStatusPanel from "./CatalogStatusPanel";
 import InventoryPlanningDashboard from "./InventoryPlanningDashboard";
 import OpeningQuantityPanel from "./OpeningQuantityPanel";
 import TallyTab from "./TallyTab";
@@ -204,6 +205,12 @@ export default function App() {
               </table></div>
             </article>
             <OpeningQuantityPanel
+              stores={stores}
+              onChanged={handleStoresChanged}
+              onNotice={setNotice}
+              onError={setError}
+            />
+            <CatalogStatusPanel
               stores={stores}
               onChanged={handleStoresChanged}
               onNotice={setNotice}

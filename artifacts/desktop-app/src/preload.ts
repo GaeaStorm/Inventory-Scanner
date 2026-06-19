@@ -21,6 +21,9 @@ contextBridge.exposeInMainWorld("desktop", {
   stores: {
     getState: () => ipcRenderer.invoke("stores:get-state"),
     createLocalStockItem: (input: unknown) => ipcRenderer.invoke("stores:create-local-stock-item", input),
+    setCatalogStatus: (input: unknown) => ipcRenderer.invoke("stores:set-catalog-status", input),
+    renameStockItem: (input: unknown) => ipcRenderer.invoke("stores:rename-stock-item", input),
+    exportCatalogCleanup: () => ipcRenderer.invoke("stores:export-catalog-cleanup"),
     saveBox: (input: unknown) => ipcRenderer.invoke("stores:save-box", input),
     deleteBox: (boxId: string, expectedRevision?: number) =>
       ipcRenderer.invoke("stores:delete-box", boxId, expectedRevision),

@@ -58,6 +58,7 @@ export type {
   ExportBatchResult,
   ReviewDecisionInput,
   SaveBoxInput,
+  SetCatalogStatusInput,
   StoresBackupResult,
   StoresBox,
   StoresState,
@@ -67,6 +68,8 @@ export type {
   MaterialOutInput,
   AdjustmentInput,
   OpeningQuantityInput,
+  RenameStockItemInput,
+  CatalogCleanupExportResult,
   StoresRestoreResult,
   AdjustmentContext,
 } from "../stores/types";
