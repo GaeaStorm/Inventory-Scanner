@@ -6,6 +6,7 @@ import * as XLSX from "xlsx";
 
 import type { ExportBatchInput, ExportBatchResult } from "./types";
 import { StoresDatabase } from "./database";
+import { writeTallyMovementWorkbooks } from "./tally-excel";
 
 type Row = Record<string, any>;
 
@@ -64,25 +65,15 @@ export class StoresExporter {
     if (approved.length === 0) throw new Error("There are no approved entries ready for export.");
 
     const materialOutConfigured = this.database.getState().materialOutXmlConfigured;
-    const blockedMaterialOut = approved.filter(
-      (entry) => entry.entityType === "MATERIAL_OUT" && !materialOutConfigured,
-    );
-    const exportable = approved.filter(
-      (entry) => entry.entityType !== "MATERIAL_OUT" || materialOutConfigured,
-    );
-    if (exportable.length === 0) {
-      throw new Error(
-        "Approved Material Out entries are waiting for the Production and Servicing sample-voucher mapping. They were not marked as exported.",
-      );
-    }
-
-    const warnings: string[] = [];
-    if (blockedMaterialOut.length > 0) {
-      warnings.push(
-        `${blockedMaterialOut.length} approved Material Out group(s) remain in the queue because the XML adapter is intentionally disabled until sample Production and Servicing vouchers are mapped.`,
-      );
-    }
+    const exportable = approved;
     const materialOut = exportable.filter((entry) => entry.entityType === "MATERIAL_OUT");
+    const warnings: string[] = [];
+
+    if (materialOut.length > 0 && !materialOutConfigured) {
+     warnings.push(
+      `${materialOut.length} approved Material Out group(s) were included in the Material Out Excel workbook. They were omitted from Tally XML because the Production and Servicing XML mapping is still unconfigured.`,
+     );
+    }
 
     this.database.backup("before-export");
     const batchId = `BATCH-${randomUUID()}`;
@@ -91,6 +82,8 @@ export class StoresExporter {
     const stamp = new Date().toISOString().replace(/[:.]/g, "-");
     const base = `inventory-scanner-v${REVIEW_EXPORT_SCHEMA_VERSION}-${stamp}`;
     const excelPath = path.join(exportFolder, `${base}-review.xlsx`);
+    const materialInExcelPath = path.join(exportFolder, `${base}-material-in.xlsx`);
+    const materialOutExcelPath = path.join(exportFolder, `${base}-material-out.xlsx`);
     const csvPath = input.includeCsv ? path.join(exportFolder, `${base}-review.csv`) : null;
     const xmlPath = path.join(exportFolder, `${base}-tally.xml`);
 
@@ -211,6 +204,13 @@ export class StoresExporter {
     appendSheet(workbook, "Exceptions", exceptionRows);
     appendSheet(workbook, "Source Transactions", sourceRows);
     XLSX.writeFile(workbook, excelPath);
+
+    writeTallyMovementWorkbooks(this.database, exportable, {
+     materialInPath: materialInExcelPath,
+     materialOutPath: materialOutExcelPath,
+     generatedAt: new Date(),
+     reviewedBy,
+    });
 
     if (csvPath) {
       const combinedRows = [

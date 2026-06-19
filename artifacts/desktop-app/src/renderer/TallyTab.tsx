@@ -125,7 +125,7 @@ export default function TallyTab({ stores, onChanged }: Props) {
       const result = await window.desktop.stores.exportBatch({ reviewedBy: reviewer.trim(), includeCsv });
       const next = await window.desktop.stores.getState();
       onChanged(next);
-      setNotice(`Generated review Excel, ${result.csvPath ? "CSV, " : ""}and Tally XML in ${stores.database.exportFolder}.${result.warnings.length ? ` ${result.warnings.join(" ")}` : ""}`);
+      setNotice(`Generated Material In Excel, Material Out Excel, review Excel, ${result.csvPath ? "CSV, " : ""}and Tally XML in ${stores.database.exportFolder}.${result.warnings.length ? ` ${result.warnings.join(" ")}` : ""}`);
     } catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)); }
     finally { setBusy(""); }
   }
@@ -182,7 +182,7 @@ export default function TallyTab({ stores, onChanged }: Props) {
           {stores.reviewEntries.map((entry) => <tr key={entry.id}><td>{entry.entityType.replaceAll("_", " ")}</td><td>{entry.eventDate}</td><td><strong>{entry.title}</strong>{entry.supplierName && <small className="table-subtext">{entry.supplierName} · PO {entry.poNumber || "exception"} · Challan {entry.challanNumber || "—"}</small>}</td><td>{entry.quantity}</td><td>{entry.fifoSummary || entry.validationMessages.join("; ") || "Ready for review"}</td><td><span className={`review-status review-status--${entry.status.toLowerCase().replaceAll("_", "-")}`}>{entry.status}</span>{entry.tallyVoucherNumber && <small className="table-subtext">Tally {entry.tallyVoucherNumber}</small>}</td><td><div className="row-actions">{entry.status === "EXPORTED" ? <button type="button" onClick={() => void confirmImported(entry.id, entry.tallyVoucherNumber)} disabled={Boolean(busy)}>Confirm import</button> : <><button type="button" onClick={() => void decide(entry.id, "APPROVED")} disabled={Boolean(busy) || ["CONFIRMED"].includes(entry.status)}>Approve</button><button type="button" onClick={() => void decide(entry.id, "NEEDS_CORRECTION")} disabled={Boolean(busy) || ["CONFIRMED"].includes(entry.status)}>Correct</button><button type="button" onClick={() => void decide(entry.id, "REJECTED")} disabled={Boolean(busy) || ["CONFIRMED"].includes(entry.status)}>Reject</button></>}</div></td></tr>)}
           {stores.reviewEntries.length === 0 && <tr><td colSpan={7} className="empty-table">No proposed vouchers yet.</td></tr>}
         </tbody></table></div>
-        {!stores.materialOutXmlConfigured && <p className="table-footnote"><strong>Material Out boundary:</strong> review and FIFO grouping work now, but Material Out XML remains blocked until one Production and one Servicing sample voucher are exported from the temporary Tally company and mapped.</p>}
+        {!stores.materialOutXmlConfigured && <p className="table-footnote"><strong>Material Out:</strong> approved movements are included in the Material Out Excel workbook, but direct Material Out XML remains blocked until one Production and one Servicing sample voucher are exported from the temporary Tally company and mapped.</p>}
       </article>
 
       <article className="panel table-panel">
