@@ -2251,7 +2251,7 @@ code {
 
 .planning-filters {
   display: grid;
-  grid-template-columns: minmax(220px, 2fr) repeat(3, minmax(135px, 1fr)) auto;
+  grid-template-columns: minmax(220px, 2fr) repeat(4, minmax(135px, 1fr)) auto;
   gap: 8px;
   padding: 0 18px 14px;
 }

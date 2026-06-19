@@ -28,6 +28,12 @@ const healthLabels: Record<RestockPlanningItem["health"], string> = {
   UNCONFIGURED: "Unconfigured",
 };
 
+const MANUFACTURED_PRODUCTS_GROUP = "MANUFACTURED PRODUCTS";
+
+function isManufacturedProduct(item: RestockPlanningItem): boolean {
+  return item.groupName.trim().toLocaleUpperCase() === MANUFACTURED_PRODUCTS_GROUP;
+}
+
 function numberInput(value: number, setter: (value: number) => void, min = 0) {
   return {
     type: "number" as const,
@@ -48,6 +54,7 @@ export default function RestockActionCenter({
 }: Props) {
   const [search, setSearch] = useState("");
   const [group, setGroup] = useState("");
+  const [itemType, setItemType] = useState("");
   const [health, setHealth] = useState("");
   const [supplier, setSupplier] = useState("");
   const [selectedGuid, setSelectedGuid] = useState(planning.items[0]?.tallyItemGuid ?? "");
@@ -55,6 +62,11 @@ export default function RestockActionCenter({
   const [includeCsv, setIncludeCsv] = useState(true);
 
   const selected = planning.items.find((item) => item.tallyItemGuid === selectedGuid) ?? null;
+  const selectedBom = selected && isManufacturedProduct(selected)
+    ? planning.boms.find((bom) => bom.productTallyGuid === selected.tallyItemGuid && bom.status === "ACTIVE")
+      ?? planning.boms.find((bom) => bom.productTallyGuid === selected.tallyItemGuid)
+      ?? null
+    : null;
   const [draft, setDraft] = useState<RestockPolicyInput | null>(selected ? toDraft(selected) : null);
   const [approvedQty, setApprovedQty] = useState(selected?.approvedOrderQuantity ?? selected?.suggestedOrderQuantity ?? 0);
 
@@ -76,12 +88,14 @@ export default function RestockActionCenter({
     const needle = search.trim().toLocaleLowerCase();
     return planning.items.filter((item) => {
       if (needle && !`${item.itemName} ${item.groupName} ${item.preferredSupplierName}`.toLocaleLowerCase().includes(needle)) return false;
+      if (itemType === "PRODUCT" && !isManufacturedProduct(item)) return false;
+      if (itemType === "COMPONENT" && isManufacturedProduct(item)) return false;
       if (group && item.groupName !== group) return false;
       if (health && item.health !== health) return false;
       if (supplier && item.preferredSupplierName !== supplier) return false;
       return true;
     });
-  }, [planning.items, search, group, health, supplier]);
+  }, [planning.items, search, itemType, group, health, supplier]);
 
   async function perform(action: () => Promise<PlanningState>, message: string) {
     setBusy(true);
@@ -160,10 +174,11 @@ export default function RestockActionCenter({
         </div>
         <div className="planning-filters">
           <input aria-label="Search stock planning" placeholder="Search item, group, or supplier…" value={search} onChange={(event) => setSearch(event.target.value)} />
+          <select aria-label="Filter by inventory type" value={itemType} onChange={(event) => setItemType(event.target.value)}><option value="">All inventory</option><option value="COMPONENT">Components and purchased stock</option><option value="PRODUCT">Products (MANUFACTURED PRODUCTS)</option></select>
           <select aria-label="Filter by group" value={group} onChange={(event) => setGroup(event.target.value)}><option value="">All groups</option>{planning.groups.map((entry) => <option key={entry}>{entry}</option>)}</select>
           <select aria-label="Filter by status" value={health} onChange={(event) => setHealth(event.target.value)}><option value="">All statuses</option>{Object.entries(healthLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select>
           <select aria-label="Filter by supplier" value={supplier} onChange={(event) => setSupplier(event.target.value)}><option value="">All suppliers</option>{supplierNames.map((entry) => <option key={entry}>{entry}</option>)}</select>
-          <button className="button button--secondary" type="button" onClick={() => { setSearch(""); setGroup(""); setHealth(""); setSupplier(""); }}>Clear filters</button>
+          <button className="button button--secondary" type="button" onClick={() => { setSearch(""); setItemType(""); setGroup(""); setHealth(""); setSupplier(""); }}>Clear filters</button>
         </div>
         <div className="table-scroll planning-restock-table"><table>
           <thead><tr><th>Status</th><th>Stock Item</th><th className="numeric">On hand</th><th className="numeric">Reserved</th><th className="numeric">Service</th><th className="numeric">Available</th><th className="numeric">Incoming</th><th className="numeric">Projected</th><th className="numeric">Reorder</th><th className="numeric">Target</th><th className="numeric">Suggested order</th><th>Supplier</th></tr></thead>
@@ -177,6 +192,19 @@ export default function RestockActionCenter({
           </tbody>
         </table></div>
       </article>
+
+      {selected && isManufacturedProduct(selected) && (
+        <article className="panel">
+          <div className="panel__header">
+            <div><p className="eyebrow">PRODUCT BOM</p><h2>{selected.itemName}</h2></div>
+            <button className="button button--secondary button--small" type="button" onClick={() => onNavigate("boms")}>Manage BOMs</button>
+          </div>
+          {selectedBom ? <>
+            <div className="import-summary"><strong>{selectedBom.label} · v{selectedBom.versionNumber}</strong><span>{selectedBom.status}</span><span>{selectedBom.source.replaceAll("_", " ")}</span></div>
+            <div className="bom-components-grid">{selectedBom.lines.map((line) => <div key={line.id}><strong>{line.componentName}</strong><span>{line.quantityPerProduct} each{line.lossBufferPercent ? ` + ${line.lossBufferPercent}% loss` : ""}</span></div>)}</div>
+          </> : <p>No BOM version is available for this manufactured product.</p>}
+        </article>
+      )}
 
       {selected && draft && (
         <article className="panel policy-editor">

@@ -116,7 +116,7 @@
   max-width: 100%;
 }
 
-.panel label:not(.checkbox-row):not(.file-drop),
+.panel label:not(.checkbox-row):not(.file-drop):not(.bom-import-button),
 .local-item-controls label,
 .recommendation-actions label {
   display: grid;
@@ -173,7 +173,7 @@
   display: grid;
   grid-template-columns:
     minmax(180px, 2fr)
-    repeat(3, minmax(140px, 1fr))
+    repeat(4, minmax(140px, 1fr))
     auto;
   gap: 12px;
   align-items: end;
@@ -182,6 +182,51 @@
 .planning-filters > * {
   min-width: 0;
   max-width: 100%;
+}
+
+.import-preview table {
+  min-width: 980px;
+}
+
+.bom-import-match {
+  display: grid;
+  grid-template-columns: minmax(190px, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+  min-width: 300px;
+}
+
+.bom-import-match .button {
+  white-space: nowrap;
+}
+
+.bom-import-button {
+  position: relative;
+  display: inline-flex;
+  width: auto;
+  min-height: 0;
+  cursor: pointer;
+}
+
+.bom-import-button input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.bom-import-workspace {
+  width: 100%;
+  min-width: 0;
+}
+
+.bom-import-workspace .import-preview table {
+  min-width: 1180px;
+}
+
+.bom-import-workspace .bom-import-match {
+  grid-template-columns: minmax(280px, 1fr) auto;
 }
 
 /* Restock policy: keep the supplier field the same width as adjacent fields. */
@@ -340,6 +385,11 @@
   .planning-filters > :first-child,
   .recommendation-actions > label:first-child {
     grid-column: auto;
+  }
+
+  .bom-import-match {
+    grid-template-columns: minmax(0, 1fr);
+    min-width: 220px;
   }
 
   .bom-line-editor__row {
