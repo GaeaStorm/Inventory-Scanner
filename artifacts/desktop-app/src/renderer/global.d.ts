@@ -2,6 +2,7 @@ import type {
   BulkVendorReceiptInput,
   BulkVendorReceiptResult,
   ConfirmImportInput,
+  CreateLocalStockItemInput,
   DesktopInfo,
   ExportBatchInput,
   ExportBatchResult,
@@ -15,6 +16,13 @@ import type {
   TallyConnectionResult,
   TallyConnectionSettings,
   TallyState,
+  PlanningState,
+  RestockPolicyInput,
+  RecommendationDecisionInput,
+  SaveBomInput,
+  SaveProductOrderInput,
+  PlanningExportInput,
+  PlanningExportResult,
 } from "./types";
 
 export {};
@@ -39,7 +47,9 @@ declare global {
       };
       stores: {
         getState: () => Promise<StoresState>;
+        createLocalStockItem: (input: CreateLocalStockItemInput) => Promise<StoresState>;
         saveBox: (input: SaveBoxInput) => Promise<StoresBox>;
+        deleteBox: (boxId: string, expectedRevision?: number) => Promise<StoresState>;
         bulkVendorReceipt: (input: BulkVendorReceiptInput) => Promise<BulkVendorReceiptResult>;
         review: (input: ReviewDecisionInput) => Promise<StoresState>;
         exportBatch: (input: ExportBatchInput) => Promise<ExportBatchResult>;
@@ -50,6 +60,19 @@ declare global {
         restoreBackup: (backupPath: string) => Promise<StoresRestoreResult>;
         chooseFolder: (kind: "backup" | "export") => Promise<StoresState | null>;
         openPath: (targetPath: string) => Promise<string>;
+      };
+      planning: {
+        getState: () => Promise<PlanningState>;
+        saveRestockPolicy: (input: RestockPolicyInput) => Promise<PlanningState>;
+        recommendationDecision: (input: RecommendationDecisionInput) => Promise<PlanningState>;
+        saveBom: (input: SaveBomInput) => Promise<PlanningState>;
+        activateBom: (bomId: string) => Promise<PlanningState>;
+        saveProductOrder: (input: SaveProductOrderInput) => Promise<PlanningState>;
+        updateProductOrderStatus: (
+          orderId: string,
+          status: "CANCELLED" | "COMPLETED" | "CONFIRMED",
+        ) => Promise<PlanningState>;
+        exportRestock: (input: PlanningExportInput) => Promise<PlanningExportResult>;
       };
     };
   }

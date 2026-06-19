@@ -30,6 +30,7 @@ export interface StoresStockItem {
   tallyClosingQuantity: number;
   localAvailableQuantity: number;
   active: boolean;
+  source: "TALLY" | "LOCAL";
 }
 
 export interface StoresSupplier {
@@ -213,6 +214,11 @@ export interface StoresState {
   openingQuantityAdjustments: StoresOpeningQuantityAdjustment[];
   exportSchemaVersion: string;
   materialOutXmlConfigured: boolean;
+}
+
+export interface CreateLocalStockItemInput {
+  name: string;
+  parentName?: string;
 }
 
 export interface SaveBoxInput {

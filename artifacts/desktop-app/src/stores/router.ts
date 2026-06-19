@@ -10,6 +10,10 @@ export function createStoresRouter(service: StoresService): Router {
     response.json(service.getState());
   });
 
+  router.post("/catalog/local-items", (request, response) => {
+    response.status(201).json(service.createLocalStockItem(request.body));
+  });
+
   router.get("/catalog", (_request, response) => {
     const state = service.getState();
     response.json({
@@ -33,6 +37,11 @@ export function createStoresRouter(service: StoresService): Router {
 
   router.post("/boxes", (request, response) => {
     response.status(201).json(service.saveBox(request.body));
+  });
+
+  router.delete("/boxes/:boxId", (request, response) => {
+    const expectedRevision = request.query.revision == null ? undefined : Number(request.query.revision);
+    response.json(service.deleteBox(request.params.boxId, expectedRevision));
   });
 
   router.post("/vendor-receipts", (request, response) => {

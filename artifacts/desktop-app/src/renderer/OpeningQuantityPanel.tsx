@@ -1,5 +1,6 @@
 import { useMemo, useState } from "react";
 
+import InfoTip from "./InfoTip";
 import type { StoresState } from "./types";
 
 function transactionId(): string {
@@ -59,14 +60,9 @@ export default function OpeningQuantityPanel(props: {
   return (
     <article className="panel opening-panel">
       <div className="panel__header">
-        <div>
-          <p className="eyebrow">OPENING STOCK CUTOVER</p>
-          <h2>Set a proven local opening count</h2>
-          <p>
-            Use this for stock that is not yet represented by historical Tally GRNs. Positive
-            differences become clearly marked Opening Legacy Stock. GRN-linked stock is never
-            silently rewritten.
-          </p>
+        <div className="heading-with-info">
+          <div><p className="eyebrow">OPENING STOCK</p><h2>Set local opening count</h2></div>
+          <InfoTip>Use this for stock not represented by historical Tally GRNs. Positive differences become Opening Legacy Stock; GRN-linked quantities are not rewritten.</InfoTip>
         </div>
       </div>
       <div className="opening-form-grid">

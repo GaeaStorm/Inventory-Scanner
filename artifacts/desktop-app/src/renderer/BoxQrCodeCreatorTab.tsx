@@ -156,6 +156,23 @@ export default function BoxQrCodeCreatorTab({ stores, onChanged }: Props) {
     }
   }
 
+  async function deleteBox(box: StoresBox): Promise<void> {
+    if (!window.confirm(`Delete ${box.boxId}? Existing printed labels will stop resolving from the desktop.`)) return;
+    setBusy(true);
+    setError("");
+    try {
+      const next = await window.desktop.stores.deleteBox(box.boxId, box.revision);
+      onChanged(next);
+      setQueue((current) => current.filter((entry) => entry.box.boxId !== box.boxId));
+      if (boxId === box.boxId) startNew();
+      setNotice(`${box.boxId} was deleted.`);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   function downloadPng(): void {
     if (!savedBox || !qrDataUrl) return;
     const link = document.createElement("a");
@@ -225,7 +242,7 @@ export default function BoxQrCodeCreatorTab({ stores, onChanged }: Props) {
   return (
     <section className="tab-page">
       <div className="page-heading">
-        <div><p className="eyebrow">SQLITE BOX RECORDS</p><h1>QR Code Creator</h1><p>Create or revise a box containing up to five Tally Stock Items. Supplier, PO, GRN, godown, batch, rate, and FIFO data are never encoded in the label.</p></div>
+        <div><p className="eyebrow">BOX LABELS</p><h1>QR Code Creator</h1></div>
         <button className="button button--secondary" type="button" onClick={startNew}>New box</button>
       </div>
       {error && <div className="alert alert--error">{error}</div>}
@@ -253,7 +270,7 @@ export default function BoxQrCodeCreatorTab({ stores, onChanged }: Props) {
 
           <div className="existing-boxes">
             <p className="eyebrow">EDIT AN EXISTING BOX</p>
-            <div className="existing-box-list">{stores.boxes.slice(0, 20).map((box) => <button key={box.boxId} type="button" onClick={() => loadBox(box)}><strong>{box.boxId}</strong><span>r{box.revision} · {box.items.length} item{box.items.length === 1 ? "" : "s"}</span></button>)}</div>
+            <div className="existing-box-list">{stores.boxes.slice(0, 50).map((box) => <div className="existing-box-row" key={box.boxId}><button className="existing-box-load" type="button" onClick={() => loadBox(box)}><strong>{box.boxId}</strong><span>r{box.revision} · {box.items.length} item{box.items.length === 1 ? "" : "s"}</span></button><button className="existing-box-delete" type="button" disabled={busy} onClick={() => void deleteBox(box)} aria-label={`Delete ${box.boxId}`}>Delete</button></div>)}</div>
           </div>
         </article>
 

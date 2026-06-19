@@ -20,6 +20,8 @@ import { TallyService } from "./tally/service";
 import { createStoresRouter } from "./stores/router";
 import { StoresDatabase } from "./stores/database";
 import { StoresService } from "./stores/service";
+import { createPlanningRouter } from "./planning/router";
+import { PlanningService } from "./planning/service";
 
 interface DesktopInfo {
   appVersion: string;
@@ -45,6 +47,7 @@ let apiServer: Server | null = null;
 let desktopInfo: DesktopInfo | null = null;
 let tallyService: TallyService | null = null;
 let storesService: StoresService | null = null;
+let planningService: PlanningService | null = null;
 let applicationDatabase: ApplicationDatabase | null = null;
 
 function preferredPort(): number {
@@ -113,6 +116,8 @@ async function startApi(): Promise<DesktopInfo> {
 
   if (!storesService) throw new Error("The Local Stores Database is unavailable.");
   desktopApi.use("/api/stores", createStoresRouter(storesService));
+  if (!planningService) throw new Error("The Planning service is unavailable.");
+  desktopApi.use("/api/planning", createPlanningRouter(planningService));
 
   // Keep the original endpoint compatible with older clients, but make the
   // SQLite Stores Catalog authoritative after Tally synchronization.
@@ -297,6 +302,9 @@ function registerIpcHandlers(): void {
   ipcMain.handle("tally:sync-stores", async (_event, settings: unknown) => {
     if (!tallyService || !storesService) throw new Error("The Tally or Stores service is unavailable.");
     const snapshot = await tallyService.syncStores(settings);
+    if (snapshot.stockItems.length > 0 && storesService.getState().dataMode === "demo") {
+      planningService?.resetForCatalogReplacement();
+    }
     const summary = storesService.sync(snapshot);
     return { snapshot, summary, state: storesService.getState() };
   });
@@ -306,9 +314,22 @@ function registerIpcHandlers(): void {
     return storesService.getState();
   });
 
+  ipcMain.handle("stores:create-local-stock-item", (_event, input: unknown) => {
+    if (!storesService) throw new Error("The Local Stores Database is unavailable.");
+    return storesService.createLocalStockItem(input as never);
+  });
+
   ipcMain.handle("stores:save-box", (_event, input: unknown) => {
     if (!storesService) throw new Error("The Local Stores Database is unavailable.");
     return storesService.saveBox(input as never);
+  });
+
+  ipcMain.handle("stores:delete-box", (_event, boxId: unknown, expectedRevision: unknown) => {
+    if (!storesService) throw new Error("The Local Stores Database is unavailable.");
+    return storesService.deleteBox(
+      String(boxId ?? ""),
+      expectedRevision == null ? undefined : Number(expectedRevision),
+    );
   });
 
   ipcMain.handle("stores:bulk-vendor-receipt", (_event, input: unknown) => {
@@ -387,6 +408,49 @@ function registerIpcHandlers(): void {
     const resolvedPath = absolutePath(targetPath, "Path");
     return shell.openPath(existsSync(resolvedPath) ? resolvedPath : path.dirname(resolvedPath));
   });
+
+  ipcMain.handle("planning:get-state", () => {
+    if (!planningService) throw new Error("The Planning service is unavailable.");
+    return planningService.getState();
+  });
+
+  ipcMain.handle("planning:save-restock-policy", (_event, input: unknown) => {
+    if (!planningService) throw new Error("The Planning service is unavailable.");
+    return planningService.saveRestockPolicy(input as never);
+  });
+
+  ipcMain.handle("planning:recommendation-decision", (_event, input: unknown) => {
+    if (!planningService) throw new Error("The Planning service is unavailable.");
+    return planningService.decideRecommendation(input as never);
+  });
+
+  ipcMain.handle("planning:save-bom", (_event, input: unknown) => {
+    if (!planningService) throw new Error("The Planning service is unavailable.");
+    return planningService.saveBom(input as never);
+  });
+
+  ipcMain.handle("planning:activate-bom", (_event, bomId: unknown) => {
+    if (!planningService) throw new Error("The Planning service is unavailable.");
+    return planningService.activateBom(String(bomId ?? ""));
+  });
+
+  ipcMain.handle("planning:save-product-order", (_event, input: unknown) => {
+    if (!planningService) throw new Error("The Planning service is unavailable.");
+    return planningService.saveProductOrder(input as never);
+  });
+
+  ipcMain.handle("planning:update-product-order-status", (_event, orderId: unknown, status: unknown) => {
+    if (!planningService) throw new Error("The Planning service is unavailable.");
+    return planningService.updateProductOrderStatus(
+      String(orderId ?? ""),
+      String(status ?? "") as "CANCELLED" | "COMPLETED" | "CONFIRMED",
+    );
+  });
+
+  ipcMain.handle("planning:export-restock", (_event, input: unknown) => {
+    if (!planningService) throw new Error("The Planning service is unavailable.");
+    return planningService.exportRestock(input as never);
+  });
 }
 
 async function createWindow(): Promise<void> {
@@ -435,6 +499,7 @@ async function bootstrap(): Promise<void> {
   );
   storesService = new StoresService(app.getPath("userData"), applicationDatabase);
   storesService.ensureDemoData();
+  planningService = new PlanningService(applicationDatabase, storesService);
   tallyService = new TallyService(app.getPath("userData"));
   if (process.platform === "darwin") app.dock?.setIcon(applicationIconPath());
   process.env.TALLY_CACHE_PATH = tallyService.cachePath;
@@ -475,6 +540,7 @@ app.on("window-all-closed", () => {
 app.on("before-quit", () => {
   apiServer?.close();
   apiServer = null;
+  planningService = null;
   storesService?.close();
   storesService = null;
   applicationDatabase?.close();

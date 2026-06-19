@@ -22,7 +22,7 @@
   display: grid;
   gap: 7px;
   color: #566176;
-  font-size: 12px;
+  font-size: 11pt;
   font-weight: 700;
 }
 
@@ -92,7 +92,7 @@
   justify-content: space-between;
   gap: 10px;
   color: #263148;
-  font-size: 12px;
+  font-size: 11pt;
 }
 
 .box-label-preview__header strong {
@@ -104,7 +104,7 @@
 .box-label-preview__header span {
   flex: 0 0 auto;
   color: #6f798c;
-  font-size: 10px;
+  font-size: 11pt;
 }
 
 .box-label-preview img {
@@ -119,7 +119,7 @@
   width: 100%;
   overflow: hidden;
   color: #6f798c;
-  font-size: 9px;
+  font-size: 11pt;
   text-align: center;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -130,7 +130,7 @@
   margin: 5px 0 0;
   padding-left: 20px;
   color: #263148;
-  font-size: 11px;
+  font-size: 11pt;
   line-height: 1.18;
 }
 
@@ -153,7 +153,7 @@
 
 .box-qr-shared-fields label small {
   color: #929bad;
-  font-size: 10px;
+  font-size: 11pt;
   font-weight: 500;
   line-height: 1.4;
 }
@@ -174,7 +174,7 @@
 
 .box-qr-contents-heading > span {
   color: #7b869a;
-  font-size: 11px;
+  font-size: 11pt;
   font-weight: 700;
 }
 
@@ -217,7 +217,7 @@
   border-radius: 999px;
   background: #eef1ff;
   color: #5268ca;
-  font-size: 11px;
+  font-size: 11pt;
   font-weight: 800;
 }
 
@@ -237,12 +237,12 @@
 
 .box-qr-item-main strong {
   color: #344056;
-  font-size: 12px;
+  font-size: 11pt;
 }
 
 .box-qr-item-main span {
   color: #7a8498;
-  font-size: 10px;
+  font-size: 11pt;
 }
 
 .box-qr-item-row input {
@@ -429,7 +429,7 @@
 
 .existing-box-list span {
   color: #7a8498;
-  font-size: 10px;
+  font-size: 11pt;
 }
 
 .box-qr-selected-list {
@@ -463,7 +463,7 @@
 
 .box-qr-selected-item small {
   color: #8992a4;
-  font-size: 9px;
+  font-size: 11pt;
 }
 
 .box-qr-index {
@@ -474,7 +474,7 @@
   border-radius: 999px;
   background: #eef1ff;
   color: #5268ca;
-  font-size: 11px;
+  font-size: 11pt;
   font-weight: 800;
 }
 
@@ -500,7 +500,7 @@
   display: grid;
   gap: 6px;
   color: #566176;
-  font-size: 11px;
+  font-size: 11pt;
   font-weight: 700;
 }
 
@@ -541,7 +541,7 @@
   gap: 5px;
   min-width: 0;
   color: #647087;
-  font-size: 10px;
+  font-size: 11pt;
   font-weight: 800;
 }
 
@@ -565,7 +565,7 @@
 .box-qr-catalog-result-count {
   margin-bottom: 7px;
   color: #8791a3;
-  font-size: 10px;
+  font-size: 11pt;
   font-weight: 700;
 }
 
@@ -617,12 +617,12 @@
 }
 
 .box-qr-catalog-action strong {
-  font-size: 12px;
+  font-size: 11pt;
 }
 
 .box-qr-catalog-action small {
   color: #7d879a;
-  font-size: 10px;
+  font-size: 11pt;
 }
 
 .box-qr-catalog-action b {
@@ -655,7 +655,7 @@
 
 .existing-box-list button span {
   color: #7d879a;
-  font-size: 10px;
+  font-size: 11pt;
 }
 
 @media (max-width: 1180px) {
@@ -669,4 +669,50 @@
   .box-qr-catalog-filters {
     grid-template-columns: 1fr;
   }
+}
+
+/* v3 UI polish */
+.existing-box-list {
+  max-height: 280px;
+  overflow-y: auto;
+}
+
+.existing-box-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 7px;
+  align-items: stretch;
+}
+
+.existing-box-load {
+  min-width: 0;
+}
+
+.existing-box-delete {
+  min-width: 70px;
+  border: 1px solid #edc4c4;
+  border-radius: 8px;
+  background: #fff7f7;
+  color: #a62a2a;
+  font-weight: 800;
+  cursor: pointer;
+}
+
+.existing-box-delete:hover:not(:disabled) {
+  background: #ffeaea;
+}
+
+.box-qr-catalog-panel :where(button, input, select, label, span, small, p),
+.box-qr-builder-panel :where(button, input, select, label, span, small, p),
+.queue-list :where(button, span, b, p) {
+  font-size: max(11pt, 1em);
+}
+
+.existing-box-list .existing-box-delete {
+  display: grid;
+  width: auto;
+  justify-content: center;
+  place-items: center;
+  padding: 8px 10px;
+  text-align: center;
 }

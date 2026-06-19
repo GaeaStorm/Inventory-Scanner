@@ -53,6 +53,7 @@ export type {
   BulkVendorReceiptLineInput,
   BulkVendorReceiptResult,
   ConfirmImportInput,
+  CreateLocalStockItemInput,
   ExportBatchInput,
   ExportBatchResult,
   ReviewDecisionInput,
@@ -69,3 +70,16 @@ export type {
   StoresRestoreResult,
   AdjustmentContext,
 } from "../stores/types";
+
+export type {
+  PlanningState,
+  RestockPlanningItem,
+  RestockPolicyInput,
+  RecommendationDecisionInput,
+  SaveBomInput,
+  BomVersion,
+  SaveProductOrderInput,
+  ProductOrder,
+  PlanningExportInput,
+  PlanningExportResult,
+} from "../planning/types";

@@ -20,7 +20,10 @@ contextBridge.exposeInMainWorld("desktop", {
   },
   stores: {
     getState: () => ipcRenderer.invoke("stores:get-state"),
+    createLocalStockItem: (input: unknown) => ipcRenderer.invoke("stores:create-local-stock-item", input),
     saveBox: (input: unknown) => ipcRenderer.invoke("stores:save-box", input),
+    deleteBox: (boxId: string, expectedRevision?: number) =>
+      ipcRenderer.invoke("stores:delete-box", boxId, expectedRevision),
     bulkVendorReceipt: (input: unknown) => ipcRenderer.invoke("stores:bulk-vendor-receipt", input),
     review: (input: unknown) => ipcRenderer.invoke("stores:review", input),
     exportBatch: (input: unknown) => ipcRenderer.invoke("stores:export-batch", input),
@@ -32,5 +35,16 @@ contextBridge.exposeInMainWorld("desktop", {
     chooseFolder: (kind: "backup" | "export") =>
       ipcRenderer.invoke("stores:choose-folder", kind),
     openPath: (targetPath: string) => ipcRenderer.invoke("stores:open-path", targetPath),
+  },
+  planning: {
+    getState: () => ipcRenderer.invoke("planning:get-state"),
+    saveRestockPolicy: (input: unknown) => ipcRenderer.invoke("planning:save-restock-policy", input),
+    recommendationDecision: (input: unknown) => ipcRenderer.invoke("planning:recommendation-decision", input),
+    saveBom: (input: unknown) => ipcRenderer.invoke("planning:save-bom", input),
+    activateBom: (bomId: string) => ipcRenderer.invoke("planning:activate-bom", bomId),
+    saveProductOrder: (input: unknown) => ipcRenderer.invoke("planning:save-product-order", input),
+    updateProductOrderStatus: (orderId: string, status: string) =>
+      ipcRenderer.invoke("planning:update-product-order-status", orderId, status),
+    exportRestock: (input: unknown) => ipcRenderer.invoke("planning:export-restock", input),
   },
 });

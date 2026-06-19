@@ -19,6 +19,7 @@ import type {
   BulkVendorReceiptInput,
   BulkVendorReceiptResult,
   ConfirmImportInput,
+  CreateLocalStockItemInput,
   ExportBatchInput,
   MaterialOutInput,
   OpeningQuantityInput,
@@ -43,7 +44,7 @@ import type {
   VendorReceiptInput,
 } from "./types";
 
-const SCHEMA_VERSION = 4;
+const SCHEMA_VERSION = 5;
 const BACKUP_RETENTION = 30;
 const LEGACY_SUPPLIER_NAME = "Opening Legacy Stock";
 
@@ -583,6 +584,19 @@ export class StoresDatabase {
         this.db.prepare("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)").run(4, nowIso());
       }, "migrating the Local Stores Database to schema 4");
     }
+
+    if (current < 5) {
+      this.transaction(() => {
+        this.db.exec(`
+          ALTER TABLE tally_stock_items
+            ADD COLUMN source TEXT NOT NULL DEFAULT 'TALLY'
+            CHECK (source IN ('TALLY','LOCAL'));
+          CREATE INDEX idx_stock_items_source
+            ON tally_stock_items(source, active, name);
+        `);
+        this.db.prepare("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)").run(5, nowIso());
+      }, "migrating the Local Stores Database to schema 5");
+    }
   }
 
   transaction<T>(work: () => T, operation = "updating inventory"): T {
@@ -822,19 +836,58 @@ export class StoresDatabase {
   private upsertStockItem(item: TallyStoresSnapshot["stockItems"][number], syncedAt: string): number {
     const guid = itemIdentity(item.guid, item.name);
     const closingQuantity = Number.isInteger(item.closingQuantity) ? item.closingQuantity ?? 0 : 0;
+    const localByName = this.db.prepare(`
+      SELECT id FROM tally_stock_items
+      WHERE name = ? COLLATE NOCASE AND source = 'LOCAL'
+    `).get(item.name) as Row | undefined;
+    if (localByName) {
+      // A locally introduced component can be promoted to its real Tally
+      // identity later without changing any foreign-key relationships.
+      this.db.prepare(`
+        UPDATE tally_stock_items SET
+          tally_guid = ?, name = ?, parent_name = ?, has_bom = ?,
+          tally_closing_quantity = ?, active = 1, source = 'TALLY', synced_at = ?
+        WHERE id = ?
+      `).run(guid, item.name, item.parent, item.hasBom ? 1 : 0, closingQuantity, syncedAt, localByName.id);
+      return Number(localByName.id);
+    }
     this.db.prepare(`
-      INSERT INTO tally_stock_items(tally_guid, name, parent_name, has_bom, tally_closing_quantity, active, synced_at)
-      VALUES (?, ?, ?, ?, ?, 1, ?)
+      INSERT INTO tally_stock_items(
+        tally_guid, name, parent_name, has_bom, tally_closing_quantity, active, synced_at, source
+      ) VALUES (?, ?, ?, ?, ?, 1, ?, 'TALLY')
       ON CONFLICT(tally_guid) DO UPDATE SET
         name = excluded.name,
         parent_name = excluded.parent_name,
         has_bom = excluded.has_bom,
         tally_closing_quantity = excluded.tally_closing_quantity,
         active = 1,
+        source = 'TALLY',
         synced_at = excluded.synced_at
     `).run(guid, item.name, item.parent, item.hasBom ? 1 : 0, closingQuantity, syncedAt);
     const row = this.db.prepare("SELECT id FROM tally_stock_items WHERE tally_guid = ?").get(guid) as Row;
     return Number(row.id);
+  }
+
+  createLocalStockItem(input: CreateLocalStockItemInput): StoresStockItem {
+    const name = text(input.name);
+    if (!name) throw new Error("Local Stock Item name is required.");
+    const parentName = text(input.parentName) || "Local Components";
+    return this.transaction(() => {
+      const existing = this.db.prepare(`
+        SELECT tally_guid FROM tally_stock_items WHERE name = ? COLLATE NOCASE
+      `).get(name) as Row | undefined;
+      if (!existing) {
+        this.db.prepare(`
+          INSERT INTO tally_stock_items(
+            tally_guid, name, parent_name, has_bom, tally_closing_quantity,
+            active, synced_at, source
+          ) VALUES (?, ?, ?, 0, 0, 1, ?, 'LOCAL')
+        `).run(`LOCAL:${randomUUID()}`, name, parentName, nowIso());
+      } else {
+        this.db.prepare("UPDATE tally_stock_items SET active = 1 WHERE tally_guid = ?").run(existing.tally_guid);
+      }
+      return this.getState().stockItems.find((item) => item.name.toLocaleLowerCase() === name.toLocaleLowerCase())!;
+    }, "creating a local Stores Catalog item");
   }
 
   private upsertSupplier(name: string, guid: string, syncedAt: string): number {
@@ -858,7 +911,7 @@ export class StoresDatabase {
       ).run(startedAt);
       const historyId = Number(historyInsert.lastInsertRowid);
 
-      this.db.exec("UPDATE tally_stock_items SET active = 0");
+      this.db.exec("UPDATE tally_stock_items SET active = 0 WHERE source = 'TALLY'");
       const itemIdByGuid = new Map<string, number>();
       const itemIdByName = new Map<string, number>();
       for (const item of snapshot.stockItems) {
@@ -1112,6 +1165,24 @@ export class StoresDatabase {
         this.db.prepare("INSERT INTO box_items(box_id, stock_item_id, sort_order) VALUES (?, ?, ?)").run(boxId, id, index);
       });
       return this.getBox(boxId)!;
+    });
+  }
+
+  deleteBox(boxId: string, expectedRevision?: number): void {
+    const normalizedBoxId = text(boxId);
+    if (!normalizedBoxId) throw new Error("Box ID is required.");
+
+    this.transaction(() => {
+      const existing = this.db.prepare("SELECT revision FROM boxes WHERE box_id = ? AND active = 1").get(normalizedBoxId) as Row | undefined;
+      if (!existing) throw new Error("This box no longer exists.");
+      if (expectedRevision != null && Number(existing.revision) !== expectedRevision) {
+        throw new Error("This box was changed elsewhere. Refresh it before deleting.");
+      }
+      this.db.prepare(`
+        UPDATE boxes
+        SET active = 0, revision = revision + 1, updated_at = ?
+        WHERE box_id = ?
+      `).run(nowIso(), normalizedBoxId);
     });
   }
 
@@ -1943,6 +2014,7 @@ export class StoresDatabase {
       tallyClosingQuantity: Number(row.tally_closing_quantity),
       localAvailableQuantity: Number(row.local_available),
       active: Number(row.active) === 1,
+      source: text(row.source) === "LOCAL" ? "LOCAL" : "TALLY",
     }));
 
     const suppliers: StoresSupplier[] = (this.db.prepare("SELECT id, tally_guid, name FROM suppliers WHERE name <> ? ORDER BY name").all(LEGACY_SUPPLIER_NAME) as Row[]).map((row) => ({

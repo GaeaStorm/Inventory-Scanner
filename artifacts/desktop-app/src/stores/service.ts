@@ -9,6 +9,7 @@ import type {
   AdjustmentInput,
   BulkVendorReceiptInput,
   ConfirmImportInput,
+  CreateLocalStockItemInput,
   ExportBatchInput,
   MaterialOutInput,
   OpeningQuantityInput,
@@ -71,12 +72,22 @@ export class StoresService {
     return this.database.getState();
   }
 
+  createLocalStockItem(input: CreateLocalStockItemInput) {
+    this.database.createLocalStockItem(input);
+    return this.getState();
+  }
+
   getBox(boxId: string) {
     return this.database.getBox(boxId);
   }
 
   saveBox(input: SaveBoxInput) {
     return this.database.saveBox(input);
+  }
+
+  deleteBox(boxId: string, expectedRevision?: number) {
+    this.database.deleteBox(boxId, expectedRevision);
+    return this.getState();
   }
 
   vendorReceipt(input: VendorReceiptInput) {
