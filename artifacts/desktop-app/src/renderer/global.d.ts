@@ -26,6 +26,8 @@ import type {
   RecommendationDecisionInput,
   SaveBomInput,
   SaveProductOrderInput,
+  SaveProductOrderFieldDefinitionInput,
+  SaveProductOrderWorkflowStateInput,
   PlanningExportInput,
   PlanningExportResult,
   AuthSession,
@@ -113,6 +115,9 @@ declare global {
           orderId: string,
           status: "CANCELLED" | "COMPLETED" | "CONFIRMED",
         ) => Promise<PlanningState>;
+        updateProductOrderWorkflowState: (orderId: string, workflowStateId: string) => Promise<PlanningState>;
+        saveProductOrderWorkflowState: (input: SaveProductOrderWorkflowStateInput) => Promise<PlanningState>;
+        saveProductOrderFieldDefinition: (input: SaveProductOrderFieldDefinitionInput) => Promise<PlanningState>;
         exportRestock: (input: PlanningExportInput) => Promise<PlanningExportResult>;
       };
       operations: {

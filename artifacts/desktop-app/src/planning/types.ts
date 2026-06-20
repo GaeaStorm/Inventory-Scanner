@@ -13,6 +13,7 @@ export type RecommendationStatus =
   | "EXPORTED";
 export type BomStatus = "DRAFT" | "ACTIVE" | "ARCHIVED";
 export type ProductOrderStatus = "DRAFT" | "CONFIRMED" | "CANCELLED" | "COMPLETED";
+export type ProductOrderFieldType = "TEXT" | "NUMBER" | "DATE" | "BOOLEAN";
 export type OrderFeasibility =
   | "READY"
   | "READY_WITH_INCOMING"
@@ -115,6 +116,7 @@ export interface BomVersion {
 
 export interface SaveBomInput {
   productTallyGuid: string;
+  versionNumber?: number;
   label?: string;
   validFrom?: string;
   source?: "MANUAL" | "FILE_IMPORT";
@@ -143,17 +145,36 @@ export interface ProductOrderRequirement {
 
 export interface ProductOrder {
   id: string;
+  fileNumber: string;
+  organisation: string;
   externalReference: string;
+  purchaseOrderDate: string;
+  lastDispatchDate: string;
   productStockItemId: number;
   productTallyGuid: string;
   productName: string;
   quantity: number;
+  pendingQuantity: number | null;
+  valueIncludingGst: number | null;
+  pendingMaterial: string;
+  rawMaterialToOrder: string;
+  crfStatus: string;
+  cracStatus: string;
+  taskRemarks: string;
+  responsiblePerson: string;
+  followUpDate: string;
+  dispatchSchedule: string;
+  priority: string;
   requiredDate: string;
   status: ProductOrderStatus;
+  workflowStateId: string;
+  workflowStateName: string;
+  workflowStateColor: string;
   bomVersionId: string | null;
   bomVersionLabel: string;
   feasibility: OrderFeasibility;
   notes: string;
+  customFields: Record<string, string | number | boolean | null>;
   createdAt: string;
   updatedAt: string;
   requirements: ProductOrderRequirement[];
@@ -161,12 +182,56 @@ export interface ProductOrder {
 
 export interface SaveProductOrderInput {
   id?: string;
+  fileNumber?: string;
+  organisation?: string;
   externalReference: string;
+  purchaseOrderDate?: string;
+  lastDispatchDate?: string;
   productTallyGuid: string;
   quantity: number;
+  pendingQuantity?: number | null;
+  valueIncludingGst?: number | null;
+  pendingMaterial?: string;
+  rawMaterialToOrder?: string;
+  crfStatus?: string;
+  cracStatus?: string;
+  taskRemarks?: string;
+  responsiblePerson?: string;
+  followUpDate?: string;
+  dispatchSchedule?: string;
+  priority?: string;
   requiredDate?: string;
   status?: "DRAFT" | "CONFIRMED";
+  workflowStateId?: string;
   notes?: string;
+  customFields?: Record<string, string | number | boolean | null>;
+}
+
+export interface ProductOrderWorkflowState {
+  id: string;
+  name: string;
+  color: string;
+  position: number;
+  terminal: boolean;
+}
+
+export interface ProductOrderFieldDefinition {
+  id: string;
+  key: string;
+  label: string;
+  type: ProductOrderFieldType;
+  position: number;
+}
+
+export interface SaveProductOrderWorkflowStateInput {
+  name: string;
+  color?: string;
+  terminal?: boolean;
+}
+
+export interface SaveProductOrderFieldDefinitionInput {
+  label: string;
+  type: ProductOrderFieldType;
 }
 
 export interface RecommendationDecisionInput {
@@ -208,5 +273,7 @@ export interface PlanningState {
   items: RestockPlanningItem[];
   boms: BomVersion[];
   productOrders: ProductOrder[];
+  productOrderWorkflowStates: ProductOrderWorkflowState[];
+  productOrderFieldDefinitions: ProductOrderFieldDefinition[];
   groups: string[];
 }

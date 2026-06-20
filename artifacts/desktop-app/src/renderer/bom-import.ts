@@ -6,6 +6,8 @@ export interface ParsedBomRow {
   rowNumber: number;
   productName: string;
   componentName: string;
+  sourceComponentName: string;
+  componentType: string;
   quantity: number;
   lossBufferPercent: number;
   productGuid: string;
@@ -15,7 +17,9 @@ export interface ParsedBomRow {
 
 export interface ParsedBomFile {
   sheetName: string;
+  title: string;
   productName: string;
+  versionNumber: number | null;
   rows: ParsedBomRow[];
   skippedNotFitted: number;
 }
@@ -25,6 +29,7 @@ const COMPONENT_HEADERS = ["component", "component name", "material", "stock ite
 const QUANTITY_HEADERS = ["quantity", "qty", "quantity per product", "qty per product", "component quantity"];
 const LOSS_HEADERS = ["loss buffer", "loss buffer percent", "loss percent", "wastage percent"];
 const SERIAL_HEADERS = ["sr no", "serial no", "serial number", "s no"];
+const TYPE_HEADERS = ["type", "component type", "mounting type"];
 const NOT_FITTED = /^(?:dna|dnp|dnf|nc|n\/a|not fitted|do not assemble|do not fit|do not populate)$/i;
 
 export function normalizeBomName(value: unknown): string {
@@ -48,27 +53,72 @@ function headerIndex(row: unknown[], aliases: string[]): number {
   return row.findIndex((value) => aliases.includes(normalizeHeader(value)));
 }
 
-function catalogMatcher(items: StoresStockItem[]): (name: string) => StoresStockItem | null {
-  const candidates = new Map<string, StoresStockItem | null>();
+function productionComponentKey(value: unknown): string {
+  return String(value ?? "")
+    .replace(/¼\s*w|�\s*w|1\s*[\/⁄]\s*4\s*w/gi, " watt ")
+    .replace(/(?:±|�|\+\s*\/\s*-|\+\s*-)\s*(\d+(?:\.\d+)?)\s*%/gi, " tolerance $1 ")
+    .normalize("NFKD")
+    .replace(/[µμ]/g, "u")
+    .replace(/×/g, "x")
+    .toLocaleLowerCase()
+    .replace(/[^a-z0-9]+/g, "");
+}
+
+function addCandidate(
+  candidates: Map<string, Map<string, StoresStockItem>>,
+  key: string,
+  item: StoresStockItem,
+): void {
+  if (!key) return;
+  const entries = candidates.get(key) ?? new Map<string, StoresStockItem>();
+  entries.set(item.tallyGuid, item);
+  candidates.set(key, entries);
+}
+
+function catalogMatcher(items: StoresStockItem[]): (name: string, componentType?: string) => StoresStockItem | null {
+  const exactCandidates = new Map<string, Map<string, StoresStockItem>>();
+  const productionCandidates = new Map<string, Map<string, StoresStockItem>>();
   for (const item of items) {
     for (const name of [item.name, item.tallyName]) {
-      const key = normalizeBomName(name);
-      if (!key) continue;
-      const existing = candidates.get(key);
-      candidates.set(key, existing && existing.tallyGuid !== item.tallyGuid ? null : item);
+      addCandidate(exactCandidates, normalizeBomName(name), item);
+      addCandidate(productionCandidates, productionComponentKey(name), item);
     }
   }
-  return (name: string) => candidates.get(normalizeBomName(name)) ?? null;
+  return (name: string, componentType = "") => {
+    const possibleNames = componentType ? [`${name} ${componentType}`, name] : [name];
+    for (const possibleName of possibleNames) {
+      for (const [map, key] of [
+        [exactCandidates, normalizeBomName(possibleName)],
+        [productionCandidates, productionComponentKey(possibleName)],
+      ] as const) {
+        const matches = [...(map.get(key)?.values() ?? [])];
+        if (matches.length === 1) return matches[0];
+      }
+    }
+    return null;
+  };
 }
 
 function cleanProductTitle(value: string): string {
   return value
     .replace(/\.(?:xlsx?|csv)$/i, "")
     .replace(/^\s*rfl[\s_-]*/i, "")
+    .replace(/[\s_-]*ver(?:sion)?[\s._-]*\d+(?:\.\d+)?/i, "")
     .replace(/[\s_-]*bom\s*$/i, "")
     .replaceAll("_", " ")
     .replace(/\s+/g, " ")
     .trim();
+}
+
+function versionFrom(values: string[]): number | null {
+  for (const value of values) {
+    const match = /(?:^|[^a-z0-9])ver(?:sion)?[\s._-]*(\d+(?:\.\d+)?)/i.exec(value);
+    if (!match) continue;
+    const parsed = Number(match[1]);
+    if (Number.isInteger(parsed) && parsed > 0) return parsed;
+    if (Number.isFinite(parsed) && parsed > 0) return Math.trunc(parsed);
+  }
+  return null;
 }
 
 function inferredProduct(
@@ -136,8 +186,14 @@ export function parseBomWorkbook(
   const quantityColumn = headerIndex(headers, QUANTITY_HEADERS);
   const lossColumn = headerIndex(headers, LOSS_HEADERS);
   const serialColumn = headerIndex(headers, SERIAL_HEADERS);
+  const typeColumn = headerIndex(headers, TYPE_HEADERS);
   const matchItem = catalogMatcher(items);
   const inferred = inferredProduct(rows, headerRowIndex, fileName, matchItem);
+  const titleValues = rows
+    .slice(0, headerRowIndex)
+    .flatMap((row) => row.map((value) => String(value ?? "").trim()))
+    .filter(Boolean);
+  const title = titleValues[0] || fileName.replace(/\.(?:xlsx?|csv)$/i, "");
   const parsed: ParsedBomRow[] = [];
   let skippedNotFitted = 0;
 
@@ -146,6 +202,7 @@ export function parseBomWorkbook(
     const componentName = String(row[componentColumn] ?? "").trim();
     const quantityText = String(row[quantityColumn] ?? "").trim();
     const serialText = serialColumn >= 0 ? String(row[serialColumn] ?? "").trim() : "";
+    const componentType = typeColumn >= 0 ? String(row[typeColumn] ?? "").trim() : "";
     if (!componentName && !quantityText && !serialText) continue;
     if (NOT_FITTED.test(componentName)) {
       skippedNotFitted += 1;
@@ -162,11 +219,13 @@ export function parseBomWorkbook(
     const quantity = Number(quantityText);
     const loss = Number(lossColumn >= 0 ? String(row[lossColumn] ?? "").trim() || 0 : 0);
     const product = productColumn >= 0 ? matchItem(productName) : inferred.item;
-    const component = matchItem(componentName);
+    const component = matchItem(componentName, componentType);
     parsed.push({
       rowNumber: index + 1,
       productName: product?.name ?? productName,
       componentName: component?.name ?? componentName,
+      sourceComponentName: componentName,
+      componentType,
       quantity,
       lossBufferPercent: loss,
       productGuid: product?.tallyGuid ?? "",
@@ -178,11 +237,13 @@ export function parseBomWorkbook(
   const parsedProductNames = [...new Set(parsed.map((row) => row.productName).filter(Boolean))];
   return {
     sheetName,
+    title,
     productName: productColumn >= 0
       ? parsedProductNames.length === 1
         ? parsedProductNames[0]
         : `${parsedProductNames.length} products`
       : inferred.item?.name ?? inferred.name,
+    versionNumber: versionFrom([title, fileName]),
     rows: parsed,
     skippedNotFitted,
   };
@@ -191,6 +252,7 @@ export function parseBomWorkbook(
 export function matchBomCatalogItem(
   items: StoresStockItem[],
   name: string,
+  componentType = "",
 ): StoresStockItem | null {
-  return catalogMatcher(items)(name);
+  return catalogMatcher(items)(name, componentType);
 }

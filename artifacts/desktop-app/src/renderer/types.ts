@@ -86,6 +86,11 @@ export type {
   BomVersion,
   SaveProductOrderInput,
   ProductOrder,
+  ProductOrderFieldDefinition,
+  ProductOrderFieldType,
+  ProductOrderWorkflowState,
+  SaveProductOrderFieldDefinitionInput,
+  SaveProductOrderWorkflowStateInput,
   PlanningExportInput,
   PlanningExportResult,
 } from "../planning/types";

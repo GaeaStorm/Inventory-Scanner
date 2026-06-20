@@ -12,6 +12,7 @@ import type {
   SupplierFaultRecord,
   UserRole,
 } from "./types";
+import ProductionOrderKanban from "./ProductionOrderKanban";
 import { traceabilityColumns } from "./traceability";
 
 type Section = "overview" | "inspection" | "faults" | "counts" | "returns" | "production" | "exceptions" | "history" | "users";
@@ -113,6 +114,7 @@ function OperationPanel({ eyebrow, title, children, actions }: { eyebrow: string
 
 export default function OperationsTab({ stores, planning, operations, auth, permissions, onRefresh, onNotice, onError }: Props) {
   const [busy, setBusy] = useState(false);
+  const [productView, setProductView] = useState<"tracker" | "execution">("tracker");
 
   async function run(action: () => Promise<unknown>, message: string) {
     setBusy(true);
@@ -130,7 +132,20 @@ export default function OperationsTab({ stores, planning, operations, auth, perm
 
   return <section className="tab-page operations-page">
     <div className="page-heading"><div><p className="eyebrow">PRODUCTS</p><h1>Product Overview</h1></div><button className="button button--secondary" type="button" onClick={() => void onRefresh()}>Refresh</button></div>
-    <Production stores={stores} planning={planning} operations={operations} busy={busy} run={run} />
+    <nav className="planning-subnav" aria-label="Product overview sections">
+      <button type="button" className={productView === "tracker" ? "planning-subnav__active" : ""} onClick={() => setProductView("tracker")}>Order tracker</button>
+      <button type="button" className={productView === "execution" ? "planning-subnav__active" : ""} onClick={() => setProductView("execution")}>Production execution</button>
+    </nav>
+    {productView === "tracker"
+      ? <ProductionOrderKanban
+          planning={planning}
+          stores={stores}
+          canManage={permissions.includes("PRODUCT_ORDER_MANAGE")}
+          onRefresh={onRefresh}
+          onNotice={onNotice}
+          onError={onError}
+        />
+      : <Production stores={stores} planning={planning} operations={operations} busy={busy} run={run} />}
   </section>;
 }
 

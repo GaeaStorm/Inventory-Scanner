@@ -23,6 +23,15 @@ export function createPlanningRouter(service: PlanningService, operations: Opera
   router.post("/product-orders/:orderId/status", (request, response) => response.json(
     service.updateProductOrderStatus(request.params.orderId, request.body.status, actor(request, "PRODUCT_ORDER_MANAGE")),
   ));
+  router.post("/product-orders/:orderId/workflow-state", (request, response) => response.json(
+    service.updateProductOrderWorkflowState(request.params.orderId, request.body.workflowStateId, actor(request, "PRODUCT_ORDER_MANAGE")),
+  ));
+  router.post("/product-order-workflow-states", (request, response) => response.status(201).json(
+    service.saveProductOrderWorkflowState(request.body, actor(request, "PRODUCT_ORDER_MANAGE")),
+  ));
+  router.post("/product-order-fields", (request, response) => response.status(201).json(
+    service.saveProductOrderFieldDefinition(request.body, actor(request, "PRODUCT_ORDER_MANAGE")),
+  ));
   router.post("/export", (request, response) => response.json(service.exportRestock(request.body, actor(request, "RESTOCK_MANAGE"))));
 
   router.use((error: unknown, _request: Request, response: Response, _next: NextFunction) => {

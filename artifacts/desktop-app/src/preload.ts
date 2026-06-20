@@ -64,6 +64,9 @@ contextBridge.exposeInMainWorld("desktop", {
     activateBom: (bomId: string) => authenticatedSession("planning:activate-bom", bomId),
     saveProductOrder: (input: unknown) => authenticatedSession("planning:save-product-order", input),
     updateProductOrderStatus: (orderId: string, status: string) => authenticatedSession("planning:update-product-order-status", orderId, status),
+    updateProductOrderWorkflowState: (orderId: string, workflowStateId: string) => authenticatedSession("planning:update-product-order-workflow-state", orderId, workflowStateId),
+    saveProductOrderWorkflowState: (input: unknown) => authenticatedSession("planning:save-product-order-workflow-state", input),
+    saveProductOrderFieldDefinition: (input: unknown) => authenticatedSession("planning:save-product-order-field-definition", input),
     exportRestock: (input: unknown) => authenticatedSession("planning:export-restock", input),
   },
   operations: {

@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
+import * as XLSX from "xlsx";
 
 import { ApplicationDatabase } from "../src/database/application-database";
 import { OperationsDatabase } from "../src/operations/database";
@@ -10,6 +11,7 @@ import { permissionsForRole, requirePermission } from "../src/operations/permiss
 import type { ActorContext, ConditionBalance } from "../src/operations/types";
 import { PlanningDatabase } from "../src/planning/database";
 import { traceabilityColumns } from "../src/renderer/traceability";
+import { parseBomWorkbook } from "../src/renderer/bom-import";
 import { StoresDatabase } from "../src/stores/database";
 import type { BulkVendorReceiptInput } from "../src/stores/types";
 
@@ -91,6 +93,28 @@ function balance(context: Context, condition: "AVAILABLE" | "PENDING_INSPECTION"
   return row;
 }
 
+test("production BOM parser detects product/version and uses component type for matching", () => {
+  const workbook = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(workbook, XLSX.utils.aoa_to_sheet([
+    ["BEL-ADA_VER 19.0_BOM"],
+    ["TOTAL BOM"],
+    [],
+    ["Sr.No.", "Component", "Qty.", "Designation", "TYPE"],
+    ["1", "1.5K ¼W ± 1%_1206", "2", "R86,R87", "SMD"],
+    ["2", "POWER CORD", "1", "", ""],
+  ]), "TOTAL BOM");
+  const items = [
+    { tallyGuid: "PRODUCT", name: "BEL-ADA", tallyName: "BEL-ADA" },
+    { tallyGuid: "RESISTOR", name: "1.5K ¼W ± 1%_1206 SMD", tallyName: "1.5K ¼W ± 1%_1206 SMD" },
+    { tallyGuid: "CORD", name: "POWER CORD", tallyName: "POWER CORD" },
+  ] as any;
+  const parsed = parseBomWorkbook(workbook, items, "BEL-ADA_VER 19.0_BOM.xls");
+  assert.equal(parsed.productName, "BEL-ADA");
+  assert.equal(parsed.versionNumber, 19);
+  assert.equal(parsed.rows[0].componentGuid, "RESISTOR");
+  assert.equal(parsed.rows[1].componentGuid, "CORD");
+});
+
 test("catalog group roles and item ignore overrides drive planning visibility", () => {
   const context = createContext();
   try {
@@ -119,6 +143,41 @@ test("catalog group roles and item ignore overrides drive planning visibility", 
     state = context.stores.getState();
     assert.equal(state.stockItems.find((item) => item.tallyGuid === context.componentGuid)?.ignored, true);
     assert.equal(context.planning.getState().items.some((item) => item.tallyItemGuid === context.componentGuid), false);
+  } finally {
+    closeContext(context);
+  }
+});
+
+test("production-order tracker persists workflow states, spreadsheet fields, and custom fields", () => {
+  const context = createContext();
+  try {
+    const product = context.stores.getState().stockItems.find((item) => item.catalogRole === "FINISHED_PRODUCT")
+      ?? context.stores.getState().stockItems[0];
+    assert.ok(product);
+    const state = context.planning.saveProductOrderWorkflowState({ name: "Quality Check", color: "#0052CC" });
+    const field = context.planning.saveProductOrderFieldDefinition({ label: "Customer contact", type: "TEXT" });
+    const saved = context.planning.saveProductOrder({
+      externalReference: "PO-KANBAN-1",
+      organisation: "Akademika Test Customer",
+      fileNumber: "42",
+      purchaseOrderDate: "2026-06-20",
+      lastDispatchDate: "2026-07-10",
+      productTallyGuid: product.tallyGuid,
+      quantity: 3,
+      pendingQuantity: 2,
+      valueIncludingGst: 118000,
+      crfStatus: "Sent",
+      cracStatus: "Pending",
+      taskRemarks: "Inventory check pending",
+      responsiblePerson: "Snehal Sawant",
+      workflowStateId: state.id,
+      customFields: { [field.key]: "A. Customer" },
+    });
+    assert.equal(saved.organisation, "Akademika Test Customer");
+    assert.equal(saved.workflowStateName, "Quality Check");
+    assert.equal(saved.pendingQuantity, 2);
+    assert.equal(saved.valueIncludingGst, 118000);
+    assert.equal(saved.customFields[field.key], "A. Customer");
   } finally {
     closeContext(context);
   }

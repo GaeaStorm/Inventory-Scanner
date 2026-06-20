@@ -9,13 +9,17 @@ import type {
   PlanningState,
   PlanningSummary,
   ProductOrder,
+  ProductOrderFieldDefinition,
   ProductOrderRequirement,
+  ProductOrderWorkflowState,
   RecommendationDecisionInput,
   RestockHealth,
   RestockPlanningItem,
   RestockPolicyInput,
   SaveBomInput,
+  SaveProductOrderFieldDefinitionInput,
   SaveProductOrderInput,
+  SaveProductOrderWorkflowStateInput,
 } from "./types";
 
 const MODULE_NAME = "planning";
@@ -52,6 +56,29 @@ function percentage(value: unknown, label: string): number {
 
 function text(value: unknown): string {
   return String(value ?? "").trim();
+}
+
+function optionalDate(value: unknown): string {
+  const normalized = text(value);
+  if (!normalized) return "";
+  return dateOnly(normalized);
+}
+
+function optionalNumber(value: unknown, label: string, whole = false): number | null {
+  if (value == null || text(value) === "") return null;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 0 || (whole && !Number.isInteger(parsed))) {
+    throw new Error(`${label} must be ${whole ? "a whole number" : "a number"} that is zero or greater.`);
+  }
+  return parsed;
+}
+
+function fieldKey(value: unknown): string {
+  return text(value)
+    .toLocaleLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .slice(0, 60);
 }
 
 function median(values: number[]): number | null {
@@ -159,6 +186,77 @@ const migrations: ApplicationDatabaseMigration[] = [
         CREATE INDEX idx_planning_orders_status ON planning_product_orders(status, required_date);
         CREATE INDEX idx_planning_reservations_component ON planning_reservations(component_item_id, status);
         CREATE INDEX idx_planning_boms_product ON planning_bom_versions(product_item_id, status, version_number);
+      `);
+    },
+  },
+  {
+    version: 2,
+    description: "Add configurable production-order workflow and tracker fields",
+    up(database: DatabaseSync) {
+      database.exec(`
+        CREATE TABLE planning_product_order_workflow_states (
+          id TEXT PRIMARY KEY,
+          name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+          color TEXT NOT NULL,
+          position INTEGER NOT NULL,
+          terminal INTEGER NOT NULL DEFAULT 0 CHECK (terminal IN (0, 1))
+        ) STRICT;
+
+        INSERT INTO planning_product_order_workflow_states(id, name, color, position, terminal) VALUES
+          ('pending', 'Pending', '#6B778C', 1, 0),
+          ('crf-pending', 'CRF Pending', '#9F7AEA', 2, 0),
+          ('crf-sent', 'CRF Sent', '#6554C0', 3, 0),
+          ('product-confirmation', 'Product Confirmation', '#0052CC', 4, 0),
+          ('raw-material', 'Raw Material to be Procured', '#FF8B00', 5, 0),
+          ('material-available', 'Material Available', '#00A3BF', 6, 0),
+          ('in-production', 'In Production', '#0065FF', 7, 0),
+          ('ready-dispatch', 'Ready for Dispatch', '#00875A', 8, 0),
+          ('dispatched', 'Dispatched', '#36B37E', 9, 1),
+          ('pending-material', 'Pending Material', '#DE350B', 10, 0),
+          ('hold', 'Hold', '#97A0AF', 11, 0);
+
+        ALTER TABLE planning_product_orders ADD COLUMN file_number TEXT NOT NULL DEFAULT '';
+        ALTER TABLE planning_product_orders ADD COLUMN organisation TEXT NOT NULL DEFAULT '';
+        ALTER TABLE planning_product_orders ADD COLUMN purchase_order_date TEXT NOT NULL DEFAULT '';
+        ALTER TABLE planning_product_orders ADD COLUMN last_dispatch_date TEXT NOT NULL DEFAULT '';
+        ALTER TABLE planning_product_orders ADD COLUMN pending_quantity INTEGER;
+        ALTER TABLE planning_product_orders ADD COLUMN value_including_gst REAL;
+        ALTER TABLE planning_product_orders ADD COLUMN pending_material TEXT NOT NULL DEFAULT '';
+        ALTER TABLE planning_product_orders ADD COLUMN raw_material_to_order TEXT NOT NULL DEFAULT '';
+        ALTER TABLE planning_product_orders ADD COLUMN crf_status TEXT NOT NULL DEFAULT '';
+        ALTER TABLE planning_product_orders ADD COLUMN crac_status TEXT NOT NULL DEFAULT '';
+        ALTER TABLE planning_product_orders ADD COLUMN task_remarks TEXT NOT NULL DEFAULT '';
+        ALTER TABLE planning_product_orders ADD COLUMN responsible_person TEXT NOT NULL DEFAULT '';
+        ALTER TABLE planning_product_orders ADD COLUMN follow_up_date TEXT NOT NULL DEFAULT '';
+        ALTER TABLE planning_product_orders ADD COLUMN dispatch_schedule TEXT NOT NULL DEFAULT '';
+        ALTER TABLE planning_product_orders ADD COLUMN priority TEXT NOT NULL DEFAULT '';
+        ALTER TABLE planning_product_orders ADD COLUMN workflow_state_id TEXT REFERENCES planning_product_order_workflow_states(id);
+
+        UPDATE planning_product_orders
+        SET workflow_state_id = CASE
+          WHEN status = 'COMPLETED' THEN 'dispatched'
+          WHEN status = 'CANCELLED' THEN 'hold'
+          ELSE 'pending'
+        END;
+
+        CREATE INDEX idx_planning_orders_workflow
+          ON planning_product_orders(workflow_state_id, required_date);
+
+        CREATE TABLE planning_product_order_field_definitions (
+          id TEXT PRIMARY KEY,
+          field_key TEXT NOT NULL UNIQUE,
+          label TEXT NOT NULL UNIQUE COLLATE NOCASE,
+          field_type TEXT NOT NULL CHECK (field_type IN ('TEXT','NUMBER','DATE','BOOLEAN')),
+          position INTEGER NOT NULL,
+          created_at TEXT NOT NULL
+        ) STRICT;
+
+        CREATE TABLE planning_product_order_field_values (
+          product_order_id TEXT NOT NULL REFERENCES planning_product_orders(id) ON DELETE CASCADE,
+          field_id TEXT NOT NULL REFERENCES planning_product_order_field_definitions(id) ON DELETE CASCADE,
+          value_json TEXT NOT NULL,
+          PRIMARY KEY(product_order_id, field_id)
+        ) STRICT;
       `);
     },
   },
@@ -344,10 +442,20 @@ export class PlanningDatabase {
 
     const id = randomUUID();
     this.host.transaction("saving a product BOM version", () => {
-      const nextVersion = Number((this.db.prepare(`
+      const automaticVersion = Number((this.db.prepare(`
         SELECT COALESCE(MAX(version_number), 0) + 1 AS version
         FROM planning_bom_versions WHERE product_item_id = ?
       `).get(product.id) as Row).version);
+      const requestedVersion = input.versionNumber == null
+        ? automaticVersion
+        : wholeNumber(input.versionNumber, "BOM version", false);
+      const existingVersion = this.db.prepare(`
+        SELECT 1 FROM planning_bom_versions
+        WHERE product_item_id = ? AND version_number = ?
+      `).get(product.id, requestedVersion);
+      if (existingVersion) {
+        throw new Error(`BOM version ${requestedVersion} already exists for ${text(product.name)}.`);
+      }
       if (input.activate !== false) {
         this.db.prepare(`
           UPDATE planning_bom_versions SET status = 'ARCHIVED'
@@ -361,8 +469,8 @@ export class PlanningDatabase {
       `).run(
         id,
         product.id,
-        nextVersion,
-        text(input.label) || `BOM v${nextVersion}`,
+        requestedVersion,
+        text(input.label) || `BOM v${requestedVersion}`,
         input.activate === false ? "DRAFT" : "ACTIVE",
         input.source === "FILE_IMPORT" ? "FILE_IMPORT" : "MANUAL",
         dateOnly(input.validFrom),
@@ -398,6 +506,65 @@ export class PlanningDatabase {
     `).get(productItemId) as Row | undefined) ?? null;
   }
 
+  saveProductOrderWorkflowState(input: SaveProductOrderWorkflowStateInput): ProductOrderWorkflowState {
+    this.ensureReady();
+    const name = text(input.name);
+    if (!name) throw new Error("Enter a workflow state name.");
+    const existing = this.db.prepare(`
+      SELECT id FROM planning_product_order_workflow_states WHERE name = ? COLLATE NOCASE
+    `).get(name) as Row | undefined;
+    if (existing) throw new Error("A workflow state with this name already exists.");
+    const id = fieldKey(name) || randomUUID();
+    const duplicateId = this.db.prepare("SELECT 1 FROM planning_product_order_workflow_states WHERE id = ?").get(id);
+    const stateId = duplicateId ? `${id}-${randomUUID().slice(0, 6)}` : id;
+    const position = Number((this.db.prepare(`
+      SELECT COALESCE(MAX(position), 0) + 1 AS position FROM planning_product_order_workflow_states
+    `).get() as Row).position);
+    const color = /^#[0-9a-f]{6}$/i.test(text(input.color)) ? text(input.color).toUpperCase() : "#6B778C";
+    this.db.prepare(`
+      INSERT INTO planning_product_order_workflow_states(id, name, color, position, terminal)
+      VALUES (?, ?, ?, ?, ?)
+    `).run(stateId, name, color, position, input.terminal ? 1 : 0);
+    return this.getProductOrderWorkflowStates().find((state) => state.id === stateId)!;
+  }
+
+  saveProductOrderFieldDefinition(input: SaveProductOrderFieldDefinitionInput): ProductOrderFieldDefinition {
+    this.ensureReady();
+    const label = text(input.label);
+    if (!label) throw new Error("Enter a field label.");
+    const key = fieldKey(label);
+    if (!key) throw new Error("Enter a field label containing letters or numbers.");
+    const allowed = ["TEXT", "NUMBER", "DATE", "BOOLEAN"];
+    const type = allowed.includes(input.type) ? input.type : "TEXT";
+    const existing = this.db.prepare(`
+      SELECT 1 FROM planning_product_order_field_definitions
+      WHERE field_key = ? OR label = ? COLLATE NOCASE
+    `).get(key, label);
+    if (existing) throw new Error("A custom field with this label already exists.");
+    const id = randomUUID();
+    const position = Number((this.db.prepare(`
+      SELECT COALESCE(MAX(position), 0) + 1 AS position FROM planning_product_order_field_definitions
+    `).get() as Row).position);
+    this.db.prepare(`
+      INSERT INTO planning_product_order_field_definitions(
+        id, field_key, label, field_type, position, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?)
+    `).run(id, key, label, type, position, nowIso());
+    return this.getProductOrderFieldDefinitions().find((field) => field.id === id)!;
+  }
+
+  updateProductOrderWorkflowState(orderId: string, workflowStateId: string): void {
+    this.ensureReady();
+    const state = this.db.prepare(`
+      SELECT id FROM planning_product_order_workflow_states WHERE id = ?
+    `).get(text(workflowStateId)) as Row | undefined;
+    if (!state) throw new Error("Workflow state not found.");
+    const result = this.db.prepare(`
+      UPDATE planning_product_orders SET workflow_state_id = ?, updated_at = ? WHERE id = ?
+    `).run(state.id, nowIso(), text(orderId));
+    if (Number(result.changes) === 0) throw new Error("Product order not found.");
+  }
+
   saveProductOrder(input: SaveProductOrderInput): ProductOrder {
     this.ensureReady();
     const product = this.stockItemByGuid(input.productTallyGuid);
@@ -415,13 +582,24 @@ export class PlanningDatabase {
     const timestamp = nowIso();
 
     this.host.transaction("saving a product order and reservations", () => {
-      const existing = this.db.prepare("SELECT created_at FROM planning_product_orders WHERE id = ?").get(orderId) as Row | undefined;
+      const existing = this.db.prepare("SELECT * FROM planning_product_orders WHERE id = ?").get(orderId) as Row | undefined;
       const bom = this.activeBomForProduct(Number(product.id));
+      const workflowStateId = text(input.workflowStateId)
+        || text(existing?.workflow_state_id)
+        || text((this.db.prepare(`
+          SELECT id FROM planning_product_order_workflow_states ORDER BY position LIMIT 1
+        `).get() as Row | undefined)?.id);
+      if (!this.db.prepare("SELECT 1 FROM planning_product_order_workflow_states WHERE id = ?").get(workflowStateId)) {
+        throw new Error("Choose a valid workflow state.");
+      }
       this.db.prepare(`
         INSERT INTO planning_product_orders(
           id, external_reference, product_item_id, quantity, required_date, status,
-          bom_version_id, notes, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          bom_version_id, notes, created_at, updated_at, file_number, organisation,
+          purchase_order_date, last_dispatch_date, pending_quantity, value_including_gst,
+          pending_material, raw_material_to_order, crf_status, crac_status, task_remarks,
+          responsible_person, follow_up_date, dispatch_schedule, priority, workflow_state_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
           external_reference = excluded.external_reference,
           product_item_id = excluded.product_item_id,
@@ -430,6 +608,22 @@ export class PlanningDatabase {
           status = excluded.status,
           bom_version_id = excluded.bom_version_id,
           notes = excluded.notes,
+          file_number = excluded.file_number,
+          organisation = excluded.organisation,
+          purchase_order_date = excluded.purchase_order_date,
+          last_dispatch_date = excluded.last_dispatch_date,
+          pending_quantity = excluded.pending_quantity,
+          value_including_gst = excluded.value_including_gst,
+          pending_material = excluded.pending_material,
+          raw_material_to_order = excluded.raw_material_to_order,
+          crf_status = excluded.crf_status,
+          crac_status = excluded.crac_status,
+          task_remarks = excluded.task_remarks,
+          responsible_person = excluded.responsible_person,
+          follow_up_date = excluded.follow_up_date,
+          dispatch_schedule = excluded.dispatch_schedule,
+          priority = excluded.priority,
+          workflow_state_id = excluded.workflow_state_id,
           updated_at = excluded.updated_at
       `).run(
         orderId,
@@ -442,7 +636,36 @@ export class PlanningDatabase {
         text(input.notes),
         existing?.created_at ?? timestamp,
         timestamp,
+        input.fileNumber === undefined ? text(existing?.file_number) : text(input.fileNumber),
+        input.organisation === undefined ? text(existing?.organisation) : text(input.organisation),
+        input.purchaseOrderDate === undefined ? text(existing?.purchase_order_date) : optionalDate(input.purchaseOrderDate),
+        input.lastDispatchDate === undefined ? text(existing?.last_dispatch_date) : optionalDate(input.lastDispatchDate),
+        input.pendingQuantity === undefined ? (existing?.pending_quantity ?? null) : optionalNumber(input.pendingQuantity, "Pending quantity", true),
+        input.valueIncludingGst === undefined ? (existing?.value_including_gst ?? null) : optionalNumber(input.valueIncludingGst, "Value including GST"),
+        input.pendingMaterial === undefined ? text(existing?.pending_material) : text(input.pendingMaterial),
+        input.rawMaterialToOrder === undefined ? text(existing?.raw_material_to_order) : text(input.rawMaterialToOrder),
+        input.crfStatus === undefined ? text(existing?.crf_status) : text(input.crfStatus),
+        input.cracStatus === undefined ? text(existing?.crac_status) : text(input.cracStatus),
+        input.taskRemarks === undefined ? text(existing?.task_remarks) : text(input.taskRemarks),
+        input.responsiblePerson === undefined ? text(existing?.responsible_person) : text(input.responsiblePerson),
+        input.followUpDate === undefined ? text(existing?.follow_up_date) : optionalDate(input.followUpDate),
+        input.dispatchSchedule === undefined ? text(existing?.dispatch_schedule) : text(input.dispatchSchedule),
+        input.priority === undefined ? text(existing?.priority) : text(input.priority),
+        workflowStateId,
       );
+      if (input.customFields) {
+        const definitions = new Map(this.getProductOrderFieldDefinitions().map((field) => [field.key, field]));
+        const upsert = this.db.prepare(`
+          INSERT INTO planning_product_order_field_values(product_order_id, field_id, value_json)
+          VALUES (?, ?, ?)
+          ON CONFLICT(product_order_id, field_id) DO UPDATE SET value_json = excluded.value_json
+        `);
+        for (const [key, value] of Object.entries(input.customFields)) {
+          const definition = definitions.get(key);
+          if (!definition) continue;
+          upsert.run(orderId, definition.id, JSON.stringify(value ?? null));
+        }
+      }
       this.db.prepare("DELETE FROM planning_reservations WHERE product_order_id = ?").run(orderId);
       if (status === "CONFIRMED" && bom) this.createReservations(orderId, bom, quantity);
     });
@@ -540,14 +763,42 @@ export class PlanningDatabase {
     }));
   }
 
+  private getProductOrderWorkflowStates(): ProductOrderWorkflowState[] {
+    return (this.db.prepare(`
+      SELECT id, name, color, position, terminal
+      FROM planning_product_order_workflow_states ORDER BY position, name
+    `).all() as Row[]).map((row) => ({
+      id: text(row.id),
+      name: text(row.name),
+      color: text(row.color),
+      position: Number(row.position),
+      terminal: Boolean(row.terminal),
+    }));
+  }
+
+  private getProductOrderFieldDefinitions(): ProductOrderFieldDefinition[] {
+    return (this.db.prepare(`
+      SELECT id, field_key, label, field_type, position
+      FROM planning_product_order_field_definitions ORDER BY position, label
+    `).all() as Row[]).map((row) => ({
+      id: text(row.id),
+      key: text(row.field_key),
+      label: text(row.label),
+      type: row.field_type,
+      position: Number(row.position),
+    }));
+  }
+
   private getProductOrders(): ProductOrder[] {
     const rows = this.db.prepare(`
       SELECT o.*, item.tally_guid AS product_tally_guid,
         COALESCE(NULLIF(item.local_name_override, ''), item.name) AS product_name,
-        bom.label AS bom_label, bom.version_number AS bom_version_number
+        bom.label AS bom_label, bom.version_number AS bom_version_number,
+        workflow.name AS workflow_state_name, workflow.color AS workflow_state_color
       FROM planning_product_orders o
       JOIN tally_stock_items item ON item.id = o.product_item_id
       LEFT JOIN planning_bom_versions bom ON bom.id = o.bom_version_id
+      LEFT JOIN planning_product_order_workflow_states workflow ON workflow.id = o.workflow_state_id
       ORDER BY CASE o.status WHEN 'CONFIRMED' THEN 0 WHEN 'DRAFT' THEN 1 ELSE 2 END,
         o.required_date, o.created_at DESC
     `).all() as Row[];
@@ -567,6 +818,13 @@ export class PlanningDatabase {
       LEFT JOIN planning_product_orders po ON po.id = r.product_order_id
       LEFT JOIN planning_bom_lines line ON line.bom_version_id = po.bom_version_id AND line.component_item_id = r.component_item_id
       WHERE r.product_order_id = ? ORDER BY item.name
+    `);
+    const customFieldStatement = this.db.prepare(`
+      SELECT definition.field_key, value.value_json
+      FROM planning_product_order_field_values value
+      JOIN planning_product_order_field_definitions definition ON definition.id = value.field_id
+      WHERE value.product_order_id = ?
+      ORDER BY definition.position
     `);
     const priorCommittedByComponent = new Map<number, number>();
     return rows.map((row) => {
@@ -606,19 +864,45 @@ export class PlanningDatabase {
         else if (requirements.some((line) => line.shortageAfterIncoming >= line.requiredQuantity)) feasibility = "SHORT_COMPONENTS";
         else feasibility = "AT_RISK";
       }
+      const customFields = Object.fromEntries((customFieldStatement.all(row.id) as Row[]).map((field) => {
+        try {
+          return [text(field.field_key), JSON.parse(text(field.value_json))];
+        } catch {
+          return [text(field.field_key), text(field.value_json)];
+        }
+      }));
       return {
         id: text(row.id),
+        fileNumber: text(row.file_number),
+        organisation: text(row.organisation),
         externalReference: text(row.external_reference),
+        purchaseOrderDate: text(row.purchase_order_date),
+        lastDispatchDate: text(row.last_dispatch_date),
         productStockItemId: Number(row.product_item_id),
         productTallyGuid: text(row.product_tally_guid),
         productName: text(row.product_name),
         quantity: Number(row.quantity),
+        pendingQuantity: row.pending_quantity == null ? null : Number(row.pending_quantity),
+        valueIncludingGst: row.value_including_gst == null ? null : Number(row.value_including_gst),
+        pendingMaterial: text(row.pending_material),
+        rawMaterialToOrder: text(row.raw_material_to_order),
+        crfStatus: text(row.crf_status),
+        cracStatus: text(row.crac_status),
+        taskRemarks: text(row.task_remarks),
+        responsiblePerson: text(row.responsible_person),
+        followUpDate: text(row.follow_up_date),
+        dispatchSchedule: text(row.dispatch_schedule),
+        priority: text(row.priority),
         requiredDate: text(row.required_date),
         status: row.status,
+        workflowStateId: text(row.workflow_state_id),
+        workflowStateName: text(row.workflow_state_name) || "Pending",
+        workflowStateColor: text(row.workflow_state_color) || "#6B778C",
         bomVersionId: row.bom_version_id ? text(row.bom_version_id) : null,
         bomVersionLabel: row.bom_version_id ? `${text(row.bom_label)} (v${row.bom_version_number})` : "No active BOM",
         feasibility,
         notes: text(row.notes),
+        customFields,
         createdAt: text(row.created_at),
         updatedAt: text(row.updated_at),
         requirements,
@@ -789,6 +1073,8 @@ export class PlanningDatabase {
     const items = this.getPlanningItems();
     const boms = this.getBoms();
     const productOrders = this.getProductOrders();
+    const productOrderWorkflowStates = this.getProductOrderWorkflowStates();
+    const productOrderFieldDefinitions = this.getProductOrderFieldDefinitions();
     const tallySync = (this.db.prepare("SELECT value_json FROM settings WHERE key = 'last_tally_sync_at'").get() as Row | undefined)?.value_json;
     let tallySyncedAt: string | null = null;
     if (tallySync) {
@@ -828,6 +1114,8 @@ export class PlanningDatabase {
       items,
       boms,
       productOrders,
+      productOrderWorkflowStates,
+      productOrderFieldDefinitions,
       groups: [...new Set(items.map((item) => item.groupName).filter(Boolean))].sort(),
     };
   }

@@ -9,7 +9,9 @@ import type {
   RecommendationDecisionInput,
   RestockPolicyInput,
   SaveBomInput,
+  SaveProductOrderFieldDefinitionInput,
   SaveProductOrderInput,
+  SaveProductOrderWorkflowStateInput,
 } from "./types";
 
 export class PlanningService {
@@ -70,6 +72,24 @@ export class PlanningService {
   updateProductOrderStatus(orderId: string, status: "CANCELLED" | "COMPLETED" | "CONFIRMED", actor: ActorContext) {
     requirePermission(actor, "PRODUCT_ORDER_MANAGE");
     this.database.updateProductOrderStatus(orderId, status);
+    return this.getState();
+  }
+
+  updateProductOrderWorkflowState(orderId: string, workflowStateId: string, actor: ActorContext) {
+    requirePermission(actor, "PRODUCT_ORDER_MANAGE");
+    this.database.updateProductOrderWorkflowState(orderId, workflowStateId);
+    return this.getState();
+  }
+
+  saveProductOrderWorkflowState(input: SaveProductOrderWorkflowStateInput, actor: ActorContext) {
+    requirePermission(actor, "PRODUCT_ORDER_MANAGE");
+    this.database.saveProductOrderWorkflowState(input);
+    return this.getState();
+  }
+
+  saveProductOrderFieldDefinition(input: SaveProductOrderFieldDefinitionInput, actor: ActorContext) {
+    requirePermission(actor, "PRODUCT_ORDER_MANAGE");
+    this.database.saveProductOrderFieldDefinition(input);
     return this.getState();
   }
 

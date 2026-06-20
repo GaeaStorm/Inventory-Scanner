@@ -504,6 +504,18 @@ function registerIpcHandlers(): void {
     if (!planningService) throw new Error("The Planning service is unavailable.");
     return planningService.updateProductOrderStatus(String(orderId ?? ""), String(status ?? "") as "CANCELLED" | "COMPLETED" | "CONFIRMED", requireActor(token, "PRODUCT_ORDER_MANAGE"));
   });
+  ipcMain.handle("planning:update-product-order-workflow-state", (_event, token: unknown, orderId: unknown, workflowStateId: unknown) => {
+    if (!planningService) throw new Error("The Planning service is unavailable.");
+    return planningService.updateProductOrderWorkflowState(String(orderId ?? ""), String(workflowStateId ?? ""), requireActor(token, "PRODUCT_ORDER_MANAGE"));
+  });
+  ipcMain.handle("planning:save-product-order-workflow-state", (_event, token: unknown, input: unknown) => {
+    if (!planningService) throw new Error("The Planning service is unavailable.");
+    return planningService.saveProductOrderWorkflowState(input as never, requireActor(token, "PRODUCT_ORDER_MANAGE"));
+  });
+  ipcMain.handle("planning:save-product-order-field-definition", (_event, token: unknown, input: unknown) => {
+    if (!planningService) throw new Error("The Planning service is unavailable.");
+    return planningService.saveProductOrderFieldDefinition(input as never, requireActor(token, "PRODUCT_ORDER_MANAGE"));
+  });
   ipcMain.handle("planning:export-restock", (_event, token: unknown, input: unknown) => {
     if (!planningService) throw new Error("The Planning service is unavailable.");
     return planningService.exportRestock(input as never, requireActor(token, "RESTOCK_MANAGE"));

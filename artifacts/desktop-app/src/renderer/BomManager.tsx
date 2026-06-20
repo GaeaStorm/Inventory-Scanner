@@ -1,12 +1,7 @@
 import { Fragment, useMemo, useState } from "react";
 import * as XLSX from "xlsx";
 
-import {
-  matchBomCatalogItem,
-  normalizeBomName,
-  parseBomWorkbook,
-  type ParsedBomRow,
-} from "./bom-import";
+import { parseBomWorkbook } from "./bom-import";
 import { finishedProductItems, materialStockItems, operationalStockItems } from "./stock-item-visibility";
 import type { PlanningState, SaveBomInput, StoresState } from "./types";
 
@@ -23,32 +18,20 @@ interface DraftLine {
   componentTallyGuid: string;
   quantityPerProduct: number;
   lossBufferPercent: number;
-}
-
-interface ImportDraftRow extends ParsedBomRow {
-  importedComponentName: string;
-}
-
-function validateImportRow(row: ImportDraftRow): ImportDraftRow {
-  const errors: string[] = [];
-  if (!row.productGuid) errors.push("Product not matched");
-  if (!row.componentGuid) errors.push("Component not matched");
-  if (!Number.isInteger(row.quantity) || row.quantity <= 0) errors.push("Quantity must be a positive whole number");
-  if (!Number.isFinite(row.lossBufferPercent) || row.lossBufferPercent < 0 || row.lossBufferPercent > 100) errors.push("Loss buffer must be 0–100");
-  return { ...row, error: errors.join("; ") };
+  importedComponentName?: string;
+  importedComponentType?: string;
+  sourceRow?: number;
 }
 
 export default function BomManager({ planning, stores, onChanged, onStoresChanged, onNotice, onError }: Props) {
   const [productGuid, setProductGuid] = useState("");
+  const [versionNumber, setVersionNumber] = useState("");
   const [label, setLabel] = useState("");
   const [validFrom, setValidFrom] = useState(new Date().toISOString().slice(0, 10));
   const [lines, setLines] = useState<DraftLine[]>([{ componentTallyGuid: "", quantityPerProduct: 1, lossBufferPercent: 0 }]);
-  const [parsedRows, setParsedRows] = useState<ImportDraftRow[]>([]);
   const [importDetails, setImportDetails] = useState("");
   const [busy, setBusy] = useState(false);
   const [expandedBom, setExpandedBom] = useState("");
-  const [localComponentGroup, setLocalComponentGroup] = useState("Local Components");
-  const [localProductGroup, setLocalProductGroup] = useState("Local Products");
   const selectableItems = useMemo(
     () => operationalStockItems(stores.stockItems),
     [stores.stockItems],
@@ -70,6 +53,11 @@ export default function BomManager({ planning, stores, onChanged, onStoresChange
       return;
     }
     const validLines = lines.filter((line) => line.componentTallyGuid);
+    const unresolvedImported = lines.filter((line) => line.importedComponentName && !line.componentTallyGuid);
+    if (unresolvedImported.length > 0) {
+      onError(`Match or remove the ${unresolvedImported.length} unresolved imported component${unresolvedImported.length === 1 ? "" : "s"} before creating the BOM.`);
+      return;
+    }
     if (validLines.length === 0) {
       onError("Add at least one component.");
       return;
@@ -79,15 +67,18 @@ export default function BomManager({ planning, stores, onChanged, onStoresChange
     try {
       const state = await window.desktop.planning.saveBom({
         productTallyGuid: productGuid,
+        versionNumber: versionNumber ? Number(versionNumber) : undefined,
         label,
         validFrom,
-        source: "MANUAL",
+        source: importDetails ? "FILE_IMPORT" : "MANUAL",
         activate: true,
         lines: validLines,
       });
       onChanged(state);
+      setVersionNumber("");
       setLabel("");
       setLines([{ componentTallyGuid: "", quantityPerProduct: 1, lossBufferPercent: 0 }]);
+      setImportDetails("");
       onNotice("A new active BOM version was created.");
     } catch (error) {
       onError(error instanceof Error ? error.message : String(error));
@@ -98,166 +89,44 @@ export default function BomManager({ planning, stores, onChanged, onStoresChange
 
   async function parseFile(file: File) {
     onError("");
-    setParsedRows([]);
     setImportDetails("");
     try {
       const workbook = XLSX.read(await file.arrayBuffer(), { type: "array", cellDates: false });
       const result = parseBomWorkbook(workbook, selectableItems, file.name);
-      setParsedRows(result.rows.map((row) => ({
-        ...row,
-        importedComponentName: row.componentName,
-      })));
+      const detectedProduct = result.rows.find((row) => row.productGuid)?.productGuid ?? "";
+      if (detectedProduct) setProductGuid(detectedProduct);
+      if (result.versionNumber) setVersionNumber(String(result.versionNumber));
+      setLabel(result.title);
+      const importedLines: DraftLine[] = [];
+      const matchedByGuid = new Map<string, DraftLine>();
+      for (const row of result.rows) {
+        const draftLine: DraftLine = {
+          componentTallyGuid: row.componentGuid,
+          quantityPerProduct: Number.isInteger(row.quantity) && row.quantity > 0 ? row.quantity : 1,
+          lossBufferPercent: Number.isFinite(row.lossBufferPercent) ? row.lossBufferPercent : 0,
+          importedComponentName: row.sourceComponentName,
+          importedComponentType: row.componentType,
+          sourceRow: row.rowNumber,
+        };
+        if (!row.componentGuid) {
+          importedLines.push(draftLine);
+          continue;
+        }
+        const existing = matchedByGuid.get(row.componentGuid);
+        if (existing) {
+          existing.quantityPerProduct += draftLine.quantityPerProduct;
+        } else {
+          matchedByGuid.set(row.componentGuid, draftLine);
+          importedLines.push(draftLine);
+        }
+      }
+      setLines(importedLines);
       setImportDetails(
-        `${result.sheetName} · product ${result.productName || "not detected"}${result.skippedNotFitted ? ` · skipped ${result.skippedNotFitted} NC/DNA row${result.skippedNotFitted === 1 ? "" : "s"}` : ""}`,
+        `${result.sheetName} · product ${result.productName || "not detected"} · version ${result.versionNumber ?? "not detected"} · ${result.rows.filter((row) => row.componentGuid).length} matched · ${result.rows.filter((row) => !row.componentGuid).length} need manual matching${result.skippedNotFitted ? ` · skipped ${result.skippedNotFitted} NC/DNA row${result.skippedNotFitted === 1 ? "" : "s"}` : ""}`,
       );
       if (result.rows.length === 0) onError("The selected file did not contain any fitted BOM component rows.");
     } catch (error) {
       onError(error instanceof Error ? error.message : String(error));
-    }
-  }
-
-  function mapImportedComponent(rowNumber: number, tallyGuid: string) {
-    const item = selectableItems.find((entry) => entry.tallyGuid === tallyGuid);
-    setParsedRows((rows) => {
-      const selectedRow = rows.find((row) => row.rowNumber === rowNumber);
-      const importedName = normalizeBomName(selectedRow?.importedComponentName);
-      return rows.map((row) => {
-        const sameUnmatchedName = Boolean(item && importedName && !row.componentGuid
-          && normalizeBomName(row.importedComponentName) === importedName);
-        if (row.rowNumber !== rowNumber && !sameUnmatchedName) return row;
-        return validateImportRow({
-          ...row,
-          componentGuid: item?.tallyGuid ?? "",
-          componentName: item?.name ?? row.importedComponentName,
-        });
-      });
-    });
-  }
-
-  function updateImportedComponentName(rowNumber: number, name: string) {
-    setParsedRows((rows) => rows.map((row) => row.rowNumber === rowNumber
-      ? validateImportRow({
-        ...row,
-        importedComponentName: name,
-        componentName: row.componentGuid ? row.componentName : name,
-      })
-      : row));
-  }
-
-  async function createComponentForRow(row: ImportDraftRow) {
-    const name = row.importedComponentName.trim();
-    if (!name) {
-      onError("Enter a component name before creating it.");
-      return;
-    }
-
-    const normalizedName = normalizeBomName(name);
-    const matchingRows = parsedRows.filter((entry) => !entry.componentGuid
-      && normalizeBomName(entry.importedComponentName) === normalizedName).length;
-    setBusy(true);
-    onError("");
-    try {
-      const state = await window.desktop.stores.createLocalStockItem({
-        name,
-        parentName: localComponentGroup.trim() || "Local Components",
-      });
-      onStoresChanged(state);
-      const refreshedItems = operationalStockItems(state.stockItems);
-      const normalizedLowerName = name.toLocaleLowerCase();
-      const created = refreshedItems.find((item) => item.name.trim().toLocaleLowerCase() === normalizedLowerName)
-        ?? matchBomCatalogItem(refreshedItems, name);
-      if (!created) throw new Error("The component was created but could not be selected in the import preview.");
-
-      setParsedRows((rows) => rows.map((entry) => !entry.componentGuid
-        && normalizeBomName(entry.importedComponentName) === normalizedName
-        ? validateImportRow({
-          ...entry,
-          componentGuid: created.tallyGuid,
-          componentName: created.name,
-        })
-        : entry));
-      onNotice(`Created ${created.name} and matched ${matchingRows} imported row${matchingRows === 1 ? "" : "s"}.`);
-    } catch (error) {
-      onError(error instanceof Error ? error.message : String(error));
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function importRows(createMissingLocally: boolean) {
-    let currentStores = stores;
-    setBusy(true);
-    onError("");
-    try {
-      currentStores = await window.desktop.stores.getState();
-      if (createMissingLocally) {
-        const missingProducts = [...new Set(parsedRows.filter((row) => !row.productGuid && row.productName).map((row) => row.productName))];
-        const missingComponents = [...new Set(parsedRows.filter((row) => !row.componentGuid && row.importedComponentName).map((row) => row.importedComponentName))];
-        for (const name of missingProducts) {
-          currentStores = await window.desktop.stores.createLocalStockItem({ name, parentName: localProductGroup });
-        }
-        for (const name of missingComponents) {
-          currentStores = await window.desktop.stores.createLocalStockItem({ name, parentName: localComponentGroup });
-        }
-        onStoresChanged(currentStores);
-      }
-
-      const refreshedItems = operationalStockItems(currentStores.stockItems);
-      const refreshedRows = parsedRows.map((row) => {
-        const product = row.productGuid
-          ? refreshedItems.find((item) => item.tallyGuid === row.productGuid)
-          : matchBomCatalogItem(refreshedItems, row.productName);
-        const component = row.componentGuid
-          ? refreshedItems.find((item) => item.tallyGuid === row.componentGuid)
-          : matchBomCatalogItem(refreshedItems, row.importedComponentName);
-        const errors: string[] = [];
-        if (!product) errors.push("Product not matched");
-        if (!component) errors.push("Component not matched");
-        if (!Number.isInteger(row.quantity) || row.quantity <= 0) errors.push("Quantity must be a positive whole number");
-        if (!Number.isFinite(row.lossBufferPercent) || row.lossBufferPercent < 0 || row.lossBufferPercent > 100) errors.push("Loss buffer must be 0–100");
-        return {
-          ...row,
-          productGuid: product?.tallyGuid ?? "",
-          productName: product?.name ?? row.productName,
-          componentGuid: component?.tallyGuid ?? "",
-          componentName: component?.name ?? row.importedComponentName,
-          error: errors.join("; "),
-        };
-      });
-      setParsedRows(refreshedRows);
-      const valid = refreshedRows.filter((row) => !row.error);
-      if (valid.length === 0) throw new Error("There are no fully matched rows to import.");
-      const grouped = new Map<string, ParsedBomRow[]>();
-      for (const row of valid) grouped.set(row.productGuid, [...(grouped.get(row.productGuid) ?? []), row]);
-      let state = planning;
-      for (const [guid, rows] of grouped) {
-        const uniqueComponents = new Map<string, ParsedBomRow>();
-        for (const row of rows) {
-          const previous = uniqueComponents.get(row.componentGuid);
-          uniqueComponents.set(row.componentGuid, previous
-            ? { ...row, quantity: previous.quantity + row.quantity }
-            : row);
-        }
-        state = await window.desktop.planning.saveBom({
-          productTallyGuid: guid,
-          label: `Imported ${new Date().toLocaleDateString("en-IN")}`,
-          source: "FILE_IMPORT",
-          activate: true,
-          lines: [...uniqueComponents.values()].map((row) => ({
-            componentTallyGuid: row.componentGuid,
-            quantityPerProduct: row.quantity,
-            lossBufferPercent: row.lossBufferPercent,
-          })),
-        });
-      }
-      onChanged(state);
-      setParsedRows([]);
-      setImportDetails("");
-      onNotice(`Imported ${grouped.size} BOM version${grouped.size === 1 ? "" : "s"}.`);
-    } catch (error) {
-      onError(error instanceof Error ? error.message : String(error));
-    } finally {
-      setBusy(false);
     }
   }
 
@@ -282,43 +151,29 @@ export default function BomManager({ planning, stores, onChanged, onStoresChange
             <div><p className="eyebrow">PRODUCT DEFINITION</p><h2>Create a BOM version</h2></div>
             <label className="button button--secondary bom-import-button">Import spreadsheet<input type="file" accept=".xlsx,.xls,.csv" onChange={(event) => { const file = event.target.files?.[0]; if (file) void parseFile(file); event.currentTarget.value = ""; }} /></label>
           </div>
-          <div className="form-grid form-grid--three">
+          {importDetails && <div className="import-summary"><strong>Spreadsheet loaded into this BOM draft</strong><span>{importDetails}</span></div>}
+          <div className="form-grid form-grid--four">
             <label>Product<select value={productGuid} onChange={(event) => setProductGuid(event.target.value)}><option value="">Select product…</option>{products.map((item) => <option key={item.tallyGuid} value={item.tallyGuid}>{item.name}{item.hasBom ? " · Tally BOM" : ""}</option>)}</select></label>
+            <label>Version number<input type="number" min={1} step={1} value={versionNumber} onChange={(event) => setVersionNumber(event.target.value)} placeholder="Automatic" /></label>
             <label>Version label<input value={label} onChange={(event) => setLabel(event.target.value)} placeholder="e.g. Standard assembly" /></label>
             <label>Valid from<input type="date" value={validFrom} onChange={(event) => setValidFrom(event.target.value)} /></label>
           </div>
           <div className="bom-line-editor">
             <div className="bom-line-editor__head"><span>Component</span><span>Qty / product</span><span>Loss buffer %</span><span /></div>
             {lines.map((line, index) => <div className="bom-line-editor__row" key={index}>
-              <select value={line.componentTallyGuid} onChange={(event) => setLines(lines.map((entry, rowIndex) => rowIndex === index ? { ...entry, componentTallyGuid: event.target.value } : entry))}><option value="">Select component…</option>{components.filter((item) => item.tallyGuid !== productGuid).map((item) => <option key={item.tallyGuid} value={item.tallyGuid}>{item.name}</option>)}</select>
+              <div className="bom-import-draft-component">
+                {line.importedComponentName && <small>Row {line.sourceRow}: {line.importedComponentName}{line.importedComponentType ? ` · ${line.importedComponentType}` : ""}</small>}
+                <select value={line.componentTallyGuid} onChange={(event) => setLines(lines.map((entry, rowIndex) => rowIndex === index ? { ...entry, componentTallyGuid: event.target.value } : entry))}><option value="">{line.importedComponentName ? "Match imported component…" : "Select component…"}</option>{components.filter((item) => item.tallyGuid !== productGuid).map((item) => <option key={item.tallyGuid} value={item.tallyGuid}>{item.name}</option>)}</select>
+              </div>
               <input type="number" min={1} step={1} value={line.quantityPerProduct} onChange={(event) => setLines(lines.map((entry, rowIndex) => rowIndex === index ? { ...entry, quantityPerProduct: Number(event.target.value) } : entry))} />
               <input type="number" min={0} max={100} step={0.1} value={line.lossBufferPercent} onChange={(event) => setLines(lines.map((entry, rowIndex) => rowIndex === index ? { ...entry, lossBufferPercent: Number(event.target.value) } : entry))} />
               <button className="icon-button" type="button" aria-label="Remove component" onClick={() => setLines(lines.filter((_, rowIndex) => rowIndex !== index))}>×</button>
             </div>)}
           </div>
-          <div className="inline-actions"><button className="button button--secondary" type="button" onClick={() => setLines([...lines, { componentTallyGuid: "", quantityPerProduct: 1, lossBufferPercent: 0 }])}>Add component</button><button className="button" disabled={busy} type="button" onClick={() => void saveManualBom()}>Create active version</button></div>
+          <div className="inline-actions"><button className="button button--secondary" type="button" onClick={() => setLines([...lines, { componentTallyGuid: "", quantityPerProduct: 1, lossBufferPercent: 0 }])}>Add component</button>{importDetails && <button className="button button--ghost" type="button" onClick={() => { setImportDetails(""); setVersionNumber(""); setLabel(""); setLines([{ componentTallyGuid: "", quantityPerProduct: 1, lossBufferPercent: 0 }]); }}>Clear imported draft</button>}<button className="button" disabled={busy} type="button" onClick={() => void saveManualBom()}>Create active version</button></div>
         </article>
 
       </section>
-
-      {parsedRows.length > 0 && (
-        <article className="panel bom-import-workspace">
-          <div className="panel__header">
-            <div><p className="eyebrow">IMPORT</p><h2>Match imported components</h2></div>
-            <label className="button button--secondary bom-import-button">Choose another spreadsheet<input type="file" accept=".xlsx,.xls,.csv" onChange={(event) => { const file = event.target.files?.[0]; if (file) void parseFile(file); event.currentTarget.value = ""; }} /></label>
-          </div>
-          <div className="import-summary"><strong>{parsedRows.filter((row) => !row.error).length} matched</strong><span>{parsedRows.filter((row) => row.error).length} need mapping or correction</span>{importDetails && <span>{importDetails}</span>}</div>
-          <div className="table-scroll import-preview"><table><thead><tr><th>Row</th><th>Product</th><th>Component from sheet</th><th>Match or create</th><th>Qty</th><th>Loss</th><th>Result</th></tr></thead><tbody>{parsedRows.map((row) => <tr key={row.rowNumber} className={row.error ? "row-error" : ""}>
-            <td>{row.rowNumber}</td>
-            <td>{row.productName || "—"}</td>
-            <td>{row.componentGuid ? (row.importedComponentName || "—") : <input aria-label={`Component name for row ${row.rowNumber}`} value={row.importedComponentName} onChange={(event) => updateImportedComponentName(row.rowNumber, event.target.value)} />}</td>
-            <td><div className="bom-import-match"><select aria-label={`Match component for row ${row.rowNumber}`} value={row.componentGuid} onChange={(event) => mapImportedComponent(row.rowNumber, event.target.value)}><option value="">Choose existing component…</option>{components.filter((item) => item.tallyGuid !== row.productGuid).map((item) => <option key={item.tallyGuid} value={item.tallyGuid}>{item.name}</option>)}</select>{!row.componentGuid && <button className="button button--secondary button--small" disabled={busy || !row.importedComponentName.trim()} type="button" onClick={() => void createComponentForRow(row)}>Create new</button>}</div></td>
-            <td>{Number.isFinite(row.quantity) ? row.quantity : "—"}</td><td>{Number.isFinite(row.lossBufferPercent) ? `${row.lossBufferPercent}%` : "—"}</td><td>{row.error || "Matched"}</td>
-          </tr>)}</tbody></table></div>
-          {parsedRows.some((row) => !row.productGuid || !row.componentGuid) && <div className="local-item-controls"><label>New component group<input value={localComponentGroup} onChange={(event) => setLocalComponentGroup(event.target.value)} /></label><label>New product group<input value={localProductGroup} onChange={(event) => setLocalProductGroup(event.target.value)} /></label><p>Edit an unidentified component name, match it to an existing item, or create it locally and link it to Tally later.</p></div>}
-          <div className="inline-actions"><button className="button button--secondary" type="button" onClick={() => { setParsedRows([]); setImportDetails(""); }}>Clear preview</button><button className="button button--secondary" disabled={busy || parsedRows.every((row) => row.error)} type="button" onClick={() => void importRows(false)}>Import matched only</button>{parsedRows.some((row) => !row.productGuid || !row.componentGuid) && <button className="button" disabled={busy} type="button" onClick={() => void importRows(true)}>Create missing locally and import</button>}</div>
-        </article>
-      )}
 
       <article className="panel table-panel">
         <div className="panel__header"><div><p className="eyebrow">BOM HISTORY</p><h2>Product definitions and versions</h2></div><span className="table-count">{planning.boms.length} versions</span></div>
