@@ -559,7 +559,9 @@ export class PlanningDatabase {
         COALESCE((SELECT service_reserve FROM planning_restock_policies WHERE stock_item_id = r.component_item_id), 0) AS service_reserve,
         COALESCE((SELECT SUM(pol.ordered_quantity - pol.received_quantity)
           FROM purchase_order_lines pol JOIN purchase_orders po ON po.id = pol.purchase_order_id
-          WHERE pol.stock_item_id = r.component_item_id AND po.status = 'OPEN'), 0) AS incoming
+          WHERE pol.stock_item_id = r.component_item_id
+            AND po.status <> 'CLOSED'
+            AND pol.ordered_quantity > pol.received_quantity), 0) AS incoming
       FROM planning_reservations r
       JOIN tally_stock_items item ON item.id = r.component_item_id
       LEFT JOIN planning_product_orders po ON po.id = r.product_order_id
@@ -660,7 +662,8 @@ export class PlanningDatabase {
     const rows = this.db.prepare(`
       SELECT item.id, item.tally_guid,
         COALESCE(NULLIF(item.local_name_override, ''), item.name) AS name,
-        item.parent_name, item.source,
+        item.parent_name, item.source, item.catalog_status,
+        COALESCE(item.catalog_role_override, group_settings.catalog_role, 'OTHER') AS catalog_role,
         policy.planning_method, policy.reorder_point, policy.target_stock,
         policy.service_reserve, policy.preferred_supplier_id,
         supplier.name AS preferred_supplier_name, policy.lead_time_days,
@@ -672,12 +675,17 @@ export class PlanningDatabase {
         COALESCE((SELECT SUM(reserved_quantity) FROM planning_reservations WHERE component_item_id = item.id AND status = 'ACTIVE'), 0) AS reserved,
         COALESCE((SELECT SUM(pol.ordered_quantity - pol.received_quantity)
           FROM purchase_order_lines pol JOIN purchase_orders po ON po.id = pol.purchase_order_id
-          WHERE pol.stock_item_id = item.id AND po.status = 'OPEN'), 0) AS incoming
+          WHERE pol.stock_item_id = item.id
+            AND po.status <> 'CLOSED'
+            AND pol.ordered_quantity > pol.received_quantity), 0) AS incoming
       FROM tally_stock_items item
+      LEFT JOIN catalog_group_settings group_settings ON group_settings.group_name = item.parent_name COLLATE NOCASE
       LEFT JOIN planning_restock_policies policy ON policy.stock_item_id = item.id
       LEFT JOIN suppliers supplier ON supplier.id = policy.preferred_supplier_id
       LEFT JOIN planning_recommendations recommendation ON recommendation.stock_item_id = item.id
       WHERE item.active = 1
+        AND item.catalog_ignored = 0
+        AND COALESCE(group_settings.ignored, 0) = 0
         AND item.catalog_status <> 'DUPLICATE'
         AND (
           item.catalog_status <> 'OBSOLETE'
@@ -710,7 +718,11 @@ export class PlanningDatabase {
       const available = onHand - reserved - serviceReserve;
       const projected = available + incoming;
       const minimumOrderQuantity = Number(row.minimum_order_quantity ?? 0);
+      const obsolete = text(row.catalog_status) === "OBSOLETE";
+      const suggestedObsoleteTarget = Math.ceil(averageDailyUsage * 365 * 3.5);
+      const yearsOfStock = averageDailyUsage > 0 ? onHand / (averageDailyUsage * 365) : null;
       let suggestedOrderQuantity = Math.max(0, targetStock - projected);
+      if (obsolete) suggestedOrderQuantity = Math.max(0, targetStock - projected);
       if (suggestedOrderQuantity > 0 && minimumOrderQuantity > 0) {
         suggestedOrderQuantity = Math.max(suggestedOrderQuantity, minimumOrderQuantity);
       }
@@ -726,12 +738,18 @@ export class PlanningDatabase {
       if (!configured) warnings.push("Restock policy not configured.");
       if (configured && !row.preferred_supplier_id) warnings.push("Preferred supplier not set.");
       if (configured && leadTimeDays === 0) warnings.push("Supplier lead time not set.");
+      if (obsolete && targetStock === 0) warnings.push("Obsolete item needs a target quantity for approximately 3–4 years of expected usage.");
+      if (obsolete && yearsOfStock != null && (yearsOfStock < 3 || yearsOfStock > 4)) {
+        warnings.push(`Current stock covers approximately ${yearsOfStock.toFixed(1)} years; the obsolete-stock goal is 3–4 years.`);
+      }
       return {
         stockItemId: Number(row.id),
         tallyItemGuid: text(row.tally_guid),
         itemName: text(row.name),
         groupName: text(row.parent_name),
         catalogSource: row.source === "LOCAL" ? "LOCAL" : "TALLY",
+        catalogStatus: obsolete ? "OBSOLETE" : "ACTIVE",
+        catalogRole: text(row.catalog_role) as RestockPlanningItem["catalogRole"],
         planningMethod: row.planning_method ?? "MANUAL",
         reorderPoint,
         targetStock,
@@ -751,6 +769,8 @@ export class PlanningDatabase {
         incoming,
         projected,
         averageDailyUsage,
+        yearsOfStock,
+        suggestedObsoleteTarget,
         suggestedReorderPoint,
         effectiveLeadTimeDays,
         observedLeadTimeMedianDays,

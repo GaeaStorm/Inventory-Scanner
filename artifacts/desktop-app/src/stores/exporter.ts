@@ -11,7 +11,7 @@ import { writeTallyMovementWorkbooks } from "./tally-excel";
 type Row = Record<string, any>;
 
 export const REVIEW_EXPORT_SCHEMA_VERSION = "1.0";
-export const TALLY_XML_ADAPTER_VERSION = "receipt-note-v1/material-out-pending";
+export const TALLY_XML_ADAPTER_VERSION = "receipt-note-v1/material-out-v1";
 
 function text(value: unknown): string {
   return String(value ?? "").trim();
@@ -62,18 +62,10 @@ export class StoresExporter {
     const reviewedBy = text(input.reviewedBy);
     if (!reviewedBy) throw new Error("Chief of Staff / reviewer name is required.");
     const approved = this.database.approvedEntries();
-    if (approved.length === 0) throw new Error("There are no approved entries ready for export.");
 
-    const materialOutConfigured = this.database.getState().materialOutXmlConfigured;
     const exportable = approved;
     const materialOut = exportable.filter((entry) => entry.entityType === "MATERIAL_OUT");
     const warnings: string[] = [];
-
-    if (materialOut.length > 0 && !materialOutConfigured) {
-     warnings.push(
-      `${materialOut.length} approved Material Out group(s) were included in the Material Out Excel workbook. They were omitted from Tally XML because the Production and Servicing XML mapping is still unconfigured.`,
-     );
-    }
 
     this.database.backup("before-export");
     const batchId = `BATCH-${randomUUID()}`;
@@ -121,7 +113,7 @@ export class StoresExporter {
       Quantity: entry.quantity,
       "FIFO Supplier Allocation": entry.fifoSummary,
       "Contributing Phone Transactions": entry.contributingTransactions,
-      "XML Mapping": this.database.getState().materialOutXmlConfigured ? "Configured" : "Blocked pending sample voucher mapping",
+      "XML Mapping": "Outward Material v1",
     }));
     const allocationRows: Row[] = data.allocations.map((allocation) => ({
       "Movement ID": allocation.movementId,
@@ -224,9 +216,8 @@ export class StoresExporter {
 
     const companyName = this.database.getState().companyName;
     const grnXml = this.buildGrnXml(exportable.filter((entry) => entry.entityType === "GRN"));
-    const materialOutXml = materialOutConfigured
-      ? this.buildConfiguredMaterialOutXml(materialOut)
-      : "";
+    const materialOutXml = this.buildMaterialOutXml(materialOut);
+    const rejectionXml = this.buildRejectedMaterialOutXml(exportable.filter((entry) => entry.entityType === "GRN"));
     const payload = `<?xml version="1.0" encoding="utf-8"?>
 <!-- Inventory Scanner export schema ${REVIEW_EXPORT_SCHEMA_VERSION}; adapter ${TALLY_XML_ADAPTER_VERSION}; batch ${batchId} -->
 <ENVELOPE>
@@ -238,7 +229,7 @@ export class StoresExporter {
         <STATICVARIABLES><SVCURRENTCOMPANY>${xml(companyName)}</SVCURRENTCOMPANY></STATICVARIABLES>
       </REQUESTDESC>
       <REQUESTDATA>
-${grnXml}${materialOutXml}
+${grnXml}${materialOutXml}${rejectionXml}
       </REQUESTDATA>
     </IMPORTDATA>
   </BODY>
@@ -302,12 +293,71 @@ ${grnXml}${materialOutXml}
     return messages.join("");
   }
 
-  private buildConfiguredMaterialOutXml(entries: ReturnType<StoresDatabase["approvedEntries"]>): string {
-    // Intentionally isolated. Replace this adapter only after exporting two sample
-    // Material Out vouchers from the temporary Tally company (Production + Servicing).
-    return entries.map((entry) => `
+  private buildMaterialOutXml(entries: ReturnType<StoresDatabase["approvedEntries"]>): string {
+    return entries.map((entry) => {
+      const ledgerName = /\b(sample|service|servicing|repair)\b/i.test(entry.destinationName)
+        ? "In - Sample Account"
+        : "Out - Outward Sales";
+      return `
         <TALLYMESSAGE xmlns:UDF="TallyUDF">
-          <!-- MATERIAL OUT ADAPTER PLACEHOLDER: ${xml(entry.externalId)} ${xml(entry.title)} × ${entry.quantity} -->
-        </TALLYMESSAGE>`).join("");
+          <VOUCHER REMOTEID="${xml(entry.externalId)}" VCHTYPE="Outward Material" ACTION="Create">
+            <DATE>${tallyDate(entry.eventDate)}</DATE>
+            <VOUCHERTYPENAME>Outward Material</VOUCHERTYPENAME>
+            <VOUCHERNUMBER>${xml(entry.externalId)}</VOUCHERNUMBER>
+            <NARRATION>${xml(`Material issued to ${entry.destinationName}`)}</NARRATION>
+            <ALLINVENTORYENTRIES.LIST>
+              <STOCKITEMNAME>${xml(entry.issuedItemName)}</STOCKITEMNAME>
+              <ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE>
+              <ACTUALQTY>-${entry.quantity}</ACTUALQTY>
+              <BILLEDQTY>-${entry.quantity}</BILLEDQTY>
+              <ACCOUNTINGALLOCATIONS.LIST>
+                <LEDGERNAME>${xml(ledgerName)}</LEDGERNAME>
+                <ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE>
+                <AMOUNT>-${entry.quantity}</AMOUNT>
+              </ACCOUNTINGALLOCATIONS.LIST>
+            </ALLINVENTORYENTRIES.LIST>
+          </VOUCHER>
+        </TALLYMESSAGE>`;
+    }).join("");
+  }
+
+  private buildRejectedMaterialOutXml(entries: ReturnType<StoresDatabase["approvedEntries"]>): string {
+    const messages: string[] = [];
+    for (const entry of entries) {
+      const rows = this.database.db.prepare(`
+        SELECT g.voucher_date, g.voucher_number, supplier.name AS supplier_name,
+          item.name AS item_name, gl.rejected_quantity, gl.id AS line_id
+        FROM grns g
+        JOIN grn_lines gl ON gl.grn_id = g.id
+        JOIN tally_stock_items item ON item.id = gl.stock_item_id
+        LEFT JOIN suppliers supplier ON supplier.id = g.supplier_id
+        WHERE g.id = ? AND gl.rejected_quantity > 0
+      `).all(Number(entry.entityId)) as Row[];
+      for (const row of rows) {
+        const externalId = `${entry.externalId}-REJECTION-${row.line_id}`;
+        messages.push(`
+        <TALLYMESSAGE xmlns:UDF="TallyUDF">
+          <VOUCHER REMOTEID="${xml(externalId)}" VCHTYPE="Outward Material" ACTION="Create">
+            <DATE>${tallyDate(text(row.voucher_date))}</DATE>
+            <VOUCHERTYPENAME>Outward Material</VOUCHERTYPENAME>
+            <VOUCHERNUMBER>${xml(`${row.voucher_number}-REJECTION`)}</VOUCHERNUMBER>
+            <PARTYLEDGERNAME>${xml(row.supplier_name)}</PARTYLEDGERNAME>
+            <NARRATION>${xml(`Purchase rejection from ${row.voucher_number}`)}</NARRATION>
+            <ALLINVENTORYENTRIES.LIST>
+              <STOCKITEMNAME>${xml(row.item_name)}</STOCKITEMNAME>
+              <ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE>
+              <ACTUALQTY>-${Number(row.rejected_quantity)}</ACTUALQTY>
+              <BILLEDQTY>-${Number(row.rejected_quantity)}</BILLEDQTY>
+              <ACCOUNTINGALLOCATIONS.LIST>
+                <LEDGERNAME>Out - Purchase Rejection</LEDGERNAME>
+                <ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE>
+                <AMOUNT>-${Number(row.rejected_quantity)}</AMOUNT>
+              </ACCOUNTINGALLOCATIONS.LIST>
+            </ALLINVENTORYENTRIES.LIST>
+          </VOUCHER>
+        </TALLYMESSAGE>`);
+      }
+    }
+    return messages.join("");
   }
 }

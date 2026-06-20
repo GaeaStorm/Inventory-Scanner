@@ -1,7 +1,7 @@
 import { Fragment, useMemo, useState } from "react";
 import * as XLSX from "xlsx";
 
-import { operationalStockItems } from "./stock-item-visibility";
+import { finishedProductItems } from "./stock-item-visibility";
 import type { PlanningState, SaveProductOrderInput, StoresState } from "./types";
 
 interface Props {
@@ -63,7 +63,7 @@ export default function ProductOrderPlanner({ planning, stores, onChanged, onNot
   const [expanded, setExpanded] = useState("");
   const [busy, setBusy] = useState(false);
   const selectableItems = useMemo(
-    () => operationalStockItems(stores.stockItems),
+    () => finishedProductItems(stores.stockItems),
     [stores.stockItems],
   );
   const activeBomProducts = useMemo(

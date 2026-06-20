@@ -12,6 +12,8 @@ export type AdjustmentReason =
   | "DAMAGE_OR_LOSS"
   | "OTHER";
 
+export type CatalogRole = "FINISHED_PRODUCT" | "COMPONENT" | "ACCESSORY" | "PACKAGING" | "OTHER";
+
 export type ReviewStatus =
   | "PENDING"
   | "APPROVED"
@@ -30,9 +32,19 @@ export interface StoresStockItem {
   hasBom: boolean;
   tallyClosingQuantity: number;
   localAvailableQuantity: number;
+  localPendingInspectionQuantity: number;
+  localFaultyQuantity: number;
+  expiredQuantity: number;
+  expiringSoonQuantity: number;
+  serializedQuantity: number;
   active: boolean;
   source: "TALLY" | "LOCAL";
   catalogStatus: "ACTIVE" | "DUPLICATE" | "OBSOLETE";
+  catalogRole: CatalogRole;
+  itemRoleOverride: CatalogRole | null;
+  ignored: boolean;
+  itemIgnored: boolean;
+  groupIgnored: boolean;
   duplicateOfTallyGuid: string | null;
   duplicateOfName: string | null;
 }
@@ -94,6 +106,14 @@ export interface StoresPurchaseLot {
   challanNumber: string;
   quantityReceived: number;
   quantityRemaining: number;
+  pendingInspectionQuantity: number;
+  faultyQuantity: number;
+  batchNumber: string;
+  serialNumbers: string[];
+  manufacturingDate: string;
+  expiryDate: string;
+  supplierLotReference: string;
+  traceabilityNotes: string;
   rate: number | null;
   value: number | null;
   legacyWarning: boolean;
@@ -117,6 +137,12 @@ export interface StoresMovement {
   adjustmentReason: AdjustmentReason | null;
   adjustmentNote: string;
   referenceMovementId: string;
+  operatorName: string;
+  operatorRole: string;
+  productOrderId: string;
+  stockCondition: string;
+  batchNumber: string;
+  serialNumbers: string[];
 }
 
 export interface StoresFifoAllocation {
@@ -202,6 +228,13 @@ export interface StoresOpeningQuantityAdjustment {
 
 export type StoresDataMode = "empty" | "demo" | "tally";
 
+export interface StoresCatalogGroup {
+  name: string;
+  role: CatalogRole;
+  ignored: boolean;
+  itemCount: number;
+}
+
 export interface StoresState {
   database: StoresDatabaseStatus;
   dataMode: StoresDataMode;
@@ -216,6 +249,7 @@ export interface StoresState {
   recentMovements: StoresMovement[];
   reviewEntries: StoresReviewEntry[];
   openingQuantityAdjustments: StoresOpeningQuantityAdjustment[];
+  catalogGroups: StoresCatalogGroup[];
   exportSchemaVersion: string;
   materialOutXmlConfigured: boolean;
 }
@@ -229,6 +263,22 @@ export interface SetCatalogStatusInput {
   tallyItemGuid: string;
   status: "ACTIVE" | "DUPLICATE" | "OBSOLETE";
   duplicateOfTallyGuid?: string | null;
+}
+
+export interface SetCatalogClassificationInput {
+  scope: "ITEM" | "GROUP";
+  tallyItemGuid?: string;
+  groupName?: string;
+  role: CatalogRole;
+  ignored: boolean;
+}
+
+export interface GeneratedExportFile {
+  path: string;
+  name: string;
+  extension: string;
+  sizeBytes: number;
+  modifiedAt: string;
 }
 
 export interface RenameStockItemInput {
@@ -268,6 +318,23 @@ export interface VendorReceiptInput {
 export interface BulkVendorReceiptLineInput {
   tallyItemGuid: string;
   quantity: number;
+  rejectedQuantity?: number;
+  acceptedQuantity?: number;
+  pendingInspectionQuantity?: number;
+  faultyQuantity?: number;
+  expectedQuantity?: number;
+  discrepancyType?: "" | "SHORT_DELIVERY" | "EXCESS_DELIVERY" | "WRONG_ITEM" | "DAMAGED" | "NON_FUNCTIONAL" | "OTHER";
+  wrongItemTallyGuid?: string;
+  faultReason?: string;
+  batchNumber?: string;
+  serialNumbers?: string[];
+  availableSerialNumbers?: string[];
+  pendingSerialNumbers?: string[];
+  faultySerialNumbers?: string[];
+  manufacturingDate?: string;
+  expiryDate?: string;
+  supplierLotReference?: string;
+  traceabilityNotes?: string;
 }
 
 export interface BulkVendorReceiptInput {
@@ -293,6 +360,11 @@ export interface MaterialOutInput {
   destinationTallyItemGuid: string;
   quantity: number;
   eventDate?: string;
+  productOrderId?: string;
+  substitutionForTallyGuid?: string;
+  additionalConsumption?: boolean;
+  notes?: string;
+  serialNumbers?: string[];
 }
 
 export interface AdjustmentInput {
@@ -305,6 +377,9 @@ export interface AdjustmentInput {
   reason: AdjustmentReason;
   note?: string;
   eventDate?: string;
+  targetCondition?: "AVAILABLE" | "PENDING_INSPECTION" | "FAULTY";
+  serialNumbers?: string[];
+  productOrderId?: string;
 }
 
 export interface AdjustmentContext {
@@ -334,6 +409,8 @@ export type StoresOfflineOperation =
 
 export interface StoresOfflineBatchInput {
   deviceId: string;
+  operator?: string;
+  localTimestamp?: string;
   operations: StoresOfflineOperation[];
 }
 
@@ -342,6 +419,7 @@ export interface StoresOfflineBatchItemResult {
   status: "ACCEPTED" | "REJECTED" | "RETRY";
   movement?: StoresMovement;
   error?: string;
+  exceptionId?: string;
 }
 
 export interface StoresOfflineBatchResult {

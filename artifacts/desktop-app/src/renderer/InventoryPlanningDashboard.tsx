@@ -19,7 +19,7 @@ type PlanningSection = "action" | "boms" | "orders";
 
 const sections: Array<{ id: PlanningSection; label: string }> = [
   { id: "action", label: "Action Center" },
-  { id: "boms", label: "Product Definitions" },
+  { id: "boms", label: "Product BOMs" },
   { id: "orders", label: "Stock Planning" },
 ];
 

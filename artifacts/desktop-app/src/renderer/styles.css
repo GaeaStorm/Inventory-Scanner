@@ -1828,7 +1828,7 @@ code {
 .bulk-receipt-line {
   display: grid;
   min-width: 900px;
-  grid-template-columns: minmax(250px, 2fr) 110px 135px 110px 130px 70px;
+  grid-template-columns: minmax(250px, 2fr) 110px 135px 110px 130px 110px minmax(110px, auto);
   gap: 10px;
   align-items: center;
   border-bottom: 1px solid #edf0f5;
@@ -2760,5 +2760,94 @@ code {
     left: 16px;
     right: 16px;
     width: auto;
+  }
+}
+
+/* Receiving inspection and optional traceability */
+.bulk-receipt-inspection-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 36px;
+  font-size: 11pt;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.bulk-receipt-inspection-toggle input {
+  width: 18px;
+  height: 18px;
+  margin: 0;
+}
+
+.bulk-receipt-lines.table-scroll {
+  display: block;
+  overflow-x: auto;
+}
+
+.bulk-receipt-row {
+  min-width: 980px;
+}
+
+.bulk-receipt-line--inspection {
+  grid-template-columns: minmax(250px, 2fr) 110px 135px 110px 130px 110px minmax(110px, auto);
+}
+
+.table-sort-button {
+  border: 0;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  font: inherit;
+  font-weight: inherit;
+  padding: 0;
+  text-align: inherit;
+}
+
+.bulk-receipt-row-actions {
+  flex-wrap: nowrap;
+  justify-content: flex-end;
+}
+
+.bulk-receipt-line-details {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(180px, 1fr));
+  gap: 12px;
+  padding: 16px;
+  border-bottom: 1px solid var(--border);
+  background: color-mix(in srgb, var(--surface-muted) 74%, transparent);
+}
+
+.bulk-receipt-line-details label {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+  font-size: 11pt;
+  font-weight: 700;
+}
+
+.bulk-receipt-line-details input,
+.bulk-receipt-line-details select,
+.bulk-receipt-line-details textarea {
+  width: 100%;
+  min-width: 0;
+}
+
+.bulk-receipt-line-details textarea {
+  min-height: 72px;
+  resize: vertical;
+}
+
+.bulk-receipt-trace-notes {
+  grid-column: span 3;
+}
+
+@media (max-width: 900px) {
+  .bulk-receipt-line-details {
+    grid-template-columns: repeat(2, minmax(170px, 1fr));
+  }
+
+  .bulk-receipt-trace-notes {
+    grid-column: span 2;
   }
 }

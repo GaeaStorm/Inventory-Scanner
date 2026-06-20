@@ -428,12 +428,7 @@ export default function BoxScannerScreen() {
     setSuccess("");
     try {
       if (workflow === "ADJUSTMENT") {
-        if (!adjustmentConfirmed) {
-          throw new Error("Confirm that this adjustment belongs to the selected item and destination.");
-        }
-        if (adjustmentReason.id === "OTHER" && !adjustmentNote.trim()) {
-          throw new Error("Describe the adjustment when the reason is Other.");
-        }
+        setAdjustmentDirection("RETURN_TO_STOCK");
       }
 
       const clientTransactionId = await createStoresClientTransactionId();
@@ -452,9 +447,9 @@ export default function BoxScannerScreen() {
             tallyItemGuid: selectedItem.tallyGuid,
             destinationTallyItemGuid: destination.tallyGuid,
             quantity: qty,
-            direction: adjustmentDirection,
-            reason: adjustmentReason.id,
-            note: adjustmentNote.trim(),
+            direction: "RETURN_TO_STOCK" as const,
+            reason: "OTHER" as const,
+            note: "New Material In entry",
             eventDate: today(),
           };
 
@@ -496,13 +491,7 @@ export default function BoxScannerScreen() {
   if (!permission.granted) return <View style={[styles.permissionContainer, { backgroundColor: c.background }]}><Feather name="camera" size={48} color={c.mutedForeground} /><Text style={[styles.permissionTitle, { color: c.foreground }]}>Camera Access Required</Text><Text style={[styles.permissionText, { color: c.mutedForeground }]}>Allow camera access to scan inventory box labels.</Text><TouchableOpacity style={[styles.permissionBtn, { backgroundColor: colors.light.primary }]} onPress={requestPermission}><Text style={styles.permissionBtnText}>Allow Camera</Text></TouchableOpacity></View>;
 
   const validQuantity = Number.isInteger(Number(quantity)) && Number(quantity) > 0;
-  const adjustmentReady = workflow !== "ADJUSTMENT" || Boolean(
-    (adjustmentContext || connectionState !== "online") &&
-    adjustmentConfirmed &&
-    adjustmentReason &&
-    (adjustmentReason.id !== "OTHER" || adjustmentNote.trim()),
-  );
-  const canSubmit = Boolean(selectedItem && destination && validQuantity && adjustmentReady);
+  const canSubmit = Boolean(selectedItem && destination && validQuantity);
 
   return (
     <View style={styles.container}>
@@ -535,36 +524,13 @@ export default function BoxScannerScreen() {
                 <Text style={[styles.label, { color: c.mutedForeground }]}>STORE WORKFLOW</Text>
                 <View style={styles.workflowWrap}>{([
                   ["MATERIAL_OUT", "Material Out", "upload"],
-                  ["ADJUSTMENT", "Adjustment", "sliders"],
+                  ["ADJUSTMENT", "Material In", "download"],
                 ] as const).map(([value, label, icon]) => <TouchableOpacity key={value} style={[styles.workflowButton, { borderColor: workflow === value ? colors.light.primary : c.border, backgroundColor: workflow === value ? colors.light.primary : c.background }]} onPress={() => { setWorkflow(value); setError(""); setAdjustmentConfirmed(false); }}><Feather name={icon} size={15} color={workflow === value ? "#fff" : c.foreground} /><Text style={[styles.workflowText, { color: workflow === value ? "#fff" : c.foreground }]}>{label}</Text></TouchableOpacity>)}</View>
               </View>
 
               {catalog && <Dropdown label="DESTINATION PRODUCT" value={destination} values={catalog.destinations} display={(item) => item.name} detail={(item) => item.hasBom ? "Has BOM" : item.parentName} onChange={(item) => { setDestination(item); setAdjustmentConfirmed(false); }} colors={c} required />}
 
-              {workflow === "ADJUSTMENT" && <>
-                <View style={styles.section}>
-                  <Text style={[styles.label, { color: c.mutedForeground }]}>ADJUSTMENT EFFECT *</Text>
-                  <View style={styles.workflowWrap}>
-                    <TouchableOpacity style={[styles.workflowButton, { borderColor: adjustmentDirection === "RETURN_TO_STOCK" ? colors.light.primary : c.border, backgroundColor: adjustmentDirection === "RETURN_TO_STOCK" ? colors.light.primary : c.background }]} onPress={() => { setAdjustmentDirection("RETURN_TO_STOCK"); setAdjustmentConfirmed(false); }}><Feather name="corner-up-left" size={15} color={adjustmentDirection === "RETURN_TO_STOCK" ? "#fff" : c.foreground} /><Text style={[styles.workflowText, { color: adjustmentDirection === "RETURN_TO_STOCK" ? "#fff" : c.foreground }]}>Return count to stock</Text></TouchableOpacity>
-                    <TouchableOpacity style={[styles.workflowButton, { borderColor: adjustmentDirection === "ADDITIONAL_OUT" ? colors.light.primary : c.border, backgroundColor: adjustmentDirection === "ADDITIONAL_OUT" ? colors.light.primary : c.background }]} onPress={() => { setAdjustmentDirection("ADDITIONAL_OUT"); setAdjustmentConfirmed(false); }}><Feather name="plus-circle" size={15} color={adjustmentDirection === "ADDITIONAL_OUT" ? "#fff" : c.foreground} /><Text style={[styles.workflowText, { color: adjustmentDirection === "ADDITIONAL_OUT" ? "#fff" : c.foreground }]}>Record additional issue</Text></TouchableOpacity>
-                  </View>
-                </View>
-
-                <Dropdown label="CAUSE" value={adjustmentReason} values={ADJUSTMENT_REASONS} display={(reason) => reason.name} detail={(reason) => reason.detail} onChange={(reason) => setAdjustmentReason(reason)} colors={c} required />
-
-                {adjustmentReason.id === "OTHER" && <View style={styles.section}><Text style={[styles.label, { color: c.mutedForeground }]}>ADJUSTMENT NOTES *</Text><TextInput value={adjustmentNote} onChangeText={setAdjustmentNote} multiline placeholder="Describe why this adjustment is needed" placeholderTextColor={c.mutedForeground} style={[styles.adjustmentNotes, { color: c.foreground, borderColor: c.border, backgroundColor: c.background }]} /></View>}
-
-                <View style={[styles.adjustmentContext, { borderColor: c.border, backgroundColor: c.background }]}>
-                  {loadingAdjustmentContext ? <><ActivityIndicator color={colors.light.primary} /><Text style={[styles.adjustmentContextText, { color: c.mutedForeground }]}>Finding the most recent matching Material Out for today…</Text></> : adjustmentContext ? <>
-                    <View style={styles.adjustmentContextTitle}><Feather name="clock" size={17} color={colors.light.primary} /><Text style={[styles.dropdownPrimary, { color: c.foreground }]}>Most recent same-day issue found</Text></View>
-                    <Text style={[styles.adjustmentContextText, { color: c.mutedForeground }]}>{adjustmentContext.issuedItemName} → {adjustmentContext.destinationName}</Text>
-                    <Text style={[styles.adjustmentContextText, { color: c.mutedForeground }]}>Current pending total: {adjustmentContext.pendingQuantity} · Last transaction: {adjustmentContext.latestMovementQuantity}</Text>
-                    <Text style={[styles.adjustmentContextMeta, { color: c.mutedForeground }]}>{new Date(adjustmentContext.latestMovementCreatedAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })} · {adjustmentContext.status}</Text>
-                  </> : <><Feather name={connectionState === "offline" ? "wifi-off" : "alert-circle"} size={18} color={connectionState === "offline" ? "#8a5a00" : "#b42318"} /><Text style={connectionState === "offline" ? [styles.adjustmentContextText, { color: "#8a5a00" }] : styles.adjustmentContextError}>{adjustmentContextError || "Select an item and destination to find today's matching Material Out."}</Text></>}
-                </View>
-
-                <TouchableOpacity style={[styles.confirmAdjustment, { borderColor: adjustmentConfirmed ? colors.light.primary : c.border, backgroundColor: adjustmentConfirmed ? "rgba(83,111,229,.10)" : c.background }]} disabled={!adjustmentContext && connectionState === "online"} onPress={() => setAdjustmentConfirmed((current) => !current)}><Feather name={adjustmentConfirmed ? "check-square" : "square"} size={19} color={adjustmentConfirmed ? colors.light.primary : c.mutedForeground} /><Text style={[styles.confirmAdjustmentText, { color: c.foreground }]}>I confirm this adjustment belongs to the selected item and destination. Offline entries will be matched and validated when synchronized.</Text></TouchableOpacity>
-              </>}
+              {workflow === "ADJUSTMENT" && <Text style={styles.offlineNotice}>This records a new Material In entry. It does not modify or link back to a previous Material Out transaction.</Text>}
 
               <View style={styles.section}><Text style={[styles.label, { color: c.mutedForeground }]}>QUANTITY (WHOLE COUNT) *</Text><View style={styles.stepper}><TouchableOpacity style={[styles.stepButton, { backgroundColor: c.muted }]} onPress={() => setQuantity(String(Math.max(1, Number(quantity || 1) - 1)))}><Feather name="minus" size={20} color={c.foreground} /></TouchableOpacity><TextInput value={quantity} onChangeText={(value) => /^\d*$/.test(value) && setQuantity(value)} keyboardType="number-pad" selectTextOnFocus style={[styles.quantityInput, { color: c.foreground, borderColor: c.border, backgroundColor: c.background }]} /><TouchableOpacity style={[styles.stepButton, { backgroundColor: c.muted }]} onPress={() => setQuantity(String(Number(quantity || 0) + 1))}><Feather name="plus" size={20} color={c.foreground} /></TouchableOpacity></View></View>
 

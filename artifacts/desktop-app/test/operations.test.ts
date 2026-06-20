@@ -1,0 +1,489 @@
+import assert from "node:assert/strict";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import test from "node:test";
+
+import { ApplicationDatabase } from "../src/database/application-database";
+import { OperationsDatabase } from "../src/operations/database";
+import { permissionsForRole, requirePermission } from "../src/operations/permissions";
+import type { ActorContext, ConditionBalance } from "../src/operations/types";
+import { PlanningDatabase } from "../src/planning/database";
+import { traceabilityColumns } from "../src/renderer/traceability";
+import { StoresDatabase } from "../src/stores/database";
+import type { BulkVendorReceiptInput } from "../src/stores/types";
+
+interface Context {
+  directory: string;
+  host: ApplicationDatabase;
+  stores: StoresDatabase;
+  planning: PlanningDatabase;
+  operations: OperationsDatabase;
+  actor: ActorContext;
+  supplierId: number;
+  componentGuid: string;
+  productGuid: string;
+}
+
+function createContext(): Context {
+  const directory = mkdtempSync(path.join(tmpdir(), "inventory-operations-"));
+  const host = new ApplicationDatabase(StoresDatabase.databasePathFor(directory));
+  const stores = new StoresDatabase(directory, host);
+  const planning = new PlanningDatabase(host);
+  const operations = new OperationsDatabase(host);
+  const session = operations.bootstrapAdmin({
+    displayName: "Test Administrator",
+    username: "administrator",
+    credential: "correct-horse-battery-staple",
+  });
+  const actor = operations.actorForToken(session.token);
+  assert.ok(actor);
+  const component = stores.createLocalStockItem({ name: "Test Component", parentName: "COMPONENTS" });
+  const product = stores.createLocalStockItem({ name: "Test Product", parentName: "MANUFACTURED PRODUCTS" });
+  const supplierId = Number(host.db.prepare(
+    "INSERT INTO suppliers(tally_guid, name, synced_at) VALUES (?, ?, ?)",
+  ).run("SUPPLIER:TEST", "Test Supplier", new Date().toISOString()).lastInsertRowid);
+  return {
+    directory,
+    host,
+    stores,
+    planning,
+    operations,
+    actor,
+    supplierId,
+    componentGuid: component.tallyGuid,
+    productGuid: product.tallyGuid,
+  };
+}
+
+function closeContext(context: Context): void {
+  context.host.close();
+  rmSync(context.directory, { recursive: true, force: true });
+}
+
+function receive(
+  context: Context,
+  id: string,
+  values: Partial<BulkVendorReceiptInput["lines"][number]> = {},
+): ReturnType<StoresDatabase["recordBulkVendorReceipt"]> {
+  const quantity = values.quantity ?? 10;
+  const input: BulkVendorReceiptInput = {
+    clientTransactionId: id,
+    supplierId: context.supplierId,
+    challanNumber: `CH-${id}`,
+    challanDate: "2026-06-19",
+    receiptDate: "2026-06-19",
+    nonPoException: true,
+    lines: [{
+      tallyItemGuid: context.componentGuid,
+      quantity,
+      ...values,
+    }],
+  };
+  const result = context.stores.recordBulkVendorReceipt(input);
+  context.operations.registerBulkReceipt(input, result, context.actor);
+  return result;
+}
+
+function balance(context: Context, condition: "AVAILABLE" | "PENDING_INSPECTION" | "FAULTY"): ConditionBalance {
+  const row = context.operations.getState().balances.find((entry) => entry.tallyItemGuid === context.componentGuid && entry.condition === condition);
+  assert.ok(row, `Expected a ${condition} balance`);
+  return row;
+}
+
+test("catalog group roles and item ignore overrides drive planning visibility", () => {
+  const context = createContext();
+  try {
+    context.stores.setCatalogClassification({
+      scope: "GROUP",
+      groupName: "MANUFACTURED PRODUCTS",
+      role: "FINISHED_PRODUCT",
+      ignored: false,
+    });
+    context.stores.setCatalogClassification({
+      scope: "GROUP",
+      groupName: "COMPONENTS",
+      role: "COMPONENT",
+      ignored: false,
+    });
+    let state = context.stores.getState();
+    assert.equal(state.stockItems.find((item) => item.tallyGuid === context.productGuid)?.catalogRole, "FINISHED_PRODUCT");
+    assert.equal(state.stockItems.find((item) => item.tallyGuid === context.componentGuid)?.catalogRole, "COMPONENT");
+
+    context.stores.setCatalogClassification({
+      scope: "ITEM",
+      tallyItemGuid: context.componentGuid,
+      role: "ACCESSORY",
+      ignored: true,
+    });
+    state = context.stores.getState();
+    assert.equal(state.stockItems.find((item) => item.tallyGuid === context.componentGuid)?.ignored, true);
+    assert.equal(context.planning.getState().items.some((item) => item.tallyItemGuid === context.componentGuid), false);
+  } finally {
+    closeContext(context);
+  }
+});
+
+test("migrations are additive and receipt splits keep only AVAILABLE in the legacy FIFO balance", () => {
+  const context = createContext();
+  try {
+    receive(context, "receipt-split", {
+      quantity: 10,
+      acceptedQuantity: 5,
+      pendingInspectionQuantity: 3,
+      faultyQuantity: 2,
+      batchNumber: "BATCH-1",
+      supplierLotReference: "SUP-LOT-1",
+      expiryDate: "2026-07-01",
+      availableSerialNumbers: ["A-1", "A-2", "A-3", "A-4", "A-5"],
+      pendingSerialNumbers: ["P-1", "P-2", "P-3"],
+      faultySerialNumbers: ["F-1", "F-2"],
+      faultReason: "Damaged on arrival",
+    });
+    assert.equal(context.operations.moduleVersion, 3);
+    assert.equal(balance(context, "AVAILABLE").quantity, 5);
+    assert.equal(balance(context, "PENDING_INSPECTION").quantity, 3);
+    assert.equal(balance(context, "FAULTY").quantity, 2);
+    assert.equal(Number((context.host.db.prepare("SELECT quantity_remaining FROM purchase_lots").get() as any).quantity_remaining), 5);
+    assert.throws(() => context.stores.recordMaterialOut({
+      clientTransactionId: "issue-too-many",
+      boxId: "",
+      tallyItemGuid: context.componentGuid,
+      destinationTallyItemGuid: context.productGuid,
+      quantity: 6,
+      serialNumbers: ["A-1", "A-2", "A-3", "A-4", "A-5", "P-1"],
+    }), /Insufficient local stock/);
+    assert.equal(context.operations.getState().faults.length, 1);
+    assert.deepEqual(traceabilityColumns(context.operations.getState().balances), {
+      batch: true,
+      serial: true,
+      expiry: true,
+      supplierLot: true,
+    });
+    const migrationRows = context.host.db.prepare(
+      "SELECT version FROM application_module_migrations WHERE module_name = 'operations' ORDER BY version",
+    ).all() as Array<{ version: number }>;
+    assert.deepEqual(migrationRows.map((row) => Number(row.version)), [1, 2, 3]);
+  } finally {
+    closeContext(context);
+  }
+});
+
+test("role permissions are enforced independently of renderer visibility", () => {
+  const store: ActorContext = { userId: "u-store", displayName: "Store", username: "store", role: "STORE", auditIdentity: "STORE" };
+  const sales: ActorContext = { userId: "u-sales", displayName: "Sales", username: "sales", role: "SALES", auditIdentity: "SALES" };
+  assert.ok(permissionsForRole("STORE").includes("STOCK_COUNT"));
+  assert.ok(permissionsForRole("ACCOUNTS").includes("TALLY_REVIEW"));
+  assert.ok(permissionsForRole("PRODUCTION").includes("PRODUCTION_EXECUTE"));
+  assert.ok(permissionsForRole("SALES").includes("CUSTOMER_RETURN_INITIATE"));
+  assert.equal(requirePermission(store, "RECEIVE_MATERIAL"), store);
+  assert.throws(() => requirePermission(sales, "STOCK_ADJUST"), /does not have permission/);
+});
+
+test("condition transitions, serial uniqueness, supplier faults, partial resolution, return and scrap stay auditable", () => {
+  const context = createContext();
+  try {
+    receive(context, "receipt-lifecycle", {
+      quantity: 6,
+      acceptedQuantity: 4,
+      pendingInspectionQuantity: 2,
+      availableSerialNumbers: ["SER-1", "SER-2", "SER-3", "SER-4"],
+      pendingSerialNumbers: ["SER-5", "SER-6"],
+    });
+    const pending = balance(context, "PENDING_INSPECTION");
+    context.operations.transitionCondition({
+      clientTransactionId: "inspect-release",
+      tallyItemGuid: context.componentGuid,
+      lotId: pending.lotId,
+      quantity: 1,
+      fromCondition: "PENDING_INSPECTION",
+      toCondition: "AVAILABLE",
+      reason: "Passed inspection",
+      serialNumbers: ["SER-5"],
+    }, context.actor);
+    const fault = context.operations.createFault({
+      clientTransactionId: "late-fault",
+      tallyItemGuid: context.componentGuid,
+      lotId: pending.lotId,
+      quantity: 2,
+      sourceCondition: "AVAILABLE",
+      discoveryPoint: "IN_STORES",
+      faultReason: "Failed functional test",
+      serialNumbers: ["SER-1", "SER-2"],
+    }, context.actor);
+    const partial = context.operations.resolveFault({
+      clientTransactionId: "fault-partial-credit",
+      faultId: fault.id,
+      quantity: 1,
+      resolution: "CREDIT_NOTE_RECEIVED",
+      reference: "CN-1",
+      expectedVersion: fault.version,
+    }, context.actor);
+    assert.equal(partial.status, "PARTIALLY_RESOLVED");
+    const returned = context.operations.resolveFault({
+      clientTransactionId: "fault-return",
+      faultId: fault.id,
+      quantity: 1,
+      resolution: "RETURNED_TO_SUPPLIER",
+      reference: "SRT-1",
+      expectedVersion: partial.version,
+      serialNumbers: ["SER-1"],
+    }, context.actor);
+    assert.equal(returned.status, "RESOLVED");
+    context.operations.scrap({
+      clientTransactionId: "scrap-pending",
+      tallyItemGuid: context.componentGuid,
+      lotId: pending.lotId,
+      quantity: 1,
+      sourceCondition: "PENDING_INSPECTION",
+      reason: "Destroyed during inspection",
+      serialNumbers: ["SER-6"],
+    }, context.actor);
+    assert.throws(() => receive(context, "duplicate-serial", {
+      quantity: 1,
+      acceptedQuantity: 1,
+      availableSerialNumbers: ["SER-3"],
+    }), /Serial number.*already exists|UNIQUE/i);
+    const replacementFault = context.operations.createFault({
+      clientTransactionId: "replacement-fault",
+      tallyItemGuid: context.componentGuid,
+      lotId: pending.lotId,
+      quantity: 1,
+      sourceCondition: "AVAILABLE",
+      discoveryPoint: "IN_STORES",
+      faultReason: "Intermittent failure",
+      serialNumbers: ["SER-3"],
+    }, context.actor);
+    context.operations.resolveFault({
+      clientTransactionId: "replacement-received",
+      faultId: replacementFault.id,
+      quantity: 1,
+      resolution: "REPLACEMENT_RECEIVED",
+      targetCondition: "PENDING_INSPECTION",
+      reference: "REPL-1",
+      serialNumbers: ["REPLACEMENT-1"],
+      expectedVersion: replacementFault.version,
+    }, context.actor);
+    const state = context.operations.getState();
+    assert.ok(state.balances.some((entry) => entry.condition === "PENDING_INSPECTION" && entry.serialNumbers.includes("REPLACEMENT-1")));
+    assert.ok(state.movements.some((movement) => movement.movementType === "SUPPLIER_RETURN"));
+    assert.ok(state.movements.some((movement) => movement.movementType === "SCRAP"));
+    assert.ok(state.manualTallyReviews.some((entry) => entry.movementType === "SUPPLIER_RETURN"));
+    assert.ok(state.manualTallyReviews.some((entry) => entry.movementType === "SCRAP"));
+    const supplierReturn = state.supplierReturns[0] as any;
+    const updatedReturn = context.operations.updateSupplierReturn({
+      returnId: String(supplierReturn.id),
+      replacementStatus: "EXPECTED",
+      creditStatus: "NOT_EXPECTED",
+      notes: "Replacement due next week",
+      expectedVersion: Number(supplierReturn.version),
+    }, context.actor) as any;
+    assert.equal(updatedReturn.replacementStatus, "EXPECTED");
+    assert.throws(() => context.operations.updateSupplierReturn({
+      returnId: String(supplierReturn.id),
+      replacementStatus: "RECEIVED",
+      creditStatus: "NOT_EXPECTED",
+      expectedVersion: Number(supplierReturn.version),
+    }, context.actor), /changed after it was opened/);
+  } finally {
+    closeContext(context);
+  }
+});
+
+test("stock counts account for post-snapshot movements and finalize explicit adjustment entries", () => {
+  const context = createContext();
+  try {
+    receive(context, "receipt-count", { quantity: 5 });
+    const session = context.operations.createCountSession({
+      clientTransactionId: "count-create",
+      name: "Cycle count",
+      scope: "CYCLE",
+      tallyItemGuids: [context.componentGuid],
+      includeAvailable: true,
+      includeFaulty: false,
+    }, context.actor);
+    const available = balance(context, "AVAILABLE");
+    context.operations.transitionCondition({
+      clientTransactionId: "post-count-fault",
+      tallyItemGuid: context.componentGuid,
+      lotId: available.lotId,
+      quantity: 1,
+      fromCondition: "AVAILABLE",
+      toCondition: "FAULTY",
+      reason: "Damaged after snapshot",
+    }, context.actor);
+    const entry = context.operations.recordCountEntry({
+      clientTransactionId: "count-entry",
+      sessionId: session.id,
+      tallyItemGuid: context.componentGuid,
+      condition: "AVAILABLE",
+      countedQuantity: 3,
+      reason: "COUNT_SHORTAGE",
+      notes: "One unit missing",
+      expectedVersion: session.version,
+    }, context.actor);
+    const line = entry.lines.find((candidate) => candidate.condition === "AVAILABLE");
+    assert.equal(line?.snapshotExpected, 5);
+    assert.equal(line?.postSnapshotMovement, -1);
+    assert.equal(line?.currentExpected, 4);
+    assert.equal(line?.variance, -1);
+    const finalized = context.operations.finalizeCount({
+      clientTransactionId: "count-finalize",
+      sessionId: session.id,
+      expectedVersion: entry.version,
+    }, context.actor);
+    assert.equal(finalized.status, "FINALIZED");
+    assert.ok(context.operations.getState().movements.some((movement) => movement.movementType === "COUNT_ADJUSTMENT_LOSS"));
+    assert.equal(balance(context, "AVAILABLE").quantity, 3);
+    const gainSession = context.operations.createCountSession({
+      clientTransactionId: "count-gain-create",
+      name: "Recovered stock",
+      scope: "CYCLE",
+      tallyItemGuids: [context.componentGuid],
+      includeAvailable: true,
+      includeFaulty: false,
+    }, context.actor);
+    const gainEntry = context.operations.recordCountEntry({
+      clientTransactionId: "count-gain-entry",
+      sessionId: gainSession.id,
+      tallyItemGuid: context.componentGuid,
+      condition: "AVAILABLE",
+      countedQuantity: 5,
+      reason: "RECOVERED_STOCK",
+      notes: "Two units found behind shelving",
+      expectedVersion: gainSession.version,
+    }, context.actor);
+    context.operations.finalizeCount({
+      clientTransactionId: "count-gain-finalize",
+      sessionId: gainSession.id,
+      expectedVersion: gainEntry.version,
+    }, context.actor);
+    assert.equal(context.operations.getState().balances
+      .filter((entry) => entry.tallyItemGuid === context.componentGuid && entry.condition === "AVAILABLE")
+      .reduce((sum, entry) => sum + entry.quantity, 0), 5);
+    assert.ok(context.operations.getState().movements.some((movement) => movement.movementType === "COUNT_ADJUSTMENT_GAIN"));
+  } finally {
+    closeContext(context);
+  }
+});
+
+test("production completion, customer returns, idempotency, reversals and synchronization exceptions remain linked", () => {
+  const context = createContext();
+  try {
+    receive(context, "receipt-production", { quantity: 8 });
+    const componentId = Number((context.host.db.prepare("SELECT id FROM tally_stock_items WHERE tally_guid = ?").get(context.componentGuid) as any).id);
+    const productId = Number((context.host.db.prepare("SELECT id FROM tally_stock_items WHERE tally_guid = ?").get(context.productGuid) as any).id);
+    const timestamp = new Date().toISOString();
+    context.host.db.prepare(`
+      INSERT INTO planning_product_orders(id, external_reference, product_item_id, quantity, required_date, status, notes, created_at, updated_at)
+      VALUES ('ORDER-1', 'PO-EXEC-1', ?, 2, '2026-06-30', 'CONFIRMED', '', ?, ?)
+    `).run(productId, timestamp, timestamp);
+    context.host.db.prepare(`
+      INSERT INTO planning_reservations(id, product_order_id, component_item_id, required_quantity, reserved_quantity, status, created_at, updated_at)
+      VALUES ('RES-1', 'ORDER-1', ?, 4, 4, 'ACTIVE', ?, ?)
+    `).run(componentId, timestamp, timestamp);
+    context.operations.releaseProductOrder("ORDER-1", "release-1", "Start build", context.actor);
+    const issueInput = {
+      clientTransactionId: "issue-production",
+      boxId: "",
+      tallyItemGuid: context.componentGuid,
+      destinationTallyItemGuid: context.productGuid,
+      quantity: 3,
+      productOrderId: "ORDER-1",
+      additionalConsumption: true,
+      notes: "Extra trial consumption",
+    };
+    const issue = context.stores.recordMaterialOut(issueInput);
+    context.operations.registerMaterialOut(issueInput, issue, context.actor);
+    context.operations.productionReturn({
+      clientTransactionId: "production-return",
+      tallyItemGuid: context.componentGuid,
+      quantity: 1,
+      originalMovementId: context.operations.getState().movements.find((movement) => movement.movementType === "MATERIAL_ISSUE")?.id,
+      productOrderId: "ORDER-1",
+      targetCondition: "AVAILABLE",
+    }, context.actor);
+    context.operations.productionReturn({
+      clientTransactionId: "unlinked-production-return",
+      tallyItemGuid: context.componentGuid,
+      quantity: 1,
+      targetCondition: "FAULTY",
+      explanation: "Material found after the issue paperwork was unavailable",
+    }, context.actor);
+    assert.ok(context.operations.getState().balances.some((entry) => entry.tallyItemGuid === context.componentGuid && entry.condition === "FAULTY" && entry.quantity > 0));
+    const completion = context.operations.productionCompletion({
+      clientTransactionId: "completion-1",
+      productOrderId: "ORDER-1",
+      tallyItemGuid: context.productGuid,
+      completedQuantity: 2,
+      availableQuantity: 1,
+      faultyQuantity: 1,
+      batchNumber: "FG-BATCH",
+      availableSerialNumbers: ["FG-1"],
+      faultySerialNumbers: ["FG-2"],
+    }, context.actor);
+    assert.equal(completion.finishedQuantity, 1);
+    assert.equal(completion.faultyFinishedQuantity, 1);
+    assert.equal(completion.expectedComponents[0]?.issuedQuantity, 3);
+    assert.equal(completion.expectedComponents[0]?.returnedQuantity, 1);
+    const request = context.operations.initiateCustomerReturn({
+      clientTransactionId: "customer-return-request",
+      externalReference: "SALE-1",
+      tallyItemGuid: context.productGuid,
+      quantity: 1,
+      serialNumbers: ["CUSTOMER-FG-1"],
+    }, context.actor);
+    context.operations.receiveCustomerReturn({
+      clientTransactionId: "customer-return-receive",
+      returnId: String((request as any).id),
+      condition: "PENDING_INSPECTION",
+      batchNumber: "RETURN-BATCH",
+      serialNumbers: ["CUSTOMER-FG-1"],
+    }, context.actor);
+    const firstException = context.operations.recordSyncException({
+      clientTransactionId: "offline-duplicate",
+      deviceId: "DEVICE-1",
+      operator: "Store User",
+      localTimestamp: timestamp,
+      operationType: "MATERIAL_OUT",
+      tallyItemGuid: context.componentGuid,
+      requestedQuantity: 99,
+      reason: "Insufficient available stock",
+      payload: issueInput,
+    });
+    const secondException = context.operations.recordSyncException({
+      clientTransactionId: "offline-duplicate",
+      deviceId: "DEVICE-1",
+      operator: "Store User",
+      localTimestamp: timestamp,
+      operationType: "MATERIAL_OUT",
+      tallyItemGuid: context.componentGuid,
+      requestedQuantity: 99,
+      reason: "Insufficient available stock",
+      payload: issueInput,
+    });
+    assert.equal(firstException.id, secondException.id);
+    context.operations.recordAuthorizedShortage(firstException, "authorized-shortage", "Approved exception", context.actor);
+    assert.ok(context.operations.getState().movements.some((movement) => movement.status === "EXCEPTION"));
+    const completionMovement = context.operations.getState().movements.find((movement) => movement.movementType === "PRODUCTION_COMPLETION");
+    assert.ok(completionMovement);
+    const reversed = context.operations.reverseMovement({
+      clientTransactionId: "reverse-completion",
+      movementId: completionMovement.id,
+      quantity: 1,
+      reason: "Incorrect finished-goods completion",
+      serialNumbers: ["FG-1"],
+    }, context.actor);
+    assert.equal(reversed.movementType, "TRANSACTION_REVERSAL");
+    const repeated = context.operations.reverseMovement({
+      clientTransactionId: "reverse-completion",
+      movementId: completionMovement.id,
+      quantity: 1,
+      reason: "Incorrect finished-goods completion",
+      serialNumbers: ["FG-1"],
+    }, context.actor);
+    assert.equal(repeated.id, reversed.id);
+  } finally {
+    closeContext(context);
+  }
+});

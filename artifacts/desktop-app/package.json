@@ -14,7 +14,8 @@
     "build": "pnpm run build:renderer && pnpm run build:electron",
     "package": "pnpm run build && electron-builder --dir",
     "dist": "pnpm run build && electron-builder",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "node ./scripts/run-tests.mjs"
   },
   "devDependencies": {
     "@types/express": "^5.0.6",

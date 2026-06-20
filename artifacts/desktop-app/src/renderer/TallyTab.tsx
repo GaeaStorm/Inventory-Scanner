@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useState } from "react";
 
 import type {
+  OperationsState,
+  GeneratedExportFile,
   StoresState,
   TallyCompany,
   TallyConnectionSettings,
@@ -8,7 +10,9 @@ import type {
 
 interface Props {
   stores: StoresState;
+  operations?: OperationsState | null;
   onChanged: (state: StoresState) => void;
+  onOperationsChanged?: () => Promise<void>;
 }
 
 const DEFAULT_SETTINGS: TallyConnectionSettings = {
@@ -26,21 +30,33 @@ function formatDate(value: string | null): string {
   return Number.isNaN(date.valueOf()) ? value : new Intl.DateTimeFormat("en-IN", { dateStyle: "medium", timeStyle: "short" }).format(date);
 }
 
-export default function TallyTab({ stores, onChanged }: Props) {
+function formatBytes(value: number): string {
+  if (value < 1024) return `${value} B`;
+  if (value < 1024 ** 2) return `${(value / 1024).toFixed(1)} KB`;
+  return `${(value / 1024 ** 2).toFixed(1)} MB`;
+}
+
+export default function TallyTab({ stores, operations, onChanged, onOperationsChanged }: Props) {
   const [settings, setSettings] = useState<TallyConnectionSettings>(DEFAULT_SETTINGS);
   const [companies, setCompanies] = useState<TallyCompany[]>([]);
   const [reviewer, setReviewer] = useState("");
   const [includeCsv, setIncludeCsv] = useState(true);
   const [search, setSearch] = useState("");
-  const [busy, setBusy] = useState<"test" | "sync" | "export" | "review" | "">("");
+  const [busy, setBusy] = useState<"test" | "sync" | "export" | "masters" | "review" | "">("");
   const [notice, setNotice] = useState("");
   const [error, setError] = useState("");
+  const [generatedFiles, setGeneratedFiles] = useState<GeneratedExportFile[]>([]);
+
+  async function refreshGeneratedFiles(): Promise<void> {
+    setGeneratedFiles(await window.desktop.stores.listGeneratedFiles());
+  }
 
   useEffect(() => {
     void window.desktop.tally.getState().then((state) => {
       setSettings(state.settings);
       setCompanies(state.cache?.companies ?? []);
     }).catch((reason) => setError(reason instanceof Error ? reason.message : String(reason)));
+    void refreshGeneratedFiles().catch(() => undefined);
   }, []);
 
   const filteredLots = useMemo(() => {
@@ -118,16 +134,54 @@ export default function TallyTab({ stores, onChanged }: Props) {
     }
   }
 
-  async function generateExport(): Promise<void> {
-    if (!reviewer.trim()) { setError("Enter the Chief of Staff / reviewer name before generating an export batch."); return; }
+
+  async function completeManualReview(reviewId: string, currentReference: string): Promise<void> {
+    const tallyVoucherReference = window.prompt(
+      "Enter the Tally voucher number or manual-processing reference:",
+      currentReference,
+    );
+    if (tallyVoucherReference === null) return;
+    if (!tallyVoucherReference.trim()) {
+      setError("A Tally voucher number or manual-processing reference is required.");
+      return;
+    }
+    setBusy("review"); setError(""); setNotice("");
+    try {
+      await window.desktop.operations.reviewManualTally({
+        reviewId,
+        status: "PROCESSED",
+        tallyVoucherReference: tallyVoucherReference.trim(),
+      });
+      await onOperationsChanged?.();
+      setNotice(`Manual Tally review recorded as ${tallyVoucherReference.trim()}.`);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function generateAllExports(): Promise<void> {
     setBusy("export"); setError(""); setNotice("");
     try {
       const result = await window.desktop.stores.exportBatch({ reviewedBy: reviewer.trim(), includeCsv });
+      const masters = await window.desktop.stores.exportCatalogCleanup();
       const next = await window.desktop.stores.getState();
       onChanged(next);
-      setNotice(`Generated Material In Excel, Material Out Excel, review Excel, ${result.csvPath ? "CSV, " : ""}and Tally XML in ${stores.database.exportFolder}.${result.warnings.length ? ` ${result.warnings.join(" ")}` : ""}`);
+      await refreshGeneratedFiles();
+      setNotice(`Generated the complete Tally file set: Material In, Material Out, voucher review, master/catalog, products, active BOMs, reorder levels, suppliers, open Purchase Orders${result.csvPath ? ", CSV" : ""}, and XML.${[...result.warnings, ...masters.warnings].length ? ` ${[...result.warnings, ...masters.warnings].join(" ")}` : ""}`);
     } catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)); }
     finally { setBusy(""); }
+  }
+
+  async function downloadFile(file: GeneratedExportFile): Promise<void> {
+    setError(""); setNotice("");
+    try {
+      const saved = await window.desktop.stores.downloadGeneratedFile(file.path);
+      if (saved) setNotice(`Downloaded ${file.name}.`);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    }
   }
 
   const counts = stores.reviewEntries.reduce<Record<string, number>>((result, entry) => {
@@ -138,7 +192,7 @@ export default function TallyTab({ stores, onChanged }: Props) {
   return (
     <section className="tab-page">
       <div className="page-heading">
-        <div><p className="eyebrow">READ FROM TALLY · REVIEW BEFORE IMPORT</p><h1>Tally Syncer</h1><p>Tally reads are limited to the Stores Catalog, supplier ledgers, Purchase Orders, Receipt Notes/GRNs, and Purchase data needed to complete lot rates. This patch never posts directly to Tally.</p></div>
+        <div><p className="eyebrow">READ FROM TALLY · EXPORT EVERYTHING TALLY-READY</p><h1>Tally Syncer</h1><p>Catalog reads, voucher review, Material In/Out, Stock Items, name changes, duplicate review, products, and active BOM definitions are managed here. Files are generated for review and import; the app does not post directly into Tally.</p></div>
         <button className="button button--secondary" type="button" onClick={() => void window.desktop.stores.openPath(stores.database.exportFolder)}>Open export folder</button>
       </div>
       {error && <div className="alert alert--error">{error}</div>}
@@ -176,14 +230,36 @@ export default function TallyTab({ stores, onChanged }: Props) {
         <article className="stat-card"><span className="stat-card__icon">✓</span><div><small>Approved</small><strong>{counts.APPROVED ?? 0}</strong><span>ready for generation</span></div></article>
       </section>
 
+      <article className="panel">
+        <div className="panel__header">
+          <div><p className="eyebrow">TALLY IMPORT FILES</p><h2>Generated file library</h2></div>
+          <button className="button" type="button" disabled={Boolean(busy)} onClick={() => void generateAllExports()}>{busy === "export" ? "Generating…" : "Generate"}</button>
+        </div>
+        <p className="table-footnote">Generate creates every available Tally-oriented workbook and XML file. Use the download icon to choose where to save a copy.</p>
+        <div className="table-scroll"><table><thead><tr><th>File</th><th>Type</th><th>Generated</th><th>Size</th><th /></tr></thead><tbody>
+          {generatedFiles.map((file) => <tr key={file.path}><td><strong>{file.name}</strong></td><td>{file.extension.toUpperCase()}</td><td>{formatDate(file.modifiedAt)}</td><td>{formatBytes(file.sizeBytes)}</td><td className="table-actions"><button className="button button--ghost button--small" type="button" title={`Download ${file.name}`} aria-label={`Download ${file.name}`} onClick={() => void downloadFile(file)}>⇩</button></td></tr>)}
+          {generatedFiles.length === 0 && <tr><td colSpan={5} className="empty-table">No generated files yet. Select Generate to create the complete Tally file set.</td></tr>}
+        </tbody></table></div>
+      </article>
+
       <article className="panel table-panel">
-        <div className="panel__header export-review-heading"><div><p className="eyebrow">END-OF-DAY REVIEW</p><h2>Tally Export Queue</h2></div><div className="review-controls"><input value={reviewer} onChange={(event) => setReviewer(event.target.value)} placeholder="Chief of Staff / reviewer" /><label><input type="checkbox" checked={includeCsv} onChange={(event) => setIncludeCsv(event.target.checked)} /> Include CSV</label><button className="button button--secondary" type="button" onClick={() => void window.desktop.stores.chooseFolder("export").then((next) => next && onChanged(next))}>Choose export folder</button><button className="button" type="button" disabled={Boolean(busy) || !stores.reviewEntries.some((entry) => entry.status === "APPROVED")} onClick={() => void generateExport()}>{busy === "export" ? "Generating…" : "Generate approved batch"}</button></div></div>
+        <div className="panel__header export-review-heading"><div><p className="eyebrow">END-OF-DAY REVIEW</p><h2>Tally Export Queue</h2></div><div className="review-controls"><input value={reviewer} onChange={(event) => setReviewer(event.target.value)} placeholder="Reviewer name for decisions" /><label><input type="checkbox" checked={includeCsv} onChange={(event) => setIncludeCsv(event.target.checked)} /> Include CSV when generated</label></div></div>
         <div className="table-scroll stores-review-table"><table><thead><tr><th>Type</th><th>Date</th><th>Proposed voucher</th><th>Qty</th><th>FIFO / validation</th><th>Status</th><th>Review</th></tr></thead><tbody>
           {stores.reviewEntries.map((entry) => <tr key={entry.id}><td>{entry.entityType.replaceAll("_", " ")}</td><td>{entry.eventDate}</td><td><strong>{entry.title}</strong>{entry.supplierName && <small className="table-subtext">{entry.supplierName} · PO {entry.poNumber || "exception"} · Challan {entry.challanNumber || "—"}</small>}</td><td>{entry.quantity}</td><td>{entry.fifoSummary || entry.validationMessages.join("; ") || "Ready for review"}</td><td><span className={`review-status review-status--${entry.status.toLowerCase().replaceAll("_", "-")}`}>{entry.status}</span>{entry.tallyVoucherNumber && <small className="table-subtext">Tally {entry.tallyVoucherNumber}</small>}</td><td><div className="row-actions">{entry.status === "EXPORTED" ? <button type="button" onClick={() => void confirmImported(entry.id, entry.tallyVoucherNumber)} disabled={Boolean(busy)}>Confirm import</button> : <><button type="button" onClick={() => void decide(entry.id, "APPROVED")} disabled={Boolean(busy) || ["CONFIRMED"].includes(entry.status)}>Approve</button><button type="button" onClick={() => void decide(entry.id, "NEEDS_CORRECTION")} disabled={Boolean(busy) || ["CONFIRMED"].includes(entry.status)}>Correct</button><button type="button" onClick={() => void decide(entry.id, "REJECTED")} disabled={Boolean(busy) || ["CONFIRMED"].includes(entry.status)}>Reject</button></>}</div></td></tr>)}
           {stores.reviewEntries.length === 0 && <tr><td colSpan={7} className="empty-table">No proposed vouchers yet.</td></tr>}
         </tbody></table></div>
-        {!stores.materialOutXmlConfigured && <p className="table-footnote"><strong>Material Out:</strong> approved movements are included in the Material Out Excel workbook, but direct Material Out XML remains blocked until one Production and one Servicing sample voucher are exported from the temporary Tally company and mapped.</p>}
+        <p className="table-footnote"><strong>Material Out:</strong> the export now includes both the import-ready Excel format and a generic Outward Material XML format. Supplier rejections entered during Material In are emitted as separate Material Out rejection vouchers.</p>
       </article>
+
+
+      {operations && <article className="panel table-panel">
+        <div className="panel__header"><div><p className="eyebrow">NEW INVENTORY MOVEMENTS</p><h2>Manual Tally Review</h2></div><span className="table-count">{operations.manualTallyReviews.filter((entry) => entry.status !== "PROCESSED").length} open</span></div>
+        <div className="table-scroll"><table><thead><tr><th>Date</th><th>Movement</th><th>Item</th><th>Qty</th><th>Reason</th><th>Status</th><th>Tally reference</th><th>Action</th></tr></thead><tbody>
+          {operations.manualTallyReviews.map((entry) => <tr key={entry.id}><td>{entry.eventDate}</td><td>{entry.movementType.replaceAll("_", " ")}</td><td>{entry.itemName}</td><td>{entry.quantity}</td><td>{entry.reviewReason}</td><td><span className={`review-status review-status--${entry.status.toLocaleLowerCase()}`}>{entry.status}</span></td><td>{entry.tallyVoucherReference || "—"}</td><td>{entry.status !== "PROCESSED" ? <button type="button" disabled={Boolean(busy)} onClick={() => void completeManualReview(entry.id, entry.tallyVoucherReference)}>Record manual processing</button> : "Complete"}</td></tr>)}
+          {operations.manualTallyReviews.length === 0 && <tr><td colSpan={8} className="empty-table">No condition, adjustment, return, scrap, production, or reversal movements require manual Tally review.</td></tr>}
+        </tbody></table></div>
+        <p className="table-footnote">These movements retain their source details and remain separate until Accounts records the correct Tally voucher or manual-processing reference.</p>
+      </article>}
 
       <article className="panel table-panel">
         <div className="panel__header"><div><p className="eyebrow">PURCHASE LOT / FIFO VIEWER</p><h2>Current supplier-attributed stock</h2></div><input className="search-input" value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search item, supplier, PO, or GRN" /></div>

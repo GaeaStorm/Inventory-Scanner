@@ -1,4 +1,4 @@
-import { existsSync } from "node:fs";
+import { copyFileSync, existsSync, readdirSync, statSync } from "node:fs";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import type { Server } from "node:http";
 import type { AddressInfo } from "node:net";
@@ -13,7 +13,7 @@ import {
   shell,
   type OpenDialogOptions,
 } from "electron";
-import express, { type Express } from "express";
+import express, { type Express, type NextFunction, type Request, type Response } from "express";
 
 import { ApplicationDatabase } from "./database/application-database";
 import { TallyService } from "./tally/service";
@@ -22,6 +22,9 @@ import { StoresDatabase } from "./stores/database";
 import { StoresService } from "./stores/service";
 import { createPlanningRouter } from "./planning/router";
 import { PlanningService } from "./planning/service";
+import { createOperationsRouter } from "./operations/router";
+import { OperationsService } from "./operations/service";
+import type { Permission } from "./operations/types";
 
 interface DesktopInfo {
   appVersion: string;
@@ -48,6 +51,7 @@ let desktopInfo: DesktopInfo | null = null;
 let tallyService: TallyService | null = null;
 let storesService: StoresService | null = null;
 let planningService: PlanningService | null = null;
+let operationsService: OperationsService | null = null;
 let applicationDatabase: ApplicationDatabase | null = null;
 
 function preferredPort(): number {
@@ -105,7 +109,7 @@ async function startApi(): Promise<DesktopInfo> {
   desktopApi.use(express.urlencoded({ extended: true }));
   desktopApi.use((_request, response, next) => {
     response.setHeader("Access-Control-Allow-Origin", "*");
-    response.setHeader("Access-Control-Allow-Headers", "Content-Type");
+    response.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Inventory-Session");
     response.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,OPTIONS");
     if (_request.method === "OPTIONS") {
       response.sendStatus(204);
@@ -114,14 +118,30 @@ async function startApi(): Promise<DesktopInfo> {
     next();
   });
 
-  if (!storesService) throw new Error("The Local Stores Database is unavailable.");
-  desktopApi.use("/api/stores", createStoresRouter(storesService));
+  if (!storesService || !operationsService) throw new Error("The Local Stores Database is unavailable.");
+  const requireHttpPermission = (permission: Permission) => (request: Request, _response: Response, next: NextFunction) => {
+    try {
+      const token = String(request.header("x-inventory-session") ?? request.header("authorization") ?? "")
+        .replace(/^Bearer\s+/i, "")
+        .trim();
+      operationsService?.requireActor(token, permission);
+      next();
+    } catch (error) {
+      next(error);
+    }
+  };
+  desktopApi.use("/api/dashboard", requireHttpPermission("INVENTORY_VIEW"));
+  desktopApi.use("/api/workbook", requireHttpPermission("SETTINGS_MANAGE"));
+  desktopApi.use("/api/operations", createOperationsRouter(operationsService));
+  desktopApi.use("/api/stores", createStoresRouter(storesService, operationsService));
   if (!planningService) throw new Error("The Planning service is unavailable.");
-  desktopApi.use("/api/planning", createPlanningRouter(planningService));
+  desktopApi.use("/api/planning", createPlanningRouter(planningService, operationsService));
 
   // Keep the original endpoint compatible with older clients, but make the
   // SQLite Stores Catalog authoritative after Tally synchronization.
-  desktopApi.get("/api/products", (_request, response, next) => {
+  desktopApi.get("/api/products", (request, response, next) => {
+    const token = String(request.header("x-inventory-session") ?? request.header("authorization") ?? "").replace(/^Bearer\s+/i, "").trim();
+    operationsService?.requireActor(token, "INVENTORY_VIEW");
     const stockItems = storesService?.getState().stockItems ?? [];
     if (stockItems.length === 0) {
       next();
@@ -228,156 +248,157 @@ async function printHtmlDocument(html: string): Promise<PrintResult> {
 }
 
 function registerIpcHandlers(): void {
+  const requireActor = (token: unknown, permission?: Permission) => {
+    if (!operationsService) throw new Error("The inventory operations service is unavailable.");
+    return operationsService.requireActor(String(token ?? ""), permission);
+  };
+
   ipcMain.handle("desktop:get-info", () => {
     if (!desktopInfo) throw new Error("The local server has not started yet.");
     return desktopInfo;
   });
 
-  ipcMain.handle("desktop:print-html", async (_event, html: unknown) =>
-    printHtmlDocument(printableHtml(html)),
-  );
+  ipcMain.handle("auth:state", (_event, token: unknown) => {
+    if (!operationsService) throw new Error("The inventory operations service is unavailable.");
+    return operationsService.authState(String(token ?? ""));
+  });
+  ipcMain.handle("auth:bootstrap", (_event, input: unknown) => {
+    if (!operationsService) throw new Error("The inventory operations service is unavailable.");
+    return operationsService.bootstrapAdmin(input as never);
+  });
+  ipcMain.handle("auth:login", (_event, input: unknown) => {
+    if (!operationsService) throw new Error("The inventory operations service is unavailable.");
+    return operationsService.login(input as never);
+  });
+  ipcMain.handle("auth:resume", (_event, token: unknown) => {
+    if (!operationsService) throw new Error("The inventory operations service is unavailable.");
+    return operationsService.resume(String(token ?? ""));
+  });
+  ipcMain.handle("auth:logout", (_event, token: unknown) => {
+    if (!operationsService) throw new Error("The inventory operations service is unavailable.");
+    operationsService.logout(String(token ?? ""));
+  });
 
-  ipcMain.handle(
-    "desktop:choose-workbook-folder",
-    async (_event, currentWorkbookPath?: string) => {
-      const fallbackPath = desktopInfo?.dataDirectory ?? app.getPath("documents");
-      const requestedPath =
-        typeof currentWorkbookPath === "string" &&
-        path.isAbsolute(currentWorkbookPath)
-          ? path.dirname(currentWorkbookPath)
-          : fallbackPath;
-      const options: OpenDialogOptions = {
-        title: "Choose the Inventory Scanner data folder",
-        buttonLabel: "Use this folder",
-        defaultPath: requestedPath,
-        properties: ["openDirectory", "createDirectory"],
-      };
-      const result = mainWindow
-        ? await dialog.showOpenDialog(mainWindow, options)
-        : await dialog.showOpenDialog(options);
+  ipcMain.handle("desktop:print-html", async (_event, token: unknown, html: unknown) => {
+    requireActor(token, "QR_MANAGE");
+    return printHtmlDocument(printableHtml(html));
+  });
+  ipcMain.handle("desktop:choose-workbook-folder", async (_event, token: unknown, currentWorkbookPath?: string) => {
+    requireActor(token, "SETTINGS_MANAGE");
+    const fallbackPath = desktopInfo?.dataDirectory ?? app.getPath("documents");
+    const requestedPath = typeof currentWorkbookPath === "string" && path.isAbsolute(currentWorkbookPath)
+      ? path.dirname(currentWorkbookPath)
+      : fallbackPath;
+    const options: OpenDialogOptions = {
+      title: "Choose the Inventory Scanner data folder",
+      buttonLabel: "Use this folder",
+      defaultPath: requestedPath,
+      properties: ["openDirectory", "createDirectory"],
+    };
+    const result = mainWindow ? await dialog.showOpenDialog(mainWindow, options) : await dialog.showOpenDialog(options);
+    return result.canceled ? null : (result.filePaths[0] ?? null);
+  });
+  ipcMain.handle("desktop:open-workbook-folder", async (_event, token: unknown, workbookPath: unknown) => {
+    requireActor(token, "INVENTORY_VIEW");
+    const resolvedPath = absolutePath(workbookPath, "Workbook path");
+    return shell.openPath(path.dirname(resolvedPath));
+  });
+  ipcMain.handle("desktop:open-excel-file", async (_event, token: unknown, workbookPath: unknown) => {
+    requireActor(token, "INVENTORY_VIEW");
+    return shell.openPath(absolutePath(workbookPath, "Workbook path"));
+  });
+  ipcMain.handle("desktop:show-excel-file", async (_event, token: unknown, workbookPath: unknown) => {
+    requireActor(token, "INVENTORY_VIEW");
+    const resolvedPath = absolutePath(workbookPath, "Workbook path");
+    if (existsSync(resolvedPath)) {
+      shell.showItemInFolder(resolvedPath);
+      return true;
+    }
+    await shell.openPath(path.dirname(resolvedPath));
+    return false;
+  });
 
-      return result.canceled ? null : (result.filePaths[0] ?? null);
-    },
-  );
-
-  ipcMain.handle(
-    "desktop:open-workbook-folder",
-    async (_event, workbookPath: unknown) => {
-      const resolvedPath = absolutePath(workbookPath, "Workbook path");
-      return shell.openPath(path.dirname(resolvedPath));
-    },
-  );
-
-  ipcMain.handle(
-    "desktop:open-excel-file",
-    async (_event, workbookPath: unknown) => {
-      const resolvedPath = absolutePath(workbookPath, "Workbook path");
-      return shell.openPath(resolvedPath);
-    },
-  );
-
-  ipcMain.handle(
-    "desktop:show-excel-file",
-    async (_event, workbookPath: unknown) => {
-      const resolvedPath = absolutePath(workbookPath, "Workbook path");
-      if (existsSync(resolvedPath)) {
-        shell.showItemInFolder(resolvedPath);
-        return true;
-      }
-      await shell.openPath(path.dirname(resolvedPath));
-      return false;
-    },
-  );
-
-  ipcMain.handle("tally:get-state", async () => {
+  ipcMain.handle("tally:get-state", async (_event, token: unknown) => {
+    requireActor(token, "TALLY_REVIEW");
     if (!tallyService) throw new Error("The Tally service is unavailable.");
     return tallyService.getState();
   });
-
-  ipcMain.handle("tally:test-connection", async (_event, settings: unknown) => {
+  ipcMain.handle("tally:test-connection", async (_event, token: unknown, settings: unknown) => {
+    requireActor(token, "PURCHASING_MANAGE");
     if (!tallyService) throw new Error("The Tally service is unavailable.");
     return tallyService.testConnection(settings);
   });
-
-  ipcMain.handle("tally:sync-stores", async (_event, settings: unknown) => {
+  ipcMain.handle("tally:sync-stores", async (_event, token: unknown, settings: unknown) => {
+    const actor = requireActor(token, "PURCHASING_MANAGE");
     if (!tallyService || !storesService) throw new Error("The Tally or Stores service is unavailable.");
     const snapshot = await tallyService.syncStores(settings);
     if (snapshot.stockItems.length > 0 && storesService.getState().dataMode === "demo") {
-      planningService?.resetForCatalogReplacement();
+      planningService?.resetForCatalogReplacement(actor);
     }
-    const summary = storesService.sync(snapshot);
+    const summary = storesService.sync(snapshot, actor);
+    operationsService?.database.reconcileLegacyLots();
     return { snapshot, summary, state: storesService.getState() };
   });
 
-  ipcMain.handle("stores:get-state", () => {
+  ipcMain.handle("stores:get-state", (_event, token: unknown) => {
+    requireActor(token, "INVENTORY_VIEW");
     if (!storesService) throw new Error("The Local Stores Database is unavailable.");
     return storesService.getState();
   });
-
-  ipcMain.handle("stores:create-local-stock-item", (_event, input: unknown) => {
+  ipcMain.handle("stores:create-local-stock-item", (_event, token: unknown, input: unknown) => {
     if (!storesService) throw new Error("The Local Stores Database is unavailable.");
-    return storesService.createLocalStockItem(input as never);
+    return storesService.createLocalStockItem(input as never, requireActor(token, "CATALOG_MANAGE"));
   });
-
-  ipcMain.handle("stores:set-catalog-status", (_event, input: unknown) => {
+  ipcMain.handle("stores:set-catalog-status", (_event, token: unknown, input: unknown) => {
     if (!storesService) throw new Error("The Local Stores Database is unavailable.");
-    return storesService.setCatalogStatus(input as never);
+    return storesService.setCatalogStatus(input as never, requireActor(token, "CATALOG_MANAGE"));
   });
-
-  ipcMain.handle("stores:rename-stock-item", (_event, input: unknown) => {
+  ipcMain.handle("stores:set-catalog-classification", (_event, token: unknown, input: unknown) => {
     if (!storesService) throw new Error("The Local Stores Database is unavailable.");
-    return storesService.renameStockItem(input as never);
+    return storesService.setCatalogClassification(input as never, requireActor(token, "CATALOG_MANAGE"));
   });
-
-  ipcMain.handle("stores:export-catalog-cleanup", () => {
+  ipcMain.handle("stores:rename-stock-item", (_event, token: unknown, input: unknown) => {
     if (!storesService) throw new Error("The Local Stores Database is unavailable.");
-    return storesService.exportCatalogCleanup();
+    return storesService.renameStockItem(input as never, requireActor(token, "CATALOG_MANAGE"));
   });
-
-  ipcMain.handle("stores:save-box", (_event, input: unknown) => {
+  ipcMain.handle("stores:export-catalog-cleanup", (_event, token: unknown) => {
     if (!storesService) throw new Error("The Local Stores Database is unavailable.");
-    return storesService.saveBox(input as never);
+    return storesService.exportCatalogCleanup(requireActor(token, "CATALOG_MANAGE"));
   });
-
-  ipcMain.handle("stores:delete-box", (_event, boxId: unknown, expectedRevision: unknown) => {
+  ipcMain.handle("stores:save-box", (_event, token: unknown, input: unknown) => {
     if (!storesService) throw new Error("The Local Stores Database is unavailable.");
-    return storesService.deleteBox(
-      String(boxId ?? ""),
-      expectedRevision == null ? undefined : Number(expectedRevision),
-    );
+    return storesService.saveBox(input as never, requireActor(token, "QR_MANAGE"));
   });
-
-  ipcMain.handle("stores:bulk-vendor-receipt", (_event, input: unknown) => {
+  ipcMain.handle("stores:delete-box", (_event, token: unknown, boxId: unknown, expectedRevision: unknown) => {
     if (!storesService) throw new Error("The Local Stores Database is unavailable.");
-    return storesService.bulkVendorReceipt(input as never);
+    return storesService.deleteBox(String(boxId ?? ""), expectedRevision == null ? undefined : Number(expectedRevision), requireActor(token, "QR_MANAGE"));
   });
-
-  ipcMain.handle("stores:review", (_event, input: unknown) => {
+  ipcMain.handle("stores:bulk-vendor-receipt", (_event, token: unknown, input: unknown) => {
     if (!storesService) throw new Error("The Local Stores Database is unavailable.");
-    return storesService.review(input as never);
+    return storesService.bulkVendorReceipt(input as never, requireActor(token, "RECEIVE_MATERIAL"));
   });
-
-  ipcMain.handle("stores:export-batch", (_event, input: unknown) => {
+  ipcMain.handle("stores:review", (_event, token: unknown, input: unknown) => {
     if (!storesService) throw new Error("The Local Stores Database is unavailable.");
-    return storesService.exportBatch(input as never);
+    return storesService.review(input as never, requireActor(token, "TALLY_REVIEW"));
   });
-
-  ipcMain.handle("stores:confirm-import", (_event, input: unknown) => {
+  ipcMain.handle("stores:export-batch", (_event, token: unknown, input: unknown) => {
     if (!storesService) throw new Error("The Local Stores Database is unavailable.");
-    return storesService.confirmImport(input as never);
+    return storesService.exportBatch(input as never, requireActor(token, "TALLY_REVIEW"));
   });
-
-  ipcMain.handle("stores:backup-now", () => {
+  ipcMain.handle("stores:confirm-import", (_event, token: unknown, input: unknown) => {
     if (!storesService) throw new Error("The Local Stores Database is unavailable.");
-    return storesService.backup("manual");
+    return storesService.confirmImport(input as never, requireActor(token, "TALLY_REVIEW"));
   });
-
-  ipcMain.handle("stores:set-opening-quantity", (_event, input: unknown) => {
+  ipcMain.handle("stores:backup-now", (_event, token: unknown) => {
     if (!storesService) throw new Error("The Local Stores Database is unavailable.");
-    return storesService.setOpeningQuantity(input as never);
+    return storesService.backup("manual", requireActor(token, "SETTINGS_MANAGE"));
   });
-
-  ipcMain.handle("stores:choose-backup-file", async () => {
+  ipcMain.handle("stores:set-opening-quantity", (_event, token: unknown, input: unknown) => {
+    if (!storesService) throw new Error("The Local Stores Database is unavailable.");
+    return storesService.setOpeningQuantity(input as never, requireActor(token, "STOCK_ADJUST"));
+  });
+  ipcMain.handle("stores:choose-backup-file", async (_event, token: unknown) => {
+    requireActor(token, "SETTINGS_MANAGE");
     if (!storesService) throw new Error("The Local Stores Database is unavailable.");
     const options: OpenDialogOptions = {
       title: "Choose an Inventory Scanner SQLite backup",
@@ -386,86 +407,136 @@ function registerIpcHandlers(): void {
       properties: ["openFile"],
       filters: [{ name: "SQLite database", extensions: ["sqlite", "db"] }],
     };
-    const result = mainWindow
-      ? await dialog.showOpenDialog(mainWindow, options)
-      : await dialog.showOpenDialog(options);
+    const result = mainWindow ? await dialog.showOpenDialog(mainWindow, options) : await dialog.showOpenDialog(options);
     return result.canceled ? null : (result.filePaths[0] ?? null);
   });
-
-  ipcMain.handle("stores:restore-backup", (_event, backupPath: unknown) => {
+  ipcMain.handle("stores:restore-backup", (_event, token: unknown, backupPath: unknown) => {
     if (!storesService) throw new Error("The Local Stores Database is unavailable.");
-    return storesService.restoreBackup(absolutePath(backupPath, "Backup path"));
+    return storesService.restoreBackup(absolutePath(backupPath, "Backup path"), requireActor(token, "SETTINGS_MANAGE"));
   });
-
-  ipcMain.handle("stores:choose-folder", async (_event, kind: "backup" | "export") => {
+  ipcMain.handle("stores:choose-folder", async (_event, token: unknown, kind: "backup" | "export") => {
+    const actor = requireActor(token, "SETTINGS_MANAGE");
     if (!storesService) throw new Error("The Local Stores Database is unavailable.");
     const state = storesService.getState();
-    const defaultPath = kind === "backup"
-      ? state.database.backupFolder
-      : path.join(app.getPath("userData"), "exports");
+    const defaultPath = kind === "backup" ? state.database.backupFolder : path.join(app.getPath("userData"), "exports");
     const options: OpenDialogOptions = {
       title: kind === "backup" ? "Choose SQLite backup folder" : "Choose Tally export folder",
       buttonLabel: "Use this folder",
       defaultPath,
       properties: ["openDirectory", "createDirectory"],
     };
-    const result = mainWindow
-      ? await dialog.showOpenDialog(mainWindow, options)
-      : await dialog.showOpenDialog(options);
+    const result = mainWindow ? await dialog.showOpenDialog(mainWindow, options) : await dialog.showOpenDialog(options);
     if (result.canceled || !result.filePaths[0]) return null;
-    const folder = result.filePaths[0];
-    return kind === "backup"
-      ? storesService.setBackupFolder(folder)
-      : storesService.setExportFolder(folder);
+    return kind === "backup" ? storesService.setBackupFolder(result.filePaths[0], actor) : storesService.setExportFolder(result.filePaths[0], actor);
   });
-
-  ipcMain.handle("stores:open-path", async (_event, targetPath: unknown) => {
+  ipcMain.handle("stores:open-path", async (_event, token: unknown, targetPath: unknown) => {
+    requireActor(token, "INVENTORY_VIEW");
     const resolvedPath = absolutePath(targetPath, "Path");
     return shell.openPath(existsSync(resolvedPath) ? resolvedPath : path.dirname(resolvedPath));
   });
-
-  ipcMain.handle("planning:get-state", () => {
-    if (!planningService) throw new Error("The Planning service is unavailable.");
-    return planningService.getState();
+  ipcMain.handle("stores:list-generated-files", (_event, token: unknown) => {
+    requireActor(token, "TALLY_REVIEW");
+    if (!storesService) throw new Error("The Local Stores Database is unavailable.");
+    const folder = storesService.getState().database.exportFolder;
+    if (!existsSync(folder)) return [];
+    return readdirSync(folder)
+      .filter((name) => /\.(xlsx|xls|csv|xml)$/i.test(name))
+      .map((name) => {
+        const filePath = path.join(folder, name);
+        const stats = statSync(filePath);
+        return {
+          path: filePath,
+          name,
+          extension: path.extname(name).slice(1).toLocaleLowerCase(),
+          sizeBytes: stats.size,
+          modifiedAt: stats.mtime.toISOString(),
+        };
+      })
+      .sort((left, right) => right.modifiedAt.localeCompare(left.modifiedAt));
+  });
+  ipcMain.handle("stores:download-generated-file", async (_event, token: unknown, sourcePath: unknown) => {
+    requireActor(token, "TALLY_REVIEW");
+    if (!storesService) throw new Error("The Local Stores Database is unavailable.");
+    const source = absolutePath(sourcePath, "Generated file");
+    const exportFolder = path.resolve(storesService.getState().database.exportFolder);
+    if (!path.resolve(source).startsWith(`${exportFolder}${path.sep}`) || !existsSync(source)) {
+      throw new Error("The selected generated file is unavailable.");
+    }
+    const result = mainWindow ? await dialog.showSaveDialog(mainWindow, {
+      title: "Download Tally import file",
+      defaultPath: path.join(app.getPath("downloads"), path.basename(source)),
+      buttonLabel: "Download",
+    }) : await dialog.showSaveDialog({
+      title: "Download Tally import file",
+      defaultPath: path.join(app.getPath("downloads"), path.basename(source)),
+      buttonLabel: "Download",
+    });
+    if (result.canceled || !result.filePath) return null;
+    copyFileSync(source, result.filePath);
+    return result.filePath;
   });
 
-  ipcMain.handle("planning:save-restock-policy", (_event, input: unknown) => {
+  ipcMain.handle("planning:get-state", (_event, token: unknown) => {
     if (!planningService) throw new Error("The Planning service is unavailable.");
-    return planningService.saveRestockPolicy(input as never);
+    return planningService.getState(requireActor(token, "RESTOCK_VIEW"));
+  });
+  ipcMain.handle("planning:save-restock-policy", (_event, token: unknown, input: unknown) => {
+    if (!planningService) throw new Error("The Planning service is unavailable.");
+    return planningService.saveRestockPolicy(input as never, requireActor(token, "RESTOCK_MANAGE"));
+  });
+  ipcMain.handle("planning:recommendation-decision", (_event, token: unknown, input: unknown) => {
+    if (!planningService) throw new Error("The Planning service is unavailable.");
+    return planningService.decideRecommendation(input as never, requireActor(token, "RESTOCK_MANAGE"));
+  });
+  ipcMain.handle("planning:save-bom", (_event, token: unknown, input: unknown) => {
+    if (!planningService) throw new Error("The Planning service is unavailable.");
+    return planningService.saveBom(input as never, requireActor(token, "BOM_MANAGE"));
+  });
+  ipcMain.handle("planning:activate-bom", (_event, token: unknown, bomId: unknown) => {
+    if (!planningService) throw new Error("The Planning service is unavailable.");
+    return planningService.activateBom(String(bomId ?? ""), requireActor(token, "BOM_MANAGE"));
+  });
+  ipcMain.handle("planning:save-product-order", (_event, token: unknown, input: unknown) => {
+    if (!planningService) throw new Error("The Planning service is unavailable.");
+    return planningService.saveProductOrder(input as never, requireActor(token, "PRODUCT_ORDER_MANAGE"));
+  });
+  ipcMain.handle("planning:update-product-order-status", (_event, token: unknown, orderId: unknown, status: unknown) => {
+    if (!planningService) throw new Error("The Planning service is unavailable.");
+    return planningService.updateProductOrderStatus(String(orderId ?? ""), String(status ?? "") as "CANCELLED" | "COMPLETED" | "CONFIRMED", requireActor(token, "PRODUCT_ORDER_MANAGE"));
+  });
+  ipcMain.handle("planning:export-restock", (_event, token: unknown, input: unknown) => {
+    if (!planningService) throw new Error("The Planning service is unavailable.");
+    return planningService.exportRestock(input as never, requireActor(token, "RESTOCK_MANAGE"));
   });
 
-  ipcMain.handle("planning:recommendation-decision", (_event, input: unknown) => {
-    if (!planningService) throw new Error("The Planning service is unavailable.");
-    return planningService.decideRecommendation(input as never);
+  ipcMain.handle("operations:get-state", (_event, token: unknown) => {
+    if (!operationsService) throw new Error("The inventory operations service is unavailable.");
+    return operationsService.getState(requireActor(token, "INVENTORY_VIEW"));
   });
-
-  ipcMain.handle("planning:save-bom", (_event, input: unknown) => {
-    if (!planningService) throw new Error("The Planning service is unavailable.");
-    return planningService.saveBom(input as never);
-  });
-
-  ipcMain.handle("planning:activate-bom", (_event, bomId: unknown) => {
-    if (!planningService) throw new Error("The Planning service is unavailable.");
-    return planningService.activateBom(String(bomId ?? ""));
-  });
-
-  ipcMain.handle("planning:save-product-order", (_event, input: unknown) => {
-    if (!planningService) throw new Error("The Planning service is unavailable.");
-    return planningService.saveProductOrder(input as never);
-  });
-
-  ipcMain.handle("planning:update-product-order-status", (_event, orderId: unknown, status: unknown) => {
-    if (!planningService) throw new Error("The Planning service is unavailable.");
-    return planningService.updateProductOrderStatus(
-      String(orderId ?? ""),
-      String(status ?? "") as "CANCELLED" | "COMPLETED" | "CONFIRMED",
-    );
-  });
-
-  ipcMain.handle("planning:export-restock", (_event, input: unknown) => {
-    if (!planningService) throw new Error("The Planning service is unavailable.");
-    return planningService.exportRestock(input as never);
-  });
+  const operation = (channel: string, permission: Permission | undefined, action: (input: never, actor: ReturnType<typeof requireActor>) => unknown) => {
+    ipcMain.handle(channel, (_event, token: unknown, input: unknown) => action(input as never, requireActor(token, permission)));
+  };
+  operation("operations:save-user", "AUTH_MANAGE_USERS", (input, actor) => operationsService!.saveUser(input, actor));
+  operation("operations:reset-credential", "AUTH_MANAGE_USERS", (input, actor) => operationsService!.resetCredential(input, actor));
+  operation("operations:transition-condition", undefined, (input, actor) => operationsService!.transitionCondition(input, actor));
+  operation("operations:create-fault", "MARK_FAULTY", (input, actor) => operationsService!.createFault(input, actor));
+  operation("operations:resolve-fault", undefined, (input, actor) => operationsService!.resolveFault(input, actor));
+  operation("operations:create-count", "STOCK_COUNT", (input, actor) => operationsService!.createCountSession(input, actor));
+  operation("operations:record-count", "STOCK_COUNT", (input, actor) => operationsService!.recordCountEntry(input, actor));
+  operation("operations:finalize-count", "STOCK_ADJUST", (input, actor) => operationsService!.finalizeCount(input, actor));
+  operation("operations:production-return", "PRODUCTION_RETURN", (input, actor) => operationsService!.productionReturn(input, actor));
+  operation("operations:supplier-return", "SUPPLIER_RETURN", (input, actor) => operationsService!.supplierReturn(input, actor));
+  operation("operations:update-supplier-return", "PURCHASING_MANAGE", (input, actor) => operationsService!.updateSupplierReturn(input, actor));
+  operation("operations:initiate-customer-return", "CUSTOMER_RETURN_INITIATE", (input, actor) => operationsService!.initiateCustomerReturn(input, actor));
+  operation("operations:receive-customer-return", "CUSTOMER_RETURN_RECEIVE", (input, actor) => operationsService!.receiveCustomerReturn(input, actor));
+  operation("operations:scrap", "SCRAP_STOCK", (input, actor) => operationsService!.scrap(input, actor));
+  operation("operations:release-product-order", "PRODUCTION_EXECUTE", (input, actor) => operationsService!.releaseProductOrder(input, actor));
+  operation("operations:issue-production-material", "PRODUCTION_EXECUTE", (input, actor) => operationsService!.issueProductionMaterial(input, actor));
+  operation("operations:production-completion", "PRODUCTION_EXECUTE", (input, actor) => operationsService!.productionCompletion(input, actor));
+  operation("operations:set-product-order-status", "PRODUCTION_EXECUTE", (input, actor) => operationsService!.setProductOrderExecutionStatus(input, actor));
+  operation("operations:resolve-sync-exception", "SYNC_EXCEPTION_RESOLVE", (input, actor) => operationsService!.resolveSyncException(input, actor));
+  operation("operations:reverse-movement", "TRANSACTION_REVERSE", (input, actor) => operationsService!.reverseMovement(input, actor));
+  operation("operations:review-manual-tally", "TALLY_REVIEW", (input, actor) => operationsService!.reviewManualTally(input, actor));
 }
 
 async function createWindow(): Promise<void> {
@@ -513,8 +584,12 @@ async function bootstrap(): Promise<void> {
     StoresDatabase.databasePathFor(app.getPath("userData")),
   );
   storesService = new StoresService(app.getPath("userData"), applicationDatabase);
+  operationsService = new OperationsService(applicationDatabase, storesService);
+  storesService.bindOperations(operationsService);
   storesService.ensureDemoData();
+  operationsService.database.reconcileLegacyLots();
   planningService = new PlanningService(applicationDatabase, storesService);
+  operationsService.bindPlanning(planningService);
   tallyService = new TallyService(app.getPath("userData"));
   if (process.platform === "darwin") app.dock?.setIcon(applicationIconPath());
   process.env.TALLY_CACHE_PATH = tallyService.cachePath;
@@ -556,6 +631,7 @@ app.on("before-quit", () => {
   apiServer?.close();
   apiServer = null;
   planningService = null;
+  operationsService = null;
   storesService?.close();
   storesService = null;
   applicationDatabase?.close();

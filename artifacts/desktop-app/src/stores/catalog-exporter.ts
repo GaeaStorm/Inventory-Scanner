@@ -80,8 +80,8 @@ function obsoleteRows(items: StoresStockItem[]): Row[] {
     }));
 }
 
-function buildRenameXml(companyName: string, rows: Row[]): string {
-  const messages = rows.map((row) => `
+function buildMasterXml(companyName: string, renameEntries: Row[], localItems: StoresStockItem[]): string {
+  const renameMessages = renameEntries.map((row) => `
         <TALLYMESSAGE xmlns:UDF="TallyUDF">
           <STOCKITEM NAME="${xml(row["Tally Current Name"])}" ACTION="Alter">
             <NAME>${xml(row["New Name"])}</NAME>
@@ -89,6 +89,14 @@ function buildRenameXml(companyName: string, rows: Row[]): string {
               <NAME>${xml(row["New Name"])}</NAME>
               <NAME>${xml(row["Tally Current Name"])}</NAME>
             </NAME.LIST>
+          </STOCKITEM>
+        </TALLYMESSAGE>`).join("");
+  const createMessages = localItems.map((item) => `
+        <TALLYMESSAGE xmlns:UDF="TallyUDF">
+          <STOCKITEM NAME="${xml(item.name)}" ACTION="Create">
+            <NAME>${xml(item.name)}</NAME>
+            <PARENT>${xml(item.parentName)}</PARENT>
+            <BASEUNITS>Nos</BASEUNITS>
           </STOCKITEM>
         </TALLYMESSAGE>`).join("");
   return `<?xml version="1.0" encoding="utf-8"?>
@@ -105,7 +113,7 @@ function buildRenameXml(companyName: string, rows: Row[]): string {
         <REPORTNAME>All Masters</REPORTNAME>
         <STATICVARIABLES><SVCURRENTCOMPANY>${xml(companyName)}</SVCURRENTCOMPANY></STATICVARIABLES>
       </REQUESTDESC>
-      <REQUESTDATA>${messages}
+      <REQUESTDATA>${createMessages}${renameMessages}
       </REQUESTDATA>
     </IMPORTDATA>
   </BODY>
@@ -125,32 +133,112 @@ export class CatalogExporter {
     const importableRenames = renames.filter((row) => row["XML Included"] === "Yes");
     const duplicates = duplicateRows(state.stockItems);
     const obsolete = obsoleteRows(state.stockItems);
-    if (renames.length + duplicates.length + obsolete.length === 0) {
-      throw new Error("There are no local catalog changes to export.");
-    }
+    const localItems = state.stockItems.filter((item) => item.source === "LOCAL" && item.catalogStatus === "ACTIVE");
+    const stockItemRows: Row[] = state.stockItems.map((item) => ({
+      "Stock Item Name": item.name,
+      "Current Tally Name": item.tallyName,
+      "Tally GUID": item.tallyGuid,
+      Group: item.parentName,
+      Source: item.source,
+      Status: item.catalogStatus,
+      "Catalog Role": item.catalogRole,
+      Ignored: item.ignored ? "Yes" : "No",
+      Active: item.active ? "Yes" : "No",
+      "Has BOM": item.hasBom ? "Yes" : "No",
+      "Local Available Quantity": item.localAvailableQuantity,
+    }));
+    const bomRows = this.database.db.prepare(`
+      SELECT product.name AS product_name, product.tally_guid AS product_guid,
+        version.version_number, version.label, version.source,
+        component.name AS component_name, component.tally_guid AS component_guid,
+        line.quantity_per_product, line.loss_buffer_percent
+      FROM planning_bom_versions version
+      JOIN tally_stock_items product ON product.id = version.product_item_id
+      JOIN planning_bom_lines line ON line.bom_version_id = version.id
+      JOIN tally_stock_items component ON component.id = line.component_item_id
+      WHERE version.status = 'ACTIVE'
+      ORDER BY product.name, line.id
+    `).all() as Array<Record<string, string | number>>;
+    const reorderRows = this.database.db.prepare(`
+      SELECT COALESCE(NULLIF(item.local_name_override, ''), item.name) AS item_name,
+        item.tally_guid, item.parent_name, policy.reorder_point, policy.target_stock,
+        policy.minimum_order_quantity, policy.lead_time_days, policy.safety_days,
+        supplier.name AS preferred_supplier
+      FROM tally_stock_items item
+      LEFT JOIN planning_restock_policies policy ON policy.stock_item_id = item.id
+      LEFT JOIN suppliers supplier ON supplier.id = policy.preferred_supplier_id
+      WHERE item.active = 1
+      ORDER BY item.name
+    `).all() as Array<Record<string, string | number>>;
+    const purchaseOrderRows = state.purchaseOrders.flatMap((order) => order.lines.map((line) => ({
+      "Purchase Order": order.voucherNumber,
+      Date: order.voucherDate,
+      Supplier: order.supplierName,
+      "Stock Item": line.itemName,
+      "Tally GUID": line.tallyItemGuid,
+      Ordered: line.orderedQuantity,
+      Received: line.receivedQuantity,
+      Outstanding: line.outstandingQuantity,
+      Rate: line.rate ?? "",
+      Value: line.value ?? "",
+    })));
 
     const exportFolder = this.database.getExportFolder(this.defaultExportFolder);
     mkdirSync(exportFolder, { recursive: true });
     const stamp = new Date().toISOString().replace(/[:.]/g, "-");
     const base = `inventory-scanner-catalog-cleanup-${stamp}`;
     const workbookPath = path.join(exportFolder, `${base}.xlsx`);
-    const renameXmlPath = importableRenames.length > 0 ? path.join(exportFolder, `${base}-renames.xml`) : null;
+    const renameXmlPath = importableRenames.length + localItems.length > 0 ? path.join(exportFolder, `${base}-masters.xml`) : null;
 
     const workbook = XLSX.utils.book_new();
     workbook.Props = {
       Title: "Inventory Scanner - Tally Catalog Cleanup",
-      Subject: "Stock Item renames, duplicate review, and obsolete-item review",
+      Subject: "Complete Tally master sync: Stock Items, renames, duplicates, obsolete items, and BOMs",
       Author: "Inventory Scanner",
       CreatedDate: new Date(),
     };
     appendSheet(workbook, "Instructions", [
       { Step: 1, Action: "Back up the Tally company.", Source: XML_IMPORT_HELP },
-      { Step: 2, Action: "Review the Renames sheet. Only those rows are included in the companion XML.", Source: XML_SCHEMA_HELP },
+      { Step: 2, Action: "Review Stock Items, Renames, and Active BOMs. Local Stock Items and Tally-backed renames are included in the companion XML.", Source: XML_SCHEMA_HELP },
       { Step: 3, Action: "Use Alt+O > Import > Masters. Select the XML and choose Modify with new data.", Source: XML_IMPORT_HELP },
-      { Step: 4, Action: "Review Duplicates with Accounts. This file does not rewrite historical vouchers or BOMs.", Source: STOCK_ITEM_HELP },
+      { Step: 4, Action: "Import or map Active BOMs from the workbook after their Stock Items exist in Tally. Review duplicates with Accounts.", Source: STOCK_ITEM_HELP },
       { Step: 5, Action: "Review Obsolete items manually because historic masters may still be referenced.", Source: STOCK_ITEM_HELP },
       { Step: 6, Action: "After Tally changes, run Tally Sync in Inventory Scanner.", Source: EXCEL_IMPORT_HELP },
     ], [8, 78, 55]);
+    appendSheet(workbook, "Stock Items", stockItemRows, [34, 34, 42, 28, 14, 16, 22, 12, 12, 12, 24]);
+    appendSheet(workbook, "Group Roles", state.catalogGroups.map((group) => ({
+      "Tally Group": group.name,
+      "Catalog Role": group.role,
+      Ignored: group.ignored ? "Yes" : "No",
+      "Stock Item Count": group.itemCount,
+    })), [36, 24, 12, 20]);
+    appendSheet(workbook, "Active BOMs", bomRows.map((row) => ({
+      Product: row.product_name,
+      "Product Tally GUID": row.product_guid,
+      "BOM Version": row.version_number,
+      "BOM Label": row.label,
+      Source: row.source,
+      Component: row.component_name,
+      "Component Tally GUID": row.component_guid,
+      "Quantity per Product": row.quantity_per_product,
+      "General Wastage %": row.loss_buffer_percent,
+    })), [34, 42, 14, 28, 14, 34, 42, 22, 20]);
+    appendSheet(workbook, "Reorder Levels", reorderRows.map((row) => ({
+      "Stock Item": row.item_name,
+      "Tally GUID": row.tally_guid,
+      Group: row.parent_name,
+      "Reorder Level": row.reorder_point ?? 0,
+      "Target Stock": row.target_stock ?? 0,
+      "Minimum Order Quantity": row.minimum_order_quantity ?? 0,
+      "Lead Time Days": row.lead_time_days ?? 0,
+      "Safety Days": row.safety_days ?? 0,
+      "Preferred Supplier": row.preferred_supplier ?? "",
+    })), [34, 42, 28, 18, 18, 24, 18, 16, 34]);
+    appendSheet(workbook, "Suppliers", state.suppliers.map((supplier) => ({
+      "Supplier Name": supplier.name,
+      "Tally GUID": supplier.tallyGuid,
+    })), [40, 44]);
+    appendSheet(workbook, "Open Purchase Orders", purchaseOrderRows, [24, 14, 34, 34, 42, 14, 14, 16, 14, 16]);
     appendSheet(workbook, "Renames", renames, [34, 34, 42, 28, 15, 72]);
     appendSheet(workbook, "Duplicates", duplicates, [34, 34, 42, 34, 34, 42, 22, 82]);
     appendSheet(workbook, "Obsolete", obsolete, [34, 34, 42, 28, 22, 82]);
@@ -189,7 +277,7 @@ export class CatalogExporter {
     XLSX.writeFile(workbook, workbookPath, { bookType: "xlsx", compression: true });
 
     if (renameXmlPath) {
-      writeFileSync(renameXmlPath, buildRenameXml(state.companyName, importableRenames), "utf8");
+      writeFileSync(renameXmlPath, buildMasterXml(state.companyName, importableRenames, localItems), "utf8");
     }
 
     const warnings: string[] = [];
@@ -201,6 +289,9 @@ export class CatalogExporter {
     }
     if (renames.length > importableRenames.length) {
       warnings.push("Local-only Stock Item renames were listed in the workbook but omitted from Tally XML because they do not yet have a Tally master.");
+    }
+    if (bomRows.length > 0) {
+      warnings.push("Active BOMs are included in the workbook for Tally import mapping; review Tally's BOM/Manufacturing Journal configuration before import.");
     }
     return {
       workbookPath,

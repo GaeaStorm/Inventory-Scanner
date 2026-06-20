@@ -1,6 +1,6 @@
 import { useMemo, useState } from "react";
 
-import { isOperationalStockItem, operationalStockItems } from "./stock-item-visibility";
+import { materialStockItems } from "./stock-item-visibility";
 import type { StoresState } from "./types";
 
 interface Props {
@@ -10,17 +10,63 @@ interface Props {
   onError: (message: string) => void;
 }
 
+type DiscrepancyType = "" | "SHORT_DELIVERY" | "EXCESS_DELIVERY" | "WRONG_ITEM" | "DAMAGED" | "NON_FUNCTIONAL" | "OTHER";
+
 interface ReceiptRow {
   tallyItemGuid: string;
   quantity: string;
+  rejectedQuantity: string;
+  acceptedQuantity: string;
+  pendingInspectionQuantity: string;
+  faultyQuantity: string;
+  discrepancyType: DiscrepancyType;
+  faultReason: string;
+  batchNumber: string;
+  availableSerials: string;
+  pendingSerials: string;
+  faultySerials: string;
+  manufacturingDate: string;
+  expiryDate: string;
+  supplierLotReference: string;
+  traceabilityNotes: string;
+  detailsOpen: boolean;
+  poLine: boolean;
 }
 
 function today(): string {
   return new Date().toISOString().slice(0, 10);
 }
 
-function emptyRow(): ReceiptRow {
-  return { tallyItemGuid: "", quantity: "" };
+function emptyRow(poLine = false): ReceiptRow {
+  return {
+    tallyItemGuid: "",
+    quantity: "",
+    rejectedQuantity: "0",
+    acceptedQuantity: "",
+    pendingInspectionQuantity: "0",
+    faultyQuantity: "0",
+    discrepancyType: "",
+    faultReason: "",
+    batchNumber: "",
+    availableSerials: "",
+    pendingSerials: "",
+    faultySerials: "",
+    manufacturingDate: "",
+    expiryDate: "",
+    supplierLotReference: "",
+    traceabilityNotes: "",
+    detailsOpen: false,
+    poLine,
+  };
+}
+
+function parseSerials(value: string): string[] {
+  return [...new Set(value.split(/[\n,;]+/).map((entry) => entry.trim()).filter(Boolean))];
+}
+
+function wholeOrZero(value: string): number {
+  const parsed = Number(value || 0);
+  return Number.isInteger(parsed) && parsed >= 0 ? parsed : Number.NaN;
 }
 
 export default function BulkMaterialInForm({ stores, onChanged, onNotice, onError }: Props) {
@@ -42,13 +88,11 @@ export default function BulkMaterialInForm({ stores, onChanged, onNotice, onErro
     () => stores.purchaseOrders.filter((order) => selectedSupplierId === null || order.supplierId === selectedSupplierId),
     [selectedSupplierId, stores.purchaseOrders],
   );
-  const visibleGuids = useMemo(
-    () => new Set(operationalStockItems(stores.stockItems).map((item) => item.tallyGuid)),
-    [stores.stockItems],
-  );
+  const operationalItems = useMemo(() => materialStockItems(stores.stockItems), [stores.stockItems]);
+  const visibleGuids = useMemo(() => new Set(operationalItems.map((item) => item.tallyGuid)), [operationalItems]);
   const allowedItems = selectedPo
     ? selectedPo.lines.filter((line) => line.outstandingQuantity > 0 && visibleGuids.has(line.tallyItemGuid))
-    : stores.stockItems.filter(isOperationalStockItem).map((item) => ({
+    : operationalItems.map((item) => ({
         tallyItemGuid: item.tallyGuid,
         itemName: item.name,
         orderedQuantity: 0,
@@ -91,12 +135,35 @@ export default function BulkMaterialInForm({ stores, onChanged, onNotice, onErro
     setRows(
       order.lines
         .filter((line) => line.outstandingQuantity > 0 && visibleGuids.has(line.tallyItemGuid))
-        .map((line) => ({ tallyItemGuid: line.tallyItemGuid, quantity: "" })),
+        .map((line) => ({
+          ...emptyRow(true),
+          tallyItemGuid: line.tallyItemGuid,
+          quantity: String(line.outstandingQuantity),
+          acceptedQuantity: String(line.outstandingQuantity),
+        })),
     );
   }
 
   function updateRow(index: number, patch: Partial<ReceiptRow>): void {
-    setRows((current) => current.map((row, rowIndex) => rowIndex === index ? { ...row, ...patch } : row));
+    setRows((current) => current.map((row, rowIndex) => {
+      if (rowIndex !== index) return row;
+      const next = { ...row, ...patch };
+      if (patch.quantity !== undefined) {
+        const total = wholeOrZero(patch.quantity);
+        const rejected = wholeOrZero(next.rejectedQuantity);
+        next.acceptedQuantity = Number.isFinite(total) && Number.isFinite(rejected)
+          ? String(Math.max(0, total - rejected))
+          : "";
+      }
+      if (patch.rejectedQuantity !== undefined) {
+        const total = wholeOrZero(next.quantity);
+        const rejected = wholeOrZero(patch.rejectedQuantity);
+        next.acceptedQuantity = Number.isFinite(total) && Number.isFinite(rejected)
+          ? String(Math.max(0, total - rejected))
+          : "";
+      }
+      return next;
+    }));
   }
 
   async function submit(): Promise<void> {
@@ -110,15 +177,51 @@ export default function BulkMaterialInForm({ stores, onChanged, onNotice, onErro
       onError("Enter the supplier challan number.");
       return;
     }
-    const lines = rows
-      .filter((row) => row.tallyItemGuid && row.quantity.trim())
-      .map((row) => ({ tallyItemGuid: row.tallyItemGuid, quantity: Number(row.quantity) }));
-    if (lines.length === 0) {
+    const submittedRows = rows.filter((row) => row.tallyItemGuid && row.quantity.trim());
+    if (submittedRows.length === 0) {
       onError("Enter a received quantity for at least one Stock Item.");
       return;
     }
+
+    const lines = submittedRows.map((row) => {
+      const quantity = Number(row.quantity);
+      const rejectedQuantity = wholeOrZero(row.rejectedQuantity);
+      const acceptedQuantity = quantity - rejectedQuantity;
+      const poLine = selectedPo?.lines.find((line) => line.tallyItemGuid === row.tallyItemGuid);
+      return {
+        tallyItemGuid: row.tallyItemGuid,
+        quantity,
+        rejectedQuantity,
+        acceptedQuantity,
+        pendingInspectionQuantity: 0,
+        faultyQuantity: 0,
+        expectedQuantity: poLine?.outstandingQuantity,
+        discrepancyType: row.discrepancyType,
+        faultReason: row.faultReason.trim(),
+        batchNumber: row.batchNumber.trim(),
+        availableSerialNumbers: parseSerials(row.availableSerials),
+        pendingSerialNumbers: parseSerials(row.pendingSerials),
+        faultySerialNumbers: parseSerials(row.faultySerials),
+        manufacturingDate: row.manufacturingDate || undefined,
+        expiryDate: row.expiryDate || undefined,
+        supplierLotReference: row.supplierLotReference.trim(),
+        traceabilityNotes: row.traceabilityNotes.trim(),
+      };
+    });
+
     if (lines.some((line) => !Number.isInteger(line.quantity) || line.quantity <= 0)) {
       onError("Every received quantity must be a positive whole number.");
+      return;
+    }
+    if (lines.some((line) => !Number.isInteger(line.rejectedQuantity) || line.rejectedQuantity < 0 || line.rejectedQuantity > line.quantity)) {
+      onError("Rejected quantity must be a whole number between zero and the received quantity.");
+      return;
+    }
+    if (lines.some((line) => {
+      const serialCount = line.availableSerialNumbers.length + line.pendingSerialNumbers.length + line.faultySerialNumbers.length;
+      return serialCount > 0 && serialCount !== line.quantity;
+    })) {
+      onError("When serials are supplied, the serial count must equal the received quantity and follow the condition split.");
       return;
     }
     if (!selectedPo && !nonPoException) {
@@ -144,9 +247,15 @@ export default function BulkMaterialInForm({ stores, onChanged, onNotice, onErro
       const nextOrder = selectedPo ? next.purchaseOrders.find((order) => order.id === selectedPo.id) : null;
       if (selectedPo && !nextOrder) setPurchaseOrderId("");
       setRows(nextOrder
-        ? nextOrder.lines.filter((line) => line.outstandingQuantity > 0 && visibleGuids.has(line.tallyItemGuid)).map((line) => ({ tallyItemGuid: line.tallyItemGuid, quantity: "" }))
+        ? nextOrder.lines.filter((line) => line.outstandingQuantity > 0 && visibleGuids.has(line.tallyItemGuid)).map((line) => ({
+          ...emptyRow(true),
+          tallyItemGuid: line.tallyItemGuid,
+          quantity: String(line.outstandingQuantity),
+          acceptedQuantity: String(line.outstandingQuantity),
+        }))
         : [emptyRow()]);
-      onNotice(`Recorded ${result.grnNumber} with ${result.movements.length} received item line${result.movements.length === 1 ? "" : "s"}. It is now pending Tally review.`);
+      const rejected = lines.reduce((sum, line) => sum + line.rejectedQuantity, 0);
+      onNotice(`Recorded ${result.grnNumber} with ${result.movements.length} Material In line${result.movements.length === 1 ? "" : "s"}.${rejected ? ` ${rejected} rejected unit${rejected === 1 ? "" : "s"} will also be included in Material Out exports.` : ""}`);
     } catch (reason) {
       onError(reason instanceof Error ? reason.message : String(reason));
     } finally {
@@ -157,7 +266,7 @@ export default function BulkMaterialInForm({ stores, onChanged, onNotice, onErro
   return (
     <article className="panel bulk-receipt-panel">
       <div className="panel__header bulk-receipt-heading">
-        <div><p className="eyebrow">MATERIAL IN · RECEIPT NOTE / GRN</p><h2>Record a large vendor restock</h2><p>Use one header for the supplier delivery, then enter all Stock Item quantities received on that challan.</p></div>
+        <div><p className="eyebrow">MATERIAL IN · RECEIPT NOTE / GRN</p><h2>Record a vendor restock</h2></div>
         <div className="bulk-receipt-heading-actions">
           <button className="button button--secondary" type="button" onClick={clearForm} disabled={busy}>Clear form</button>
           <span className="health-badge">WHOLE COUNTS</span>
@@ -173,28 +282,36 @@ export default function BulkMaterialInForm({ stores, onChanged, onNotice, onErro
         <label className="bulk-receipt-exception"><input type="checkbox" checked={nonPoException} onChange={(event) => { setNonPoException(event.target.checked); if (event.target.checked) setPurchaseOrderId(""); }} /> Non-PO exception</label>
       </div>
 
-      <div className="bulk-receipt-lines">
-        <div className="bulk-receipt-line bulk-receipt-line--header"><span>Stock Item</span><span>Ordered</span><span>Previously received</span><span>Outstanding</span><span>Received now</span><span /></div>
+      <div className="table-scroll bulk-receipt-lines">
+        <div className="bulk-receipt-line bulk-receipt-line--header"><span>Stock Item</span><span>Ordered</span><span>Previously received</span><span>Outstanding</span><span>Received now</span><span>Rejected</span><span /></div>
         {rows.map((row, index) => {
           const poLine = selectedPo?.lines.find((line) => line.tallyItemGuid === row.tallyItemGuid);
+          const selectable = row.poLine
+            ? allowedItems
+            : operationalItems.map((item) => ({ tallyItemGuid: item.tallyGuid, itemName: item.name }));
           return (
-            <div className="bulk-receipt-line" key={`${index}-${row.tallyItemGuid}`}>
-              <select value={row.tallyItemGuid} onChange={(event) => updateRow(index, { tallyItemGuid: event.target.value })} disabled={Boolean(selectedPo)}>
-                <option value="">Choose Stock Item</option>
-                {allowedItems.map((item) => <option key={item.tallyItemGuid} value={item.tallyItemGuid} disabled={rows.some((candidate, candidateIndex) => candidateIndex !== index && candidate.tallyItemGuid === item.tallyItemGuid)}>{item.itemName}</option>)}
-              </select>
-              <span>{poLine?.orderedQuantity ?? "—"}</span>
-              <span>{poLine?.receivedQuantity ?? "—"}</span>
-              <span>{poLine?.outstandingQuantity ?? "—"}</span>
-              <input type="number" min="1" step="1" max={poLine?.outstandingQuantity} value={row.quantity} onChange={(event) => updateRow(index, { quantity: event.target.value })} placeholder="0" />
-              <button type="button" className="text-button" onClick={() => setRows((current) => current.filter((_, rowIndex) => rowIndex !== index))} disabled={rows.length === 1 || Boolean(selectedPo)}>Remove</button>
+            <div className="bulk-receipt-row" key={`${index}-${row.tallyItemGuid}`}>
+              <div className="bulk-receipt-line bulk-receipt-line--inspection">
+                <select value={row.tallyItemGuid} onChange={(event) => updateRow(index, { tallyItemGuid: event.target.value })} disabled={row.poLine}>
+                  <option value="">Choose Stock Item</option>
+                  {selectable.map((item) => <option key={item.tallyItemGuid} value={item.tallyItemGuid} disabled={rows.some((candidate, candidateIndex) => candidateIndex !== index && candidate.tallyItemGuid === item.tallyItemGuid)}>{item.itemName}</option>)}
+                </select>
+                <span>{poLine?.orderedQuantity ?? "—"}</span>
+                <span>{poLine?.receivedQuantity ?? "—"}</span>
+                <span>{poLine?.outstandingQuantity ?? "—"}</span>
+                <input aria-label="Total received" type="number" min="1" step="1" value={row.quantity} onChange={(event) => updateRow(index, { quantity: event.target.value })} placeholder="0" />
+                <input aria-label="Rejected quantity" type="number" min="0" step="1" max={row.quantity || undefined} value={row.rejectedQuantity} onChange={(event) => updateRow(index, { rejectedQuantity: event.target.value })} />
+                <div className="inline-actions bulk-receipt-row-actions">
+                  <button type="button" className="text-button" onClick={() => setRows((current) => current.filter((_, rowIndex) => rowIndex !== index))} disabled={rows.length === 1 || row.poLine}>Remove</button>
+                </div>
+              </div>
             </div>
           );
         })}
       </div>
 
       <div className="bulk-receipt-footer">
-        <button className="button button--secondary" type="button" onClick={() => setRows((current) => [...current, emptyRow()])} disabled={Boolean(selectedPo)}>Add item line</button>
+        <button className="button button--secondary" type="button" onClick={() => setRows((current) => [...current, emptyRow()])}>Add item line</button>
         <div><span>{rows.filter((row) => row.tallyItemGuid && row.quantity).length} lines</span><strong>{totalQuantity} total units</strong><button className="button" type="button" disabled={busy} onClick={() => void submit()}>{busy ? "Recording…" : "Record Material In"}</button></div>
       </div>
     </article>

@@ -26,6 +26,7 @@ import type {
   RenameStockItemInput,
   ReviewDecisionInput,
   SaveBoxInput,
+  SetCatalogClassificationInput,
   SetCatalogStatusInput,
   StoresBackupInfo,
   StoresBackupResult,
@@ -46,7 +47,7 @@ import type {
   VendorReceiptInput,
 } from "./types";
 
-const SCHEMA_VERSION = 7;
+const SCHEMA_VERSION = 9;
 const BACKUP_RETENTION = 30;
 const LEGACY_SUPPLIER_NAME = "Opening Legacy Stock";
 const LEGACY_SUPPLIER_GUID = "LOCAL:LEGACY_OPENING";
@@ -629,6 +630,38 @@ export class StoresDatabase {
         this.db.prepare("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)").run(7, nowIso());
       }, "migrating the Local Stores Database to schema 7");
     }
+
+    if (current < 8) {
+      this.transaction(() => {
+        this.db.exec(`
+          ALTER TABLE grn_lines
+            ADD COLUMN rejected_quantity INTEGER NOT NULL DEFAULT 0
+            CHECK (rejected_quantity >= 0 AND rejected_quantity <= quantity);
+        `);
+        this.db.prepare("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)").run(8, nowIso());
+      }, "adding rejected Material In quantities");
+    }
+
+    if (current < 9) {
+      this.transaction(() => {
+        this.db.exec(`
+          ALTER TABLE tally_stock_items
+            ADD COLUMN catalog_role_override TEXT
+            CHECK (catalog_role_override IS NULL OR catalog_role_override IN ('FINISHED_PRODUCT','COMPONENT','ACCESSORY','PACKAGING','OTHER'));
+          ALTER TABLE tally_stock_items
+            ADD COLUMN catalog_ignored INTEGER NOT NULL DEFAULT 0
+            CHECK (catalog_ignored IN (0,1));
+          CREATE TABLE catalog_group_settings (
+            group_name TEXT PRIMARY KEY COLLATE NOCASE,
+            catalog_role TEXT NOT NULL DEFAULT 'OTHER'
+              CHECK (catalog_role IN ('FINISHED_PRODUCT','COMPONENT','ACCESSORY','PACKAGING','OTHER')),
+            ignored INTEGER NOT NULL DEFAULT 0 CHECK (ignored IN (0,1)),
+            updated_at TEXT NOT NULL
+          ) STRICT;
+        `);
+        this.db.prepare("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)").run(9, nowIso());
+      }, "adding catalog roles and ignore settings");
+    }
   }
 
   transaction<T>(work: () => T, operation = "updating inventory"): T {
@@ -697,6 +730,25 @@ export class StoresDatabase {
     const backup = this.backup("before-replacing-demo-data");
     this.transaction(() => {
       this.db.exec(`
+        DELETE FROM ops_count_entries;
+        DELETE FROM ops_count_items;
+        DELETE FROM ops_count_sessions;
+        DELETE FROM ops_supplier_fault_resolutions;
+        DELETE FROM ops_supplier_returns;
+        DELETE FROM ops_customer_returns;
+        DELETE FROM ops_scrap_records;
+        DELETE FROM ops_tally_reviews;
+        DELETE FROM ops_movement_serials;
+        DELETE FROM ops_movement_lot_lines;
+        DELETE FROM ops_movements;
+        DELETE FROM ops_supplier_faults;
+        DELETE FROM ops_serials;
+        DELETE FROM ops_lot_balances;
+        DELETE FROM ops_lots;
+        DELETE FROM ops_sync_exceptions;
+        DELETE FROM ops_production_executions;
+        DELETE FROM ops_idempotency;
+        DELETE FROM ops_audit_events;
         DELETE FROM tally_import_results;
         DELETE FROM idempotency_requests;
         DELETE FROM opening_quantity_adjustments;
@@ -987,6 +1039,34 @@ export class StoresDatabase {
         WHERE id = ?
       `).run(status, duplicateOfId, nowIso(), item.id);
     }, "updating the local Stock Item catalog");
+  }
+
+  setCatalogClassification(input: SetCatalogClassificationInput): void {
+    const role = text(input.role);
+    if (!["FINISHED_PRODUCT", "COMPONENT", "ACCESSORY", "PACKAGING", "OTHER"].includes(role)) {
+      throw new Error("Choose a valid catalog role.");
+    }
+    if (input.scope === "GROUP") {
+      const groupName = text(input.groupName);
+      if (!groupName) throw new Error("Choose a Tally group to classify.");
+      this.db.prepare(`
+        INSERT INTO catalog_group_settings(group_name, catalog_role, ignored, updated_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(group_name) DO UPDATE SET
+          catalog_role = excluded.catalog_role,
+          ignored = excluded.ignored,
+          updated_at = excluded.updated_at
+      `).run(groupName, role, input.ignored ? 1 : 0, nowIso());
+      return;
+    }
+    const tallyItemGuid = text(input.tallyItemGuid);
+    if (!tallyItemGuid) throw new Error("Choose a Stock Item to classify.");
+    const result = this.db.prepare(`
+      UPDATE tally_stock_items
+      SET catalog_role_override = ?, catalog_ignored = ?, catalog_updated_at = ?
+      WHERE tally_guid = ?
+    `).run(role, input.ignored ? 1 : 0, nowIso(), tallyItemGuid);
+    if (Number(result.changes) === 0) throw new Error("The selected Stock Item is no longer available.");
   }
 
   renameStockItem(input: RenameStockItemInput): void {
@@ -1405,7 +1485,7 @@ export class StoresDatabase {
     const challanDate = businessDate(input.challanDate);
     const eventDate = businessDate(input.receiptDate);
     const normalizedLines = (Array.isArray(input.lines) ? input.lines : [])
-      .map((line) => ({ tallyItemGuid: text(line.tallyItemGuid), quantity: integerQuantity(line.quantity) }))
+      .map((line) => ({ ...line, tallyItemGuid: text(line.tallyItemGuid), quantity: integerQuantity(line.quantity) }))
       .filter((line) => line.tallyItemGuid);
     const duplicateGuids = normalizedLines.filter((line, index) =>
       normalizedLines.findIndex((candidate) => candidate.tallyItemGuid === line.tallyItemGuid) !== index,
@@ -1444,6 +1524,10 @@ export class StoresDatabase {
       }
 
       const resolvedLines = normalizedLines.map((line) => {
+        const rejectedQuantity = Number(line.rejectedQuantity ?? 0);
+        if (!Number.isInteger(rejectedQuantity) || rejectedQuantity < 0 || rejectedQuantity > line.quantity) {
+          throw new Error("Rejected quantity must be a whole number between zero and the received quantity.");
+        }
         const stockItemId = this.itemId(line.tallyItemGuid);
         let poLine: Row | undefined;
         if (poId) {
@@ -1452,13 +1536,18 @@ export class StoresDatabase {
             FROM purchase_order_lines
             WHERE purchase_order_id = ? AND stock_item_id = ?
           `).get(poId, stockItemId) as Row | undefined;
-          if (!poLine) throw new Error("One of the selected Stock Items is not present on that Purchase Order.");
-          const outstanding = Number(poLine.ordered_quantity) - Number(poLine.received_quantity);
-          if (line.quantity > outstanding) {
-            throw new Error(`Receipt quantity for one item exceeds the Purchase Order outstanding quantity of ${outstanding}.`);
+          if (!poLine && line.discrepancyType !== "WRONG_ITEM") {
+            throw new Error("One of the selected Stock Items is not present on that Purchase Order. Mark it as Wrong item received to record the discrepancy.");
+          }
+          const outstanding = poLine
+            ? Math.max(0, Number(poLine.ordered_quantity) - Number(poLine.received_quantity))
+            : 0;
+          if (poLine && line.quantity > outstanding
+            && line.discrepancyType !== "EXCESS_DELIVERY" && !input.nonPoException) {
+            throw new Error(`Receipt quantity for one item exceeds the Purchase Order outstanding quantity of ${outstanding}. Mark it as Excess delivery to continue.`);
           }
         }
-        return { ...line, stockItemId, poLine };
+        return { ...line, rejectedQuantity, stockItemId, poLine };
       });
 
       const localGrnGuid = `LOCAL-GRN-${randomUUID()}`;
@@ -1474,14 +1563,15 @@ export class StoresDatabase {
       resolvedLines.forEach((line, index) => {
         const rate = nullableNumber(line.poLine?.rate);
         const value = rate === null ? null : rate * line.quantity;
+        const acceptedQuantity = line.quantity - line.rejectedQuantity;
         const lineInsert = this.db.prepare(
-          "INSERT INTO grn_lines(grn_id, stock_item_id, quantity, rate, value) VALUES (?, ?, ?, ?, ?)",
-        ).run(grnId, line.stockItemId, line.quantity, sqlValue(rate), sqlValue(value));
+          "INSERT INTO grn_lines(grn_id, stock_item_id, quantity, rejected_quantity, rate, value) VALUES (?, ?, ?, ?, ?, ?)",
+        ).run(grnId, line.stockItemId, line.quantity, line.rejectedQuantity, sqlValue(rate), sqlValue(value));
         const grnLineId = Number(lineInsert.lastInsertRowid);
         this.db.prepare(`
           INSERT INTO purchase_lots(stock_item_id, supplier_id, grn_line_id, source_type, source_voucher_guid, source_voucher_date, po_number, grn_number, receipt_date, challan_number, challan_date, quantity_received, quantity_remaining, rate, value, created_at)
           VALUES (?, ?, ?, 'LOCAL_GRN', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        `).run(line.stockItemId, supplier.id, grnLineId, localGrnGuid, eventDate, poNumber, grnNumber, eventDate, challanNumber, challanDate, line.quantity, line.quantity, sqlValue(rate), sqlValue(value), timestamp);
+        `).run(line.stockItemId, supplier.id, grnLineId, localGrnGuid, eventDate, poNumber, grnNumber, eventDate, challanNumber, challanDate, line.quantity, acceptedQuantity, sqlValue(rate), sqlValue(value), timestamp);
 
         const movementId = `MOV-${randomUUID()}`;
         this.db.prepare(`
@@ -1493,7 +1583,7 @@ export class StoresDatabase {
         ).run(movementId, line.stockItemId, line.quantity);
         movements.push(this.getMovement(movementId)!);
 
-        if (poId) {
+        if (poId && line.poLine) {
           this.db.prepare(`
             UPDATE purchase_order_lines
             SET received_quantity = received_quantity + ?
@@ -1598,6 +1688,61 @@ export class StoresDatabase {
     });
   }
 
+  recordMaterialInCorrection(input: AdjustmentInput): StoresMovement {
+    const quantity = integerQuantity(input.quantity);
+    const eventDate = businessDate(input.eventDate);
+    return this.transaction(() => {
+      const duplicate = this.movementByClientId(input.clientTransactionId);
+      if (duplicate) return duplicate;
+      const stockItemId = this.itemId(input.tallyItemGuid);
+      this.ensureBoxContains(input.boxId, stockItemId);
+      const timestamp = nowIso();
+      const supplierId = this.upsertSupplier(
+        "Inventory Material In",
+        "LOCAL-INVENTORY-MATERIAL-IN",
+        timestamp,
+      );
+      const movementId = `MOV-${randomUUID()}`;
+      const localGrnGuid = `LOCAL-GRN-${randomUUID()}`;
+      const grnNumber = `MIN-${eventDate.replaceAll("-", "")}-${movementId.slice(-8).toUpperCase()}`;
+      const grnInsert = this.db.prepare(`
+        INSERT INTO grns(
+          client_transaction_id, tally_guid, voucher_number, voucher_date,
+          supplier_id, po_number, challan_number, challan_date, source_type, synced_at
+        ) VALUES (?, ?, ?, ?, ?, '', ?, ?, 'LOCAL_GRN', ?)
+      `).run(input.clientTransactionId, localGrnGuid, grnNumber, eventDate, supplierId, text(input.note), eventDate, timestamp);
+      const grnId = Number(grnInsert.lastInsertRowid);
+      const lineInsert = this.db.prepare(`
+        INSERT INTO grn_lines(grn_id, stock_item_id, quantity, rejected_quantity, rate, value)
+        VALUES (?, ?, ?, 0, NULL, NULL)
+      `).run(grnId, stockItemId, quantity);
+      const grnLineId = Number(lineInsert.lastInsertRowid);
+      this.db.prepare(`
+        INSERT INTO purchase_lots(
+          stock_item_id, supplier_id, grn_line_id, source_type, source_voucher_guid,
+          source_voucher_date, grn_number, receipt_date, challan_number, challan_date,
+          quantity_received, quantity_remaining, created_at
+        ) VALUES (?, ?, ?, 'LOCAL_GRN', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(stockItemId, supplierId, grnLineId, localGrnGuid, eventDate, grnNumber, eventDate, text(input.note), eventDate, quantity, quantity, timestamp);
+      this.db.prepare(`
+        INSERT INTO inventory_movements(
+          id, client_transaction_id, workflow, event_date, box_id,
+          stock_item_id, quantity, supplier_id, grn_id, status, created_at
+        ) VALUES (?, ?, 'VENDOR_MATERIAL_IN', ?, ?, ?, ?, ?, ?, 'PENDING', ?)
+      `).run(movementId, input.clientTransactionId, eventDate, text(input.boxId), stockItemId, quantity, supplierId, grnId, timestamp);
+      this.db.prepare(`
+        INSERT INTO movement_lines(movement_id, stock_item_id, quantity, direction)
+        VALUES (?, ?, ?, 'IN')
+      `).run(movementId, stockItemId, quantity);
+      this.db.prepare(`
+        INSERT INTO tally_export_entries(
+          id, entity_type, entity_id, status, external_id, validation_json, created_at, updated_at
+        ) VALUES (?, 'GRN', ?, 'PENDING', ?, '[]', ?, ?)
+      `).run(`EXP-${randomUUID()}`, String(grnId), `INVSCAN-MATERIAL-IN-${grnId}`, timestamp, timestamp);
+      return this.getMovement(movementId)!;
+    });
+  }
+
   recordMaterialOut(input: MaterialOutInput): StoresMovement {
     const quantity = integerQuantity(input.quantity);
     const eventDate = businessDate(input.eventDate);
@@ -1650,7 +1795,7 @@ export class StoresDatabase {
         INSERT INTO tally_export_entries(id, entity_type, entity_id, status, external_id, validation_json, created_at, updated_at)
         VALUES (?, 'MATERIAL_OUT', ?, 'PENDING', ?, ?, ?, ?)
         ON CONFLICT(entity_type, entity_id) DO UPDATE SET status = 'PENDING', batch_id = NULL, reviewed_by = '', reviewed_at = NULL, updated_at = excluded.updated_at
-      `).run(`EXP-${randomUUID()}`, groupId, externalId, json(["Material Out XML adapter is not configured until sample Production and Servicing vouchers are supplied."]), timestamp, timestamp);
+      `).run(`EXP-${randomUUID()}`, groupId, externalId, json([]), timestamp, timestamp);
       return this.getMovement(movementId)!;
     });
   }
@@ -2132,6 +2277,12 @@ export class StoresDatabase {
         : isLegacyReturn ? "UNUSED_MATERIAL" : null,
       adjustmentNote: adjustment ? text(adjustment.note) : "",
       referenceMovementId: adjustment ? text(adjustment.reference_movement_id) : "",
+      operatorName: text(row.operator_name),
+      operatorRole: text(row.operator_role),
+      productOrderId: text(row.product_order_id),
+      stockCondition: text(row.stock_condition),
+      batchNumber: text(row.batch_number),
+      serialNumbers: parseJson<string[]>(row.serials_json, []),
     };
   }
 
@@ -2163,10 +2314,21 @@ export class StoresDatabase {
     const stockRows = this.db.prepare(`
       SELECT tsi.*, primary_item.tally_guid AS duplicate_of_tally_guid,
         COALESCE(NULLIF(primary_item.local_name_override, ''), primary_item.name) AS duplicate_of_name,
-        COALESCE((SELECT SUM(pl.quantity_remaining) FROM purchase_lots pl WHERE pl.stock_item_id = tsi.id), 0) AS local_available
+        group_settings.catalog_role AS group_catalog_role,
+        COALESCE(group_settings.ignored, 0) AS group_ignored,
+        COALESCE((SELECT SUM(pl.quantity_remaining) FROM purchase_lots pl WHERE pl.stock_item_id = tsi.id), 0) AS local_available,
+        COALESCE((SELECT SUM(balance.quantity) FROM ops_lot_balances balance JOIN ops_lots lot ON lot.id = balance.lot_id WHERE lot.stock_item_id = tsi.id AND balance.condition = 'PENDING_INSPECTION'), 0) AS local_pending,
+        COALESCE((SELECT SUM(balance.quantity) FROM ops_lot_balances balance JOIN ops_lots lot ON lot.id = balance.lot_id WHERE lot.stock_item_id = tsi.id AND balance.condition = 'FAULTY'), 0) AS local_faulty,
+        COALESCE((SELECT SUM(balance.quantity) FROM ops_lot_balances balance JOIN ops_lots lot ON lot.id = balance.lot_id WHERE lot.stock_item_id = tsi.id AND lot.expiry_date <> '' AND date(lot.expiry_date) < date('now')), 0) AS expired_quantity,
+        COALESCE((SELECT SUM(balance.quantity) FROM ops_lot_balances balance JOIN ops_lots lot ON lot.id = balance.lot_id WHERE lot.stock_item_id = tsi.id AND lot.expiry_date <> '' AND date(lot.expiry_date) BETWEEN date('now') AND date('now', '+30 days')), 0) AS expiring_quantity,
+        COALESCE((SELECT COUNT(*) FROM ops_serials serial WHERE serial.stock_item_id = tsi.id AND serial.active = 1 AND serial.condition IN ('AVAILABLE','PENDING_INSPECTION','FAULTY')), 0) AS serialized_quantity
       FROM tally_stock_items tsi
       LEFT JOIN tally_stock_items primary_item ON primary_item.id = tsi.duplicate_of_item_id
-      WHERE tsi.active = 1 ORDER BY COALESCE(NULLIF(tsi.local_name_override, ''), tsi.name)
+      LEFT JOIN catalog_group_settings group_settings ON group_settings.group_name = tsi.parent_name COLLATE NOCASE
+      WHERE tsi.active = 1
+        OR EXISTS (SELECT 1 FROM purchase_lots pl WHERE pl.stock_item_id = tsi.id AND pl.quantity_remaining > 0)
+        OR EXISTS (SELECT 1 FROM ops_lot_balances balance JOIN ops_lots lot ON lot.id = balance.lot_id WHERE lot.stock_item_id = tsi.id AND balance.quantity > 0)
+      ORDER BY COALESCE(NULLIF(tsi.local_name_override, ''), tsi.name)
     `).all() as Row[];
     const stockItems: StoresStockItem[] = stockRows.map((row) => ({
       id: Number(row.id),
@@ -2177,11 +2339,21 @@ export class StoresDatabase {
       hasBom: Number(row.has_bom) === 1,
       tallyClosingQuantity: Number(row.tally_closing_quantity),
       localAvailableQuantity: Number(row.local_available),
+      localPendingInspectionQuantity: Number(row.local_pending),
+      localFaultyQuantity: Number(row.local_faulty),
+      expiredQuantity: Number(row.expired_quantity),
+      expiringSoonQuantity: Number(row.expiring_quantity),
+      serializedQuantity: Number(row.serialized_quantity),
       active: Number(row.active) === 1,
       source: text(row.source) === "LOCAL" ? "LOCAL" : "TALLY",
       catalogStatus: ["DUPLICATE", "OBSOLETE"].includes(text(row.catalog_status))
         ? text(row.catalog_status) as StoresStockItem["catalogStatus"]
         : "ACTIVE",
+      catalogRole: (text(row.catalog_role_override) || text(row.group_catalog_role) || "OTHER") as StoresStockItem["catalogRole"],
+      itemRoleOverride: row.catalog_role_override == null ? null : text(row.catalog_role_override) as StoresStockItem["itemRoleOverride"],
+      itemIgnored: Number(row.catalog_ignored) === 1,
+      groupIgnored: Number(row.group_ignored) === 1,
+      ignored: Number(row.catalog_ignored) === 1 || Number(row.group_ignored) === 1,
       duplicateOfTallyGuid: row.duplicate_of_tally_guid == null ? null : text(row.duplicate_of_tally_guid),
       duplicateOfName: row.duplicate_of_name == null ? null : text(row.duplicate_of_name),
     }));
@@ -2189,11 +2361,33 @@ export class StoresDatabase {
     const suppliers: StoresSupplier[] = (this.db.prepare("SELECT id, tally_guid, name FROM suppliers WHERE name <> ? ORDER BY name").all(LEGACY_SUPPLIER_NAME) as Row[]).map((row) => ({
       id: Number(row.id), tallyGuid: text(row.tally_guid), name: text(row.name),
     }));
+    const catalogGroups = (this.db.prepare(`
+      SELECT item.parent_name AS name,
+        COALESCE(settings.catalog_role, 'OTHER') AS catalog_role,
+        COALESCE(settings.ignored, 0) AS ignored,
+        COUNT(*) AS item_count
+      FROM tally_stock_items item
+      LEFT JOIN catalog_group_settings settings ON settings.group_name = item.parent_name COLLATE NOCASE
+      WHERE item.active = 1 AND item.parent_name <> ''
+      GROUP BY item.parent_name
+      ORDER BY item.parent_name
+    `).all() as Row[]).map((row) => ({
+      name: text(row.name),
+      role: text(row.catalog_role) as StoresState["catalogGroups"][number]["role"],
+      ignored: Number(row.ignored) === 1,
+      itemCount: Number(row.item_count),
+    }));
 
     const purchaseOrders: StoresPurchaseOrder[] = (this.db.prepare(`
       SELECT po.*, supplier.name AS supplier_name FROM purchase_orders po
       LEFT JOIN suppliers supplier ON supplier.id = po.supplier_id
-      WHERE po.status = 'OPEN' ORDER BY po.voucher_date DESC, po.voucher_number
+      WHERE po.status <> 'CLOSED'
+        AND EXISTS (
+          SELECT 1 FROM purchase_order_lines line
+          WHERE line.purchase_order_id = po.id
+            AND line.ordered_quantity > line.received_quantity
+        )
+      ORDER BY po.voucher_date DESC, po.voucher_number
     `).all() as Row[]).map((row) => {
       const lines = this.db.prepare(`
         SELECT pol.*, COALESCE(NULLIF(item.local_name_override, ''), item.name) AS item_name, item.tally_guid
@@ -2228,11 +2422,21 @@ export class StoresDatabase {
 
     const purchaseLots: StoresPurchaseLot[] = (this.db.prepare(`
       SELECT pl.*, COALESCE(NULLIF(item.local_name_override, ''), item.name) AS item_name,
-        item.tally_guid, supplier.name AS supplier_name
+        item.tally_guid, supplier.name AS supplier_name, lot.id AS ops_lot_id,
+        COALESCE(lot.batch_number, '') AS batch_number,
+        COALESCE(lot.manufacturing_date, '') AS manufacturing_date,
+        COALESCE(lot.expiry_date, '') AS expiry_date,
+        COALESCE(lot.supplier_lot_reference, '') AS supplier_lot_reference,
+        COALESCE(lot.traceability_notes, '') AS traceability_notes,
+        COALESCE((SELECT quantity FROM ops_lot_balances WHERE lot_id = lot.id AND condition = 'PENDING_INSPECTION'), 0) AS pending_quantity,
+        COALESCE((SELECT quantity FROM ops_lot_balances WHERE lot_id = lot.id AND condition = 'FAULTY'), 0) AS faulty_quantity,
+        COALESCE((SELECT json_group_array(serial_number) FROM ops_serials WHERE lot_id = lot.id AND active = 1 AND condition IN ('AVAILABLE','PENDING_INSPECTION','FAULTY')), '[]') AS serials_json
       FROM purchase_lots pl
       JOIN tally_stock_items item ON item.id = pl.stock_item_id
       LEFT JOIN suppliers supplier ON supplier.id = pl.supplier_id
+      LEFT JOIN ops_lots lot ON lot.purchase_lot_id = pl.id
       WHERE pl.quantity_remaining > 0
+        OR COALESCE((SELECT SUM(quantity) FROM ops_lot_balances WHERE lot_id = lot.id AND condition IN ('PENDING_INSPECTION','FAULTY')), 0) > 0
       ORDER BY item.name, pl.receipt_date, pl.id LIMIT 1000
     `).all() as Row[]).map((row) => ({
       id: Number(row.id),
@@ -2246,6 +2450,14 @@ export class StoresDatabase {
       challanNumber: text(row.challan_number),
       quantityReceived: Number(row.quantity_received),
       quantityRemaining: Number(row.quantity_remaining),
+      pendingInspectionQuantity: Number(row.pending_quantity),
+      faultyQuantity: Number(row.faulty_quantity),
+      batchNumber: text(row.batch_number),
+      serialNumbers: parseJson<string[]>(row.serials_json, []),
+      manufacturingDate: text(row.manufacturing_date),
+      expiryDate: text(row.expiry_date),
+      supplierLotReference: text(row.supplier_lot_reference),
+      traceabilityNotes: text(row.traceability_notes),
       rate: nullableNumber(row.rate),
       value: nullableNumber(row.value),
       legacyWarning: Number(row.legacy_warning) === 1,
@@ -2256,13 +2468,18 @@ export class StoresDatabase {
         COALESCE(NULLIF(item.local_name_override, ''), item.name) AS item_name,
         COALESCE(NULLIF(destination.local_name_override, ''), destination.name) AS destination_name,
         supplier.name AS supplier_name,
-        po.voucher_number AS po_number, grn.challan_number
+        po.voucher_number AS po_number, grn.challan_number,
+        ops.operator_name, ops.operator_role, ops.product_order_id,
+        COALESCE(ops.target_condition, ops.source_condition, '') AS stock_condition,
+        COALESCE((SELECT GROUP_CONCAT(DISTINCT lot.batch_number) FROM ops_movement_lot_lines line JOIN ops_lots lot ON lot.id = line.lot_id WHERE line.movement_id = ops.id AND lot.batch_number <> ''), '') AS batch_number,
+        COALESCE((SELECT json_group_array(serial_number) FROM ops_movement_serials WHERE movement_id = ops.id), '[]') AS serials_json
       FROM inventory_movements m
       JOIN tally_stock_items item ON item.id = m.stock_item_id
       LEFT JOIN tally_stock_items destination ON destination.id = m.destination_item_id
       LEFT JOIN suppliers supplier ON supplier.id = m.supplier_id
       LEFT JOIN purchase_orders po ON po.id = m.purchase_order_id
       LEFT JOIN grns grn ON grn.id = m.grn_id
+      LEFT JOIN ops_movements ops ON ops.legacy_movement_id = m.id
       ORDER BY m.created_at DESC LIMIT 250
     `).all() as Row[]).map((row) => this.mapMovement(row));
 
@@ -2323,6 +2540,7 @@ export class StoresDatabase {
       recentMovements,
       reviewEntries,
       openingQuantityAdjustments,
+      catalogGroups,
       exportSchemaVersion: "1.0",
       materialOutXmlConfigured: this.getSetting<boolean>("material_out_xml_configured") === true,
     };

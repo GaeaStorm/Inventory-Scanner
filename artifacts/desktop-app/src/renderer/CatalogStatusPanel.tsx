@@ -1,9 +1,16 @@
 import { useMemo, useState } from "react";
 
 import InfoTip from "./InfoTip";
-import type { StoresState } from "./types";
+import type { CatalogRole, StoresState } from "./types";
 
 type CatalogAction = "DUPLICATE" | "OBSOLETE";
+const roleLabels: Record<CatalogRole, string> = {
+  FINISHED_PRODUCT: "Finished Product",
+  COMPONENT: "Component",
+  ACCESSORY: "Accessory",
+  PACKAGING: "Packaging",
+  OTHER: "Other",
+};
 
 export default function CatalogStatusPanel(props: {
   stores: StoresState;
@@ -16,6 +23,11 @@ export default function CatalogStatusPanel(props: {
   const [primaryGuid, setPrimaryGuid] = useState("");
   const [renameName, setRenameName] = useState("");
   const [busy, setBusy] = useState(false);
+  const [classificationScope, setClassificationScope] = useState<"ITEM" | "GROUP">("GROUP");
+  const [classificationItemGuid, setClassificationItemGuid] = useState("");
+  const [classificationGroup, setClassificationGroup] = useState("");
+  const [classificationRole, setClassificationRole] = useState<CatalogRole>("OTHER");
+  const [classificationIgnored, setClassificationIgnored] = useState(false);
 
   const selected = props.stores.stockItems.find((item) => item.tallyGuid === itemGuid) ?? null;
   const activeItems = useMemo(
@@ -27,7 +39,7 @@ export default function CatalogStatusPanel(props: {
     [activeItems, itemGuid],
   );
   const changedItems = useMemo(
-    () => props.stores.stockItems.filter((item) => item.catalogStatus !== "ACTIVE" || item.name !== item.tallyName),
+    () => props.stores.stockItems.filter((item) => item.catalogStatus !== "ACTIVE" || item.name !== item.tallyName || item.ignored || item.itemRoleOverride),
     [props.stores.stockItems],
   );
 
@@ -54,8 +66,39 @@ export default function CatalogStatusPanel(props: {
           ? `${selected.name} is now hidden as a duplicate.`
           : `${selected.name} is marked obsolete and will remain selectable only while stock remains.`,
       );
+      if (action === "OBSOLETE") {
+        window.alert("This item is now obsolete. Open its Restock Policy and set a target quantity intended to cover roughly 3–4 years of expected usage.");
+      }
       setItemGuid("");
       setPrimaryGuid("");
+    } catch (error) {
+      props.onError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function saveClassification(): Promise<void> {
+    if (classificationScope === "GROUP" && !classificationGroup) {
+      props.onError("Choose a Tally group to classify.");
+      return;
+    }
+    if (classificationScope === "ITEM" && !classificationItemGuid) {
+      props.onError("Choose a Stock Item to classify.");
+      return;
+    }
+    setBusy(true);
+    props.onError("");
+    try {
+      const next = await window.desktop.stores.setCatalogClassification({
+        scope: classificationScope,
+        groupName: classificationScope === "GROUP" ? classificationGroup : undefined,
+        tallyItemGuid: classificationScope === "ITEM" ? classificationItemGuid : undefined,
+        role: classificationRole,
+        ignored: classificationIgnored,
+      });
+      props.onChanged(next);
+      props.onNotice(`${classificationScope === "GROUP" ? classificationGroup : next.stockItems.find((item) => item.tallyGuid === classificationItemGuid)?.name} is classified as ${roleLabels[classificationRole]}${classificationIgnored ? " and ignored by operational screens" : ""}.`);
     } catch (error) {
       props.onError(error instanceof Error ? error.message : String(error));
     } finally {
@@ -143,11 +186,36 @@ export default function CatalogStatusPanel(props: {
     <article className="panel catalog-status-panel">
       <div className="panel__header">
         <div className="heading-with-info">
-          <div><p className="eyebrow">CATALOG CLEANUP</p><h2>Duplicates and obsolete components</h2></div>
+          <div><p className="eyebrow">CATALOG CLEANUP</p><h2>Visibility, roles, duplicates, and obsolete items</h2></div>
           <InfoTip>
-            Duplicate Tally entries are hidden from operational selectors. Obsolete items remain available only until their local stock reaches zero. These labels are local and do not alter Tally.
+            Group and item roles control where synchronized Tally Stock Items appear. Ignored groups and items remain synchronized for history but disappear from operational dropdowns.
           </InfoTip>
         </div>
+      </div>
+
+      <div className="catalog-status-grid">
+        <label>Classify<select value={classificationScope} onChange={(event) => setClassificationScope(event.target.value as typeof classificationScope)}><option value="GROUP">A whole Tally group</option><option value="ITEM">An individual Stock Item</option></select></label>
+        {classificationScope === "GROUP" ? <label>Tally group<select value={classificationGroup} onChange={(event) => {
+          const group = props.stores.catalogGroups.find((entry) => entry.name === event.target.value);
+          setClassificationGroup(event.target.value);
+          setClassificationRole(group?.role ?? "OTHER");
+          setClassificationIgnored(group?.ignored ?? false);
+        }}><option value="">Choose group…</option>{props.stores.catalogGroups.map((entry) => <option key={entry.name} value={entry.name}>{entry.name} · {entry.itemCount} items</option>)}</select></label>
+          : <label>Stock Item<select value={classificationItemGuid} onChange={(event) => {
+            const item = props.stores.stockItems.find((entry) => entry.tallyGuid === event.target.value);
+            setClassificationItemGuid(event.target.value);
+            setClassificationRole(item?.catalogRole ?? "OTHER");
+            setClassificationIgnored(item?.itemIgnored ?? false);
+          }}><option value="">Choose item…</option>{props.stores.stockItems.map((item) => <option key={item.tallyGuid} value={item.tallyGuid}>{item.name} · {item.parentName}</option>)}</select></label>}
+        <label>Catalog role<select value={classificationRole} onChange={(event) => setClassificationRole(event.target.value as CatalogRole)}>{Object.entries(roleLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>
+        <label className="bulk-receipt-exception"><input type="checkbox" checked={classificationIgnored} onChange={(event) => setClassificationIgnored(event.target.checked)} /> Ignored</label>
+      </div>
+      <div className="settings-actions"><button className="button" type="button" disabled={busy} onClick={() => void saveClassification()}>Save role and visibility</button></div>
+
+      <div className="table-scroll catalog-status-list">
+        <table><thead><tr><th>Tally group</th><th>Role</th><th>Items</th><th>Visibility</th></tr></thead><tbody>
+          {props.stores.catalogGroups.map((entry) => <tr key={entry.name}><td>{entry.name}</td><td>{roleLabels[entry.role]}</td><td>{entry.itemCount}</td><td>{entry.ignored ? "Ignored" : "Tracked"}</td></tr>)}
+        </tbody></table>
       </div>
 
       <div className="catalog-status-grid">
@@ -230,12 +298,13 @@ export default function CatalogStatusPanel(props: {
       {changedItems.length > 0 && (
         <div className="table-scroll catalog-status-list">
           <table>
-            <thead><tr><th>Stock Item</th><th>Tally name</th><th>Status</th><th>Primary item / stock rule</th><th /></tr></thead>
+            <thead><tr><th>Stock Item</th><th>Tally name</th><th>Role</th><th>Status</th><th>Primary item / stock rule</th><th /></tr></thead>
             <tbody>
               {changedItems.map((item) => (
                 <tr key={item.tallyGuid}>
                   <td>{item.name}</td>
                   <td>{item.tallyName}</td>
+                  <td>{roleLabels[item.catalogRole]}{item.ignored ? " · Ignored" : ""}</td>
                   <td><span className={`review-status review-status--${item.catalogStatus === "ACTIVE" ? "renamed" : item.catalogStatus.toLocaleLowerCase()}`}>{item.catalogStatus === "ACTIVE" ? "RENAMED" : item.catalogStatus}</span></td>
                   <td>
                     {item.catalogStatus === "ACTIVE"

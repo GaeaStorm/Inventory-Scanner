@@ -7,7 +7,7 @@ import {
   parseBomWorkbook,
   type ParsedBomRow,
 } from "./bom-import";
-import { operationalStockItems } from "./stock-item-visibility";
+import { finishedProductItems, materialStockItems, operationalStockItems } from "./stock-item-visibility";
 import type { PlanningState, SaveBomInput, StoresState } from "./types";
 
 interface Props {
@@ -56,12 +56,13 @@ export default function BomManager({ planning, stores, onChanged, onStoresChange
 
   const products = useMemo(() => {
     const activeBomProducts = new Set(planning.boms.filter((bom) => bom.status === "ACTIVE").map((bom) => bom.productTallyGuid));
-    return [...selectableItems].sort((left, right) => {
+    return finishedProductItems(selectableItems).sort((left, right) => {
       const leftPriority = left.hasBom || activeBomProducts.has(left.tallyGuid) ? 1 : 0;
       const rightPriority = right.hasBom || activeBomProducts.has(right.tallyGuid) ? 1 : 0;
       return rightPriority - leftPriority || left.name.localeCompare(right.name);
     });
   }, [selectableItems, planning.boms]);
+  const components = useMemo(() => materialStockItems(selectableItems), [selectableItems]);
 
   async function saveManualBom() {
     if (!productGuid) {
@@ -289,7 +290,7 @@ export default function BomManager({ planning, stores, onChanged, onStoresChange
           <div className="bom-line-editor">
             <div className="bom-line-editor__head"><span>Component</span><span>Qty / product</span><span>Loss buffer %</span><span /></div>
             {lines.map((line, index) => <div className="bom-line-editor__row" key={index}>
-              <select value={line.componentTallyGuid} onChange={(event) => setLines(lines.map((entry, rowIndex) => rowIndex === index ? { ...entry, componentTallyGuid: event.target.value } : entry))}><option value="">Select component…</option>{selectableItems.filter((item) => item.tallyGuid !== productGuid).map((item) => <option key={item.tallyGuid} value={item.tallyGuid}>{item.name}</option>)}</select>
+              <select value={line.componentTallyGuid} onChange={(event) => setLines(lines.map((entry, rowIndex) => rowIndex === index ? { ...entry, componentTallyGuid: event.target.value } : entry))}><option value="">Select component…</option>{components.filter((item) => item.tallyGuid !== productGuid).map((item) => <option key={item.tallyGuid} value={item.tallyGuid}>{item.name}</option>)}</select>
               <input type="number" min={1} step={1} value={line.quantityPerProduct} onChange={(event) => setLines(lines.map((entry, rowIndex) => rowIndex === index ? { ...entry, quantityPerProduct: Number(event.target.value) } : entry))} />
               <input type="number" min={0} max={100} step={0.1} value={line.lossBufferPercent} onChange={(event) => setLines(lines.map((entry, rowIndex) => rowIndex === index ? { ...entry, lossBufferPercent: Number(event.target.value) } : entry))} />
               <button className="icon-button" type="button" aria-label="Remove component" onClick={() => setLines(lines.filter((_, rowIndex) => rowIndex !== index))}>×</button>
@@ -311,7 +312,7 @@ export default function BomManager({ planning, stores, onChanged, onStoresChange
             <td>{row.rowNumber}</td>
             <td>{row.productName || "—"}</td>
             <td>{row.componentGuid ? (row.importedComponentName || "—") : <input aria-label={`Component name for row ${row.rowNumber}`} value={row.importedComponentName} onChange={(event) => updateImportedComponentName(row.rowNumber, event.target.value)} />}</td>
-            <td><div className="bom-import-match"><select aria-label={`Match component for row ${row.rowNumber}`} value={row.componentGuid} onChange={(event) => mapImportedComponent(row.rowNumber, event.target.value)}><option value="">Choose existing component…</option>{selectableItems.filter((item) => item.tallyGuid !== row.productGuid).map((item) => <option key={item.tallyGuid} value={item.tallyGuid}>{item.name}</option>)}</select>{!row.componentGuid && <button className="button button--secondary button--small" disabled={busy || !row.importedComponentName.trim()} type="button" onClick={() => void createComponentForRow(row)}>Create new</button>}</div></td>
+            <td><div className="bom-import-match"><select aria-label={`Match component for row ${row.rowNumber}`} value={row.componentGuid} onChange={(event) => mapImportedComponent(row.rowNumber, event.target.value)}><option value="">Choose existing component…</option>{components.filter((item) => item.tallyGuid !== row.productGuid).map((item) => <option key={item.tallyGuid} value={item.tallyGuid}>{item.name}</option>)}</select>{!row.componentGuid && <button className="button button--secondary button--small" disabled={busy || !row.importedComponentName.trim()} type="button" onClick={() => void createComponentForRow(row)}>Create new</button>}</div></td>
             <td>{Number.isFinite(row.quantity) ? row.quantity : "—"}</td><td>{Number.isFinite(row.lossBufferPercent) ? `${row.lossBufferPercent}%` : "—"}</td><td>{row.error || "Matched"}</td>
           </tr>)}</tbody></table></div>
           {parsedRows.some((row) => !row.productGuid || !row.componentGuid) && <div className="local-item-controls"><label>New component group<input value={localComponentGroup} onChange={(event) => setLocalComponentGroup(event.target.value)} /></label><label>New product group<input value={localProductGroup} onChange={(event) => setLocalProductGroup(event.target.value)} /></label><p>Edit an unidentified component name, match it to an existing item, or create it locally and link it to Tally later.</p></div>}

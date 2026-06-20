@@ -105,6 +105,14 @@ export default function BoxQrCodeCreatorTab({ stores, onChanged }: Props) {
     setSavedBox(null);
   }, [boxId, selectedGuids]);
 
+  useEffect(() => {
+    const visible = new Set(selectableItems.map((item) => item.tallyGuid));
+    setSelectedGuids((current) => {
+      const next = current.filter((guid) => visible.has(guid));
+      return next.length === current.length ? current : next;
+    });
+  }, [selectableItems]);
+
   function loadBox(box: StoresBox): void {
     setBoxId(box.boxId);
     setExpectedRevision(box.revision);
@@ -122,6 +130,13 @@ export default function BoxQrCodeCreatorTab({ stores, onChanged }: Props) {
     setSavedBox(null);
     setQrDataUrl("");
     setNotice("Started a new box record.");
+    setError("");
+  }
+
+  function clearItems(): void {
+    setSelectedGuids([]);
+    setExpectedRevision(savedBox?.revision);
+    setNotice("Cleared all items from the box draft.");
     setError("");
   }
 
@@ -214,13 +229,11 @@ export default function BoxQrCodeCreatorTab({ stores, onChanged }: Props) {
     );
     const pages = chunksOf(labels, 4);
     const labelMarkup = ({ box, qrDataUrl: image }: QueueEntry) => `<article class="label">
-      <div class="label-header"><strong>${escapeHtml(box.boxId)}</strong><span>r${box.revision}</span></div>
       <img src="${image}" alt="QR for ${escapeHtml(box.boxId)}" />
-      <div class="company">${escapeHtml(stores.companyName || "Tally company")}</div>
-      <ol class="items">${box.items.map((item) => `<li>${escapeHtml(item.itemName)}</li>`).join("")}</ol>
+      <div class="items">${box.items.map((item) => `<div>${escapeHtml(item.itemName)}</div>`).join("")}</div>
     </article>`;
     const html = `<!doctype html><html><head><meta charset="utf-8"><title>Inventory box labels</title><style>
-      @page{size:auto;margin:.25in}*{box-sizing:border-box}html,body{margin:0;padding:0}body{font-family:Arial,sans-serif;color:#111}.sheet{display:grid;grid-template-columns:repeat(2,3.75in);grid-auto-rows:4in;gap:.15in;justify-content:center;align-content:start;break-after:page;page-break-after:always}.sheet:last-child{break-after:auto;page-break-after:auto}.label{width:3.75in;height:4in;overflow:hidden;border:1px solid #777;border-radius:.08in;padding:.1in .14in;break-inside:avoid;page-break-inside:avoid;display:flex;flex-direction:column;align-items:center;background:#fff}.label-header{width:100%;display:flex;justify-content:space-between;gap:.1in;align-items:center;font-size:10pt;line-height:1.1}.label-header strong{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.label-header span{font-size:8pt;color:#444;flex:0 0 auto}.label img{display:block;width:2in;height:2in;min-width:2in;min-height:2in;margin:.04in auto .03in;image-rendering:pixelated}.company{width:100%;font-size:7.5pt;text-align:center;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:#444}.items{width:100%;margin:.04in 0 0;padding-left:.22in;font-size:8.5pt;line-height:1.12;overflow:hidden}.items li{margin:0 0 .025in;overflow-wrap:anywhere}.items li::marker{font-size:7pt}
+      @page{size:auto;margin:.2in}*{box-sizing:border-box}html,body{margin:0;padding:0}body{font-family:Arial,sans-serif;color:#111}.sheet{display:grid;grid-template-columns:repeat(2,2in);grid-auto-rows:2in;gap:.12in;justify-content:center;align-content:start;break-after:page;page-break-after:always}.sheet:last-child{break-after:auto;page-break-after:auto}.label{width:2in;height:2in;overflow:hidden;border:1px solid #555;padding:.06in;break-inside:avoid;page-break-inside:avoid;display:flex;flex-direction:column;align-items:center;background:#fff}.label img{display:block;width:1in;height:1in;min-width:1in;min-height:1in;margin:0 auto .04in;image-rendering:pixelated}.items{width:100%;font-size:10pt;font-weight:700;line-height:1.08;text-align:center;overflow:hidden}.items div{margin:0 0 .025in;overflow-wrap:anywhere}
     </style></head><body>${pages.map((page) => `<section class="sheet">${page.map(labelMarkup).join("")}</section>`).join("")}</body></html>`;
 
     setPrinting(true);
@@ -289,8 +302,8 @@ export default function BoxQrCodeCreatorTab({ stores, onChanged }: Props) {
             {selectedItems.length === 0 && <p className="muted">Choose at least one Tally Stock Item.</p>}
           </div>
           <button className="button box-qr-save" type="button" onClick={() => void saveBox()} disabled={busy}>{busy ? "Saving…" : "Save box and generate QR"}</button>
-          <div className="box-qr-preview">{qrDataUrl && savedBox ? <div className="box-label-preview"><div className="box-label-preview__header"><strong>{savedBox.boxId}</strong><span>r{savedBox.revision}</span></div><img src={qrDataUrl} alt={`QR for ${savedBox.boxId}`} /><small>{stores.companyName || "Tally company"}</small><ol>{savedBox.items.map((item) => <li key={item.tallyItemGuid}>{item.itemName}</li>)}</ol></div> : <div className="qr-placeholder">Save the box to generate its version-3 QR.</div>}</div>
-          <div className="box-qr-actions"><button className="button button--secondary" type="button" onClick={downloadPng} disabled={!qrDataUrl}>Download PNG</button><label>Copies<input type="number" min="1" max="100" value={copies} onChange={(event) => setCopies(event.target.value)} /></label><button className="button" type="button" onClick={addToQueue} disabled={!qrDataUrl}>Add to print queue</button></div>
+          <div className="box-qr-preview">{qrDataUrl && savedBox ? <div className="box-label-preview"><img src={qrDataUrl} alt={`QR for ${savedBox.boxId}`} /><div className="box-label-preview__items">{savedBox.items.map((item) => <strong key={item.tallyItemGuid}>{item.itemName}</strong>)}</div></div> : <div className="qr-placeholder">Save the box to generate its version-3 QR.</div>}</div>
+          <div className="box-qr-actions"><button className="button button--secondary" type="button" onClick={downloadPng} disabled={!qrDataUrl}>Download PNG</button><button className="button button--ghost" type="button" onClick={clearItems} disabled={selectedGuids.length === 0}>Clear</button><label>Copies<input type="number" min="1" max="100" value={copies} onChange={(event) => setCopies(event.target.value)} /></label><button className="button" type="button" onClick={addToQueue} disabled={!qrDataUrl}>Add to print queue</button></div>
         </article>
       </div>
 

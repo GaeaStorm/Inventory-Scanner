@@ -1,4 +1,4 @@
-export type AppTab = "tracker" | "dashboard" | "qr" | "settings" | "tally";
+export type AppTab = "tracker" | "operations" | "dashboard" | "qr" | "settings" | "tally";
 
 export interface DesktopInfo {
   appVersion: string;
@@ -59,6 +59,9 @@ export type {
   ReviewDecisionInput,
   SaveBoxInput,
   SetCatalogStatusInput,
+  SetCatalogClassificationInput,
+  CatalogRole,
+  GeneratedExportFile,
   StoresBackupResult,
   StoresBox,
   StoresState,
@@ -86,3 +89,39 @@ export type {
   PlanningExportInput,
   PlanningExportResult,
 } from "../planning/types";
+
+export type {
+  ActorContext,
+  AuthSession,
+  AuthState,
+  AuthUser,
+  BootstrapAdminInput,
+  ConditionBalance,
+  ConditionTransitionInput,
+  CreateCountSessionInput,
+  CreateFaultInput,
+  CustomerReturnInput,
+  FinalizeCountInput,
+  LoginInput,
+  ManualTallyReview,
+  OperationsMovement,
+  OperationsState,
+  Permission,
+  ProductionCompletionInput,
+  ProductionExecution,
+  ProductionIssueInput,
+  ProductionReturnInput,
+  ReceiveCustomerReturnInput,
+  RecordCountEntryInput,
+  ResetCredentialInput,
+  ResolveFaultInput,
+  ResolveSyncExceptionInput,
+  ReverseMovementInput,
+  SaveUserInput,
+  ScrapInput,
+  StockCondition,
+  StockCountDetail,
+  SupplierFaultRecord,
+  SupplierReturnInput,
+  UserRole,
+} from "../operations/types";

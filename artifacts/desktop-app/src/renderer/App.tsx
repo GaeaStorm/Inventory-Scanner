@@ -1,11 +1,13 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 
 import BackupRestorePanel from "./BackupRestorePanel";
+import AuthGate from "./AuthGate";
 import BoxQrCodeCreatorTab from "./BoxQrCodeCreatorTab";
 import BulkMaterialInForm from "./BulkMaterialInForm";
 import CatalogStatusPanel from "./CatalogStatusPanel";
 import InventoryPlanningDashboard from "./InventoryPlanningDashboard";
 import OpeningQuantityPanel from "./OpeningQuantityPanel";
+import OperationsTab from "./OperationsTab";
 import TallyTab from "./TallyTab";
 import {
   getDashboard,
@@ -15,18 +17,23 @@ import {
 } from "./api";
 import type {
   AppTab,
+  AuthSession,
+  AuthState,
   DashboardState,
   DesktopInfo,
+  OperationsState,
+  Permission,
   PlanningState,
   StoresState,
 } from "./types";
 
-const tabs: Array<{ id: AppTab; label: string; icon: string }> = [
-  { id: "tracker", label: "Inventory Tracker", icon: "▤" },
-  { id: "dashboard", label: "Inventory Dashboard", icon: "▦" },
-  { id: "qr", label: "QR Code Creator", icon: "⌗" },
-  { id: "settings", label: "Settings", icon: "⚙" },
-  { id: "tally", label: "Tally Syncer", icon: "⇄" },
+const tabs: Array<{ id: AppTab; label: string; icon: string; permission?: Permission }> = [
+  { id: "dashboard", label: "Inventory Dashboard", icon: "▦", permission: "RESTOCK_VIEW" },
+  { id: "tracker", label: "Inventory Tracker", icon: "▤", permission: "INVENTORY_VIEW" },
+  { id: "operations", label: "Product Overview", icon: "↻", permission: "INVENTORY_VIEW" },
+  { id: "qr", label: "QR Code Creator", icon: "⌗", permission: "QR_MANAGE" },
+  { id: "settings", label: "Settings", icon: "⚙", permission: "SETTINGS_MANAGE" },
+  { id: "tally", label: "Tally Syncer", icon: "⇄", permission: "TALLY_REVIEW" },
 ];
 
 function formatDate(value: string | null): string {
@@ -54,11 +61,14 @@ function formatCode(value: string | null): string {
 }
 
 export default function App() {
-  const [activeTab, setActiveTab] = useState<AppTab>("tracker");
+  const [activeTab, setActiveTab] = useState<AppTab>("dashboard");
+  const [auth, setAuth] = useState<AuthState | null>(null);
+  const [session, setSession] = useState<AuthSession | null>(null);
   const [desktopInfo, setDesktopInfo] = useState<DesktopInfo | null>(null);
   const [dashboard, setDashboard] = useState<DashboardState | null>(null);
   const [stores, setStores] = useState<StoresState | null>(null);
   const [planning, setPlanning] = useState<PlanningState | null>(null);
+  const [operations, setOperations] = useState<OperationsState | null>(null);
   const [selectedScannerUrl, setSelectedScannerUrl] = useState("");
   const [workbookPath, setWorkbookPath] = useState("");
   const [loading, setLoading] = useState(true);
@@ -67,14 +77,18 @@ export default function App() {
   const [error, setError] = useState("");
 
   const refresh = useCallback(async () => {
-    const [nextStores, nextPlanning, nextDashboard] = await Promise.all([
+    const [nextStores, nextPlanning, nextOperations, nextDashboard, nextAuth] = await Promise.all([
       window.desktop.stores.getState(),
       window.desktop.planning.getState(),
+      window.desktop.operations.getState(),
       getDashboard(100),
+      window.desktop.auth.state(),
     ]);
     setStores(nextStores);
     setPlanning(nextPlanning);
+    setOperations(nextOperations);
     setDashboard(nextDashboard);
+    setAuth(nextAuth);
     setWorkbookPath((current) => current || nextDashboard.workbook.path);
   }, []);
 
@@ -83,19 +97,26 @@ export default function App() {
     async function initialize() {
       try {
         const info = await window.desktop.getInfo();
-        setApiBaseUrl(info.apiBaseUrl);
-        const [nextStores, nextPlanning, nextDashboard] = await Promise.all([
-          window.desktop.stores.getState(),
-          window.desktop.planning.getState(),
-          getDashboard(100),
-        ]);
         if (cancelled) return;
         setDesktopInfo(info);
-        setStores(nextStores);
-        setPlanning(nextPlanning);
-        setDashboard(nextDashboard);
-        setWorkbookPath(nextDashboard.workbook.path);
-        setSelectedScannerUrl(nextDashboard.scannerUrls[0] ?? info.scannerUrls[0] ?? "");
+        setApiBaseUrl(info.apiBaseUrl);
+        const savedToken = localStorage.getItem("inventory-scanner-session") ?? "";
+        if (savedToken) {
+          try {
+            const resumed = await window.desktop.auth.resume(savedToken);
+            if (cancelled) return;
+            setSession(resumed);
+            await refresh();
+            const nextDashboard = await getDashboard(100);
+            if (cancelled) return;
+            setSelectedScannerUrl(nextDashboard.scannerUrls[0] ?? info.scannerUrls[0] ?? "");
+          } catch {
+            localStorage.removeItem("inventory-scanner-session");
+            if (!cancelled) setAuth(await window.desktop.auth.state());
+          }
+        } else {
+          setAuth(await window.desktop.auth.state());
+        }
       } catch (reason) {
         if (!cancelled) setError(reason instanceof Error ? reason.message : String(reason));
       } finally {
@@ -103,16 +124,38 @@ export default function App() {
       }
     }
     void initialize();
-    return () => {
-      cancelled = true;
-    };
-  }, []);
+    return () => { cancelled = true; };
+  }, [refresh]);
+
+  async function authenticated(nextSession: AuthSession) {
+    localStorage.setItem("inventory-scanner-session", nextSession.token);
+    setSession(nextSession);
+    setLoading(true);
+    try {
+      await refresh();
+      const nextDashboard = await getDashboard(100);
+      setSelectedScannerUrl(nextDashboard.scannerUrls[0] ?? desktopInfo?.scannerUrls[0] ?? "");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function signOut() {
+    await window.desktop.auth.logout();
+    localStorage.removeItem("inventory-scanner-session");
+    setSession(null);
+    setStores(null);
+    setPlanning(null);
+    setOperations(null);
+    setAuth(await window.desktop.auth.state());
+  }
 
   const handleStoresChanged = useCallback((state: StoresState) => {
     setStores(state);
-    void window.desktop.planning.getState().then(setPlanning).catch((reason) => {
-      setError(reason instanceof Error ? reason.message : String(reason));
-    });
+    void Promise.all([window.desktop.planning.getState(), window.desktop.operations.getState()]).then(([nextPlanning, nextOperations]) => {
+      setPlanning(nextPlanning);
+      setOperations(nextOperations);
+    }).catch((reason) => setError(reason instanceof Error ? reason.message : String(reason)));
   }, []);
 
   const scannerUrls = dashboard?.scannerUrls.length
@@ -141,6 +184,13 @@ export default function App() {
     return <main className="loading-screen">Opening the Local Stores Database…</main>;
   }
 
+  if (!session || !auth?.currentUser) {
+    return <AuthGate authState={auth ?? { needsBootstrap: false, currentUser: null, permissions: [], users: [] }} onAuthenticated={(next) => void authenticated(next)} />;
+  }
+
+  const visibleTabs = tabs.filter((tab) => !tab.permission || auth.permissions.includes(tab.permission));
+  const can = (permission: Permission) => auth.permissions.includes(permission);
+
   return (
     <div className="app-shell">
       <header className="app-header">
@@ -148,14 +198,15 @@ export default function App() {
           <img className="brand__logo" src="./logo.png" alt="Akademika" />
           <div><strong>Inventory Scanner</strong><span>SQLite-backed stores operations</span></div>
         </div>
-        <div className="server-status">
-          <div><strong>{stores?.database.integrity === "ok" ? "Database healthy" : "Database needs attention"}</strong><small>{desktopInfo?.apiBaseUrl ?? "Local API unavailable"}</small></div>
-          <span className="status-dot" />
+        <div className="user-menu">
+          <div className="server-status"><div><strong>{stores?.database.integrity === "ok" ? "Database healthy" : "Database needs attention"}</strong><small>{desktopInfo?.apiBaseUrl ?? "Local API unavailable"}</small></div><span className="status-dot" /></div>
+          <div className="user-menu__identity"><strong>{auth.currentUser.displayName}</strong><small>{formatCode(auth.currentUser.role)}</small></div>
+          <button className="button button--secondary button--small" type="button" onClick={() => void signOut()}>Sign out</button>
         </div>
       </header>
 
       <nav className="tab-bar" aria-label="Application sections">
-        {tabs.map((tab) => (
+        {visibleTabs.map((tab) => (
           <button
             key={tab.id}
             className={`tab-button ${activeTab === tab.id ? "tab-button--active" : ""}`}
@@ -180,12 +231,12 @@ export default function App() {
               <div><p className="eyebrow">LOCAL STORES DATABASE</p><h1>Inventory Tracker</h1></div>
               <button className="button button--secondary" type="button" onClick={() => void refresh()}>Refresh</button>
             </div>
-            <BulkMaterialInForm
+            {can("RECEIVE_MATERIAL") && <BulkMaterialInForm
               stores={stores}
               onChanged={handleStoresChanged}
               onNotice={setNotice}
               onError={setError}
-            />
+            />}
             <article className="panel table-panel">
               <div className="panel__header"><div><p className="eyebrow">RECENT EVENTS</p><h2>Vendor receipts, issues, and adjustments</h2></div><span className="table-count">{stores.recentMovements.length} shown</span></div>
               <div className="table-scroll stores-main-table"><table>
@@ -204,19 +255,23 @@ export default function App() {
                 </tbody>
               </table></div>
             </article>
-            <OpeningQuantityPanel
+            {can("STOCK_ADJUST") && <OpeningQuantityPanel
               stores={stores}
               onChanged={handleStoresChanged}
               onNotice={setNotice}
               onError={setError}
-            />
-            <CatalogStatusPanel
+            />}
+            {can("CATALOG_MANAGE") && <CatalogStatusPanel
               stores={stores}
               onChanged={handleStoresChanged}
               onNotice={setNotice}
               onError={setError}
-            />
+            />}
           </section>
+        )}
+
+        {activeTab === "operations" && stores && planning && operations && (
+          <OperationsTab stores={stores} planning={planning} operations={operations} auth={auth} permissions={auth.permissions} onRefresh={refresh} onNotice={setNotice} onError={setError} />
         )}
 
         {activeTab === "dashboard" && stores && planning && (
@@ -274,7 +329,7 @@ export default function App() {
         )}
 
         {activeTab === "tally" && stores && (
-          <TallyTab stores={stores} onChanged={handleStoresChanged} />
+          <TallyTab stores={stores} operations={operations} onChanged={handleStoresChanged} onOperationsChanged={refresh} />
         )}
       </main>
     </div>

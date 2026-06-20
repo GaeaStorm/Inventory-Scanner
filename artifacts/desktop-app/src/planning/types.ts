@@ -41,6 +41,8 @@ export interface RestockPolicy {
   itemName: string;
   groupName: string;
   catalogSource: "TALLY" | "LOCAL";
+  catalogStatus: "ACTIVE" | "OBSOLETE";
+  catalogRole: import("../stores/types").CatalogRole;
   planningMethod: PlanningMethod;
   reorderPoint: number;
   targetStock: number;
@@ -63,6 +65,8 @@ export interface RestockPlanningItem extends RestockPolicy {
   incoming: number;
   projected: number;
   averageDailyUsage: number;
+  yearsOfStock: number | null;
+  suggestedObsoleteTarget: number;
   suggestedReorderPoint: number;
   effectiveLeadTimeDays: number;
   observedLeadTimeMedianDays: number | null;

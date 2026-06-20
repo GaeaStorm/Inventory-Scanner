@@ -117,8 +117,8 @@ function buildMaterialInRows(
  return rows;
 }
 
-function buildMaterialOutRows(entries: ReviewEntries): TallyVoucherRow[] {
- return entries
+function buildMaterialOutRows(database: StoresDatabase, entries: ReviewEntries): TallyVoucherRow[] {
+ const issuedRows = entries
   .filter((entry) => entry.entityType === "MATERIAL_OUT")
   .map((entry) => ({
    ...emptyVoucherRow(),
@@ -128,8 +128,36 @@ function buildMaterialOutRows(entries: ReviewEntries): TallyVoucherRow[] {
    "Ledger Name": materialOutLedgerName(entry.destinationName),
    "Ledger Amount": entry.quantity,
    "Item Name": entry.issuedItemName,
-   "Billed Quantity": entry.quantity,
+    "Billed Quantity": entry.quantity,
   }));
+
+ const rejectionRows: TallyVoucherRow[] = [];
+ for (const entry of entries.filter((candidate) => candidate.entityType === "GRN")) {
+  const rows = database.db.prepare(`
+   SELECT g.voucher_date, g.voucher_number, supplier.name AS supplier_name,
+     item.name AS item_name, gl.rejected_quantity
+   FROM grns g
+   JOIN grn_lines gl ON gl.grn_id = g.id
+   JOIN tally_stock_items item ON item.id = gl.stock_item_id
+   LEFT JOIN suppliers supplier ON supplier.id = g.supplier_id
+   WHERE g.id = ? AND gl.rejected_quantity > 0
+   ORDER BY gl.id
+  `).all(Number(entry.entityId)) as DatabaseRow[];
+  for (const row of rows) {
+   rejectionRows.push({
+    ...emptyVoucherRow(),
+    "Voucher Date": dateForTally(row.voucher_date),
+    "Voucher Type Name": "Outward Material",
+    "Voucher Number": `${cleanText(row.voucher_number)}-REJECTION`,
+    "Ledger Name": "Out - Purchase Rejection",
+    "Ledger Amount": numberOrBlank(row.rejected_quantity),
+    "Item Name": cleanText(row.item_name),
+    "Billed Quantity": numberOrBlank(row.rejected_quantity),
+    "Buyer/Supplier - Address": cleanText(row.supplier_name),
+   });
+  }
+ }
+ return [...issuedRows, ...rejectionRows];
 }
 
 function writeVoucherWorkbook(
@@ -193,7 +221,7 @@ export function writeTallyMovementWorkbooks(
  writeVoucherWorkbook(
   output.materialOutPath,
   "Material Out - Tally Inventory Voucher",
-  buildMaterialOutRows(entries),
+  buildMaterialOutRows(database, entries),
   output.generatedAt,
   output.reviewedBy,
  );

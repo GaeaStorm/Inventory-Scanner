@@ -4,7 +4,6 @@ import InfoTip from "./InfoTip";
 
 import type {
   PlanningState,
-  RecommendationDecisionInput,
   RestockPlanningItem,
   RestockPolicyInput,
   StoresState,
@@ -28,12 +27,6 @@ const healthLabels: Record<RestockPlanningItem["health"], string> = {
   UNCONFIGURED: "Unconfigured",
 };
 
-const MANUFACTURED_PRODUCTS_GROUP = "MANUFACTURED PRODUCTS";
-
-function isManufacturedProduct(item: RestockPlanningItem): boolean {
-  return item.groupName.trim().toLocaleUpperCase() === MANUFACTURED_PRODUCTS_GROUP;
-}
-
 function numberInput(value: number, setter: (value: number) => void, min = 0) {
   return {
     type: "number" as const,
@@ -53,27 +46,31 @@ export default function RestockActionCenter({
   onError,
 }: Props) {
   const [search, setSearch] = useState("");
-  const [group, setGroup] = useState("");
-  const [itemType, setItemType] = useState("");
+  const finishedProductGroups = useMemo(
+    () => new Set(stores.catalogGroups.filter((group) => group.role === "FINISHED_PRODUCT" && !group.ignored).map((group) => group.name)),
+    [stores.catalogGroups],
+  );
+  const finishedProducts = useMemo(
+    () => stores.stockItems.filter((item) => !item.ignored && finishedProductGroups.has(item.parentName) && item.catalogStatus !== "DUPLICATE"),
+    [finishedProductGroups, stores.stockItems],
+  );
+  const [productGuid, setProductGuid] = useState("");
   const [health, setHealth] = useState("");
   const [supplier, setSupplier] = useState("");
   const [selectedGuid, setSelectedGuid] = useState(planning.items[0]?.tallyItemGuid ?? "");
   const [busy, setBusy] = useState(false);
-  const [includeCsv, setIncludeCsv] = useState(true);
+  const [sort, setSort] = useState<{ key: keyof RestockPlanningItem; direction: "asc" | "desc" }>({ key: "health", direction: "asc" });
 
   const selected = planning.items.find((item) => item.tallyItemGuid === selectedGuid) ?? null;
-  const selectedBom = selected && isManufacturedProduct(selected)
-    ? planning.boms.find((bom) => bom.productTallyGuid === selected.tallyItemGuid && bom.status === "ACTIVE")
-      ?? planning.boms.find((bom) => bom.productTallyGuid === selected.tallyItemGuid)
-      ?? null
-    : null;
+  const selectedProduct = finishedProducts.find((item) => item.tallyGuid === productGuid) ?? null;
+  const selectedBom = planning.boms.find((bom) => bom.productTallyGuid === productGuid && bom.status === "ACTIVE")
+    ?? planning.boms.find((bom) => bom.productTallyGuid === productGuid)
+    ?? null;
   const [draft, setDraft] = useState<RestockPolicyInput | null>(selected ? toDraft(selected) : null);
-  const [approvedQty, setApprovedQty] = useState(selected?.approvedOrderQuantity ?? selected?.suggestedOrderQuantity ?? 0);
 
   function choose(item: RestockPlanningItem) {
     setSelectedGuid(item.tallyItemGuid);
     setDraft(toDraft(item));
-    setApprovedQty(item.approvedOrderQuantity ?? item.suggestedOrderQuantity);
   }
 
   const suppliers = useMemo(
@@ -86,16 +83,33 @@ export default function RestockActionCenter({
   );
   const filtered = useMemo(() => {
     const needle = search.trim().toLocaleLowerCase();
-    return planning.items.filter((item) => {
+    const requiredGuids = new Set(selectedBom?.lines.map((line) => line.componentTallyGuid) ?? []);
+    const rows = planning.items.filter((item) => {
+      if (productGuid && !requiredGuids.has(item.tallyItemGuid)) return false;
       if (needle && !`${item.itemName} ${item.groupName} ${item.preferredSupplierName}`.toLocaleLowerCase().includes(needle)) return false;
-      if (itemType === "PRODUCT" && !isManufacturedProduct(item)) return false;
-      if (itemType === "COMPONENT" && isManufacturedProduct(item)) return false;
-      if (group && item.groupName !== group) return false;
       if (health && item.health !== health) return false;
       if (supplier && item.preferredSupplierName !== supplier) return false;
       return true;
     });
-  }, [planning.items, search, itemType, group, health, supplier]);
+    return rows.sort((left, right) => {
+      const a = left[sort.key];
+      const b = right[sort.key];
+      const comparison = typeof a === "number" && typeof b === "number"
+        ? a - b
+        : String(a ?? "").localeCompare(String(b ?? ""), undefined, { numeric: true });
+      return sort.direction === "asc" ? comparison : -comparison;
+    });
+  }, [planning.items, productGuid, selectedBom, search, health, supplier, sort]);
+
+  function toggleSort(key: keyof RestockPlanningItem) {
+    setSort((current) => current.key === key
+      ? { key, direction: current.direction === "asc" ? "desc" : "asc" }
+      : { key, direction: "asc" });
+  }
+
+  function sortLabel(label: string, key: keyof RestockPlanningItem) {
+    return <button className="table-sort-button" type="button" onClick={() => toggleSort(key)}>{label}{sort.key === key ? (sort.direction === "asc" ? " ↑" : " ↓") : ""}</button>;
+  }
 
   async function perform(action: () => Promise<PlanningState>, message: string) {
     setBusy(true);
@@ -106,7 +120,6 @@ export default function RestockActionCenter({
       const next = state.items.find((item) => item.tallyItemGuid === selectedGuid);
       if (next) {
         setDraft(toDraft(next));
-        setApprovedQty(next.approvedOrderQuantity ?? next.suggestedOrderQuantity);
       }
       onNotice(message);
     } catch (error) {
@@ -118,35 +131,11 @@ export default function RestockActionCenter({
 
   async function savePolicy() {
     if (!draft) return;
-    await perform(() => window.desktop.planning.saveRestockPolicy(draft), "Restock policy saved locally.");
-  }
-
-  async function decide(status: RecommendationDecisionInput["status"]) {
-    if (!selected) return;
-    await perform(
-      () => window.desktop.planning.recommendationDecision({
-        tallyItemGuid: selected.tallyItemGuid,
-        status,
-        approvedOrderQuantity: status === "APPROVED" ? Math.max(0, Math.round(approvedQty)) : null,
-      }),
-      status === "APPROVED" ? "Restock recommendation approved." : "Recommendation status updated.",
-    );
-  }
-
-  async function exportRecommendations() {
-    setBusy(true);
-    onError("");
-    try {
-      const result = await window.desktop.planning.exportRestock({ includeCsv });
-      onNotice(`Exported ${result.itemCount} approved restock recommendation${result.itemCount === 1 ? "" : "s"}.`);
-      const next = await window.desktop.planning.getState();
-      onChanged(next);
-      await window.desktop.stores.openPath(result.excelPath);
-    } catch (error) {
-      onError(error instanceof Error ? error.message : String(error));
-    } finally {
-      setBusy(false);
+    if (selected?.catalogStatus === "OBSOLETE" && draft.targetStock === 0) {
+      window.alert("This item is obsolete. Set a target quantity intended to cover approximately 3–4 years before saving the policy.");
+      return;
     }
+    await perform(() => window.desktop.planning.saveRestockPolicy(draft), "Restock policy saved locally.");
   }
 
   const dataAttention = planning.summary.unconfigured + planning.summary.missingBom;
@@ -167,21 +156,22 @@ export default function RestockActionCenter({
       <article className="panel planning-table-panel">
         <div className="panel__header planning-header-wrap">
           <div className="heading-with-info"><div><p className="eyebrow">RESTOCK</p><h2>Action Center</h2></div><InfoTip>Projected stock equals available local stock plus open Purchase Order quantities. Reservations and service reserve reduce availability.</InfoTip></div>
-          <div className="inline-actions">
-            <label className="checkbox-row"><input type="checkbox" checked={includeCsv} onChange={(event) => setIncludeCsv(event.target.checked)} />Include CSV</label>
-            <button className="button" disabled={busy} type="button" onClick={() => void exportRecommendations()}>Export approved</button>
-          </div>
         </div>
         <div className="planning-filters">
           <input aria-label="Search stock planning" placeholder="Search item, group, or supplier…" value={search} onChange={(event) => setSearch(event.target.value)} />
-          <select aria-label="Filter by inventory type" value={itemType} onChange={(event) => setItemType(event.target.value)}><option value="">All inventory</option><option value="COMPONENT">Components and purchased stock</option><option value="PRODUCT">Products (MANUFACTURED PRODUCTS)</option></select>
-          <select aria-label="Filter by group" value={group} onChange={(event) => setGroup(event.target.value)}><option value="">All groups</option>{planning.groups.map((entry) => <option key={entry}>{entry}</option>)}</select>
+          <select aria-label="Choose finished product" value={productGuid} onChange={(event) => {
+            const guid = event.target.value;
+            setProductGuid(guid);
+            const bom = planning.boms.find((entry) => entry.productTallyGuid === guid && entry.status === "ACTIVE");
+            const first = planning.items.find((item) => item.tallyItemGuid === bom?.lines[0]?.componentTallyGuid);
+            if (first) choose(first);
+          }}><option value="">Choose a Finished Product…</option>{finishedProducts.map((item) => <option key={item.tallyGuid} value={item.tallyGuid}>{item.name} · {item.parentName}</option>)}</select>
           <select aria-label="Filter by status" value={health} onChange={(event) => setHealth(event.target.value)}><option value="">All statuses</option>{Object.entries(healthLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select>
           <select aria-label="Filter by supplier" value={supplier} onChange={(event) => setSupplier(event.target.value)}><option value="">All suppliers</option>{supplierNames.map((entry) => <option key={entry}>{entry}</option>)}</select>
-          <button className="button button--secondary" type="button" onClick={() => { setSearch(""); setItemType(""); setGroup(""); setHealth(""); setSupplier(""); }}>Clear filters</button>
+          <button className="button button--secondary" type="button" onClick={() => { setSearch(""); setProductGuid(""); setHealth(""); setSupplier(""); }}>Clear filters</button>
         </div>
         <div className="table-scroll planning-restock-table"><table>
-          <thead><tr><th>Status</th><th>Stock Item</th><th className="numeric">On hand</th><th className="numeric">Reserved</th><th className="numeric">Service</th><th className="numeric">Available</th><th className="numeric">Incoming</th><th className="numeric">Projected</th><th className="numeric">Reorder</th><th className="numeric">Target</th><th className="numeric">Suggested order</th><th>Supplier</th></tr></thead>
+          <thead><tr><th>{sortLabel("Status", "health")}</th><th>{sortLabel("Stock Item", "itemName")}</th><th className="numeric">{sortLabel("On hand", "onHand")}</th><th className="numeric">{sortLabel("Reserved", "reserved")}</th><th className="numeric">{sortLabel("Service", "serviceReserve")}</th><th className="numeric">{sortLabel("Available", "available")}</th><th className="numeric">{sortLabel("Incoming", "incoming")}</th><th className="numeric">{sortLabel("Projected", "projected")}</th><th className="numeric">{sortLabel("Reorder", "reorderPoint")}</th><th className="numeric">{sortLabel("Target", "targetStock")}</th><th className="numeric">{sortLabel("Suggested order", "suggestedOrderQuantity")}</th><th>{sortLabel("Supplier", "preferredSupplierName")}</th></tr></thead>
           <tbody>
             {filtered.map((item) => <tr key={item.tallyItemGuid} className={selectedGuid === item.tallyItemGuid ? "selected-row" : ""} onClick={() => choose(item)}>
               <td><span className={`planning-health planning-health--${item.health.toLocaleLowerCase().replaceAll("_", "-")}`}>{healthLabels[item.health]}</span></td>
@@ -193,10 +183,10 @@ export default function RestockActionCenter({
         </table></div>
       </article>
 
-      {selected && isManufacturedProduct(selected) && (
+      {selectedProduct && (
         <article className="panel">
           <div className="panel__header">
-            <div><p className="eyebrow">PRODUCT BOM</p><h2>{selected.itemName}</h2></div>
+            <div><p className="eyebrow">PRODUCT BOM</p><h2>{selectedProduct.name}</h2></div>
             <button className="button button--secondary button--small" type="button" onClick={() => onNavigate("boms")}>Manage BOMs</button>
           </div>
           {selectedBom ? <>
@@ -232,7 +222,7 @@ export default function RestockActionCenter({
           </div>
           <div className="policy-footer">
             <button className="button" disabled={busy} type="button" onClick={() => void savePolicy()}>Save policy</button>
-            <div className="recommendation-actions"><label>Approved order qty<input {...numberInput(approvedQty, setApprovedQty)} /></label><button className="button button--secondary" disabled={busy} type="button" onClick={() => void decide("REVIEWED")}>Mark reviewed</button><button className="button" disabled={busy} type="button" onClick={() => void decide("APPROVED")}>Approve order</button><button className="button button--ghost" disabled={busy} type="button" onClick={() => void decide("SUGGESTED")}>Reset</button></div>
+            {selected.catalogStatus === "OBSOLETE" && <div className="recommendation-actions"><span>{selected.yearsOfStock == null ? "No usage history available for a years-of-stock estimate." : `Current stock covers about ${selected.yearsOfStock.toFixed(1)} years.`}</span><button className="button button--secondary" type="button" onClick={() => setDraft({ ...draft, targetStock: selected.suggestedObsoleteTarget })}>Use 3.5-year target ({selected.suggestedObsoleteTarget})</button></div>}
           </div>
         </article>
       )}
