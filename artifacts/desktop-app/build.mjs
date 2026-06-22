@@ -1,4 +1,4 @@
-import { mkdir, rm } from "node:fs/promises";
+import { mkdir, readdir, rm } from "node:fs/promises";
 import { createRequire } from "node:module";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -27,11 +27,17 @@ await build({
   platform: "node",
   format: "cjs",
   target: "node24",
-  sourcemap: true,
+  sourcemap: false,
   external: ["electron"],
   plugins: [pinoPlugin({ transports: ["pino-pretty"] })],
   logLevel: "info",
 });
+
+for (const entry of await readdir(distDirectory, { recursive: true })) {
+  if (entry.endsWith(".map")) {
+    await rm(path.join(distDirectory, entry), { force: true });
+  }
+}
 
 await build({
   absWorkingDir: appDirectory,
@@ -41,7 +47,7 @@ await build({
   platform: "node",
   format: "cjs",
   target: "node24",
-  sourcemap: true,
+  sourcemap: false,
   external: ["electron"],
   logLevel: "info",
 });

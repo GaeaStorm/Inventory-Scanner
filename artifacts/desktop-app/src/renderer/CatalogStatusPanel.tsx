@@ -26,6 +26,7 @@ export default function CatalogStatusPanel(props: {
   const [classificationScope, setClassificationScope] = useState<"ITEM" | "GROUP">("GROUP");
   const [classificationItemGuid, setClassificationItemGuid] = useState("");
   const [classificationGroup, setClassificationGroup] = useState("");
+  const [classificationPrimaryGroup, setClassificationPrimaryGroup] = useState("");
   const [classificationRole, setClassificationRole] = useState<CatalogRole>("OTHER");
   const [classificationIgnored, setClassificationIgnored] = useState(false);
 
@@ -42,6 +43,21 @@ export default function CatalogStatusPanel(props: {
     () => props.stores.stockItems.filter((item) => item.catalogStatus !== "ACTIVE" || item.name !== item.tallyName || item.ignored || item.itemRoleOverride),
     [props.stores.stockItems],
   );
+  const primaryGroups = useMemo(
+    () => props.stores.catalogGroups.filter((group) => group.type === "PRIMARY"),
+    [props.stores.catalogGroups],
+  );
+  const secondaryGroups = useMemo(
+    () => props.stores.catalogGroups.filter((group) => group.type === "SECONDARY" && group.primaryName === classificationPrimaryGroup),
+    [classificationPrimaryGroup, props.stores.catalogGroups],
+  );
+
+  function chooseClassificationGroup(name: string) {
+    const group = props.stores.catalogGroups.find((entry) => entry.name === name);
+    setClassificationGroup(name);
+    setClassificationRole(group?.role ?? "OTHER");
+    setClassificationIgnored(group?.ignored ?? false);
+  }
 
   async function save(): Promise<void> {
     if (!selected) {
@@ -195,26 +211,24 @@ export default function CatalogStatusPanel(props: {
 
       <div className="catalog-status-grid">
         <label>Classify<select value={classificationScope} onChange={(event) => setClassificationScope(event.target.value as typeof classificationScope)}><option value="GROUP">A whole Tally group</option><option value="ITEM">An individual Stock Item</option></select></label>
-        {classificationScope === "GROUP" ? <label>Tally group<select value={classificationGroup} onChange={(event) => {
-          const group = props.stores.catalogGroups.find((entry) => entry.name === event.target.value);
-          setClassificationGroup(event.target.value);
-          setClassificationRole(group?.role ?? "OTHER");
-          setClassificationIgnored(group?.ignored ?? false);
-        }}><option value="">Choose group…</option>{props.stores.catalogGroups.map((entry) => <option key={entry.name} value={entry.name}>{entry.name} · {entry.itemCount} items</option>)}</select></label>
+        {classificationScope === "GROUP" ? <>
+          <label>Primary group<select value={classificationPrimaryGroup} onChange={(event) => { setClassificationPrimaryGroup(event.target.value); chooseClassificationGroup(event.target.value); }}><option value="">Choose primary group…</option>{primaryGroups.map((entry) => <option key={entry.name} value={entry.name}>{entry.name} · {entry.itemCount} items</option>)}</select></label>
+          <label>Secondary group<select value={classificationGroup === classificationPrimaryGroup ? "" : classificationGroup} onChange={(event) => chooseClassificationGroup(event.target.value || classificationPrimaryGroup)} disabled={!classificationPrimaryGroup || secondaryGroups.length === 0}><option value="">Apply to the primary group</option>{secondaryGroups.map((entry) => <option key={entry.name} value={entry.name}>{entry.name} · {entry.itemCount} items</option>)}</select></label>
+        </>
           : <label>Stock Item<select value={classificationItemGuid} onChange={(event) => {
             const item = props.stores.stockItems.find((entry) => entry.tallyGuid === event.target.value);
             setClassificationItemGuid(event.target.value);
             setClassificationRole(item?.catalogRole ?? "OTHER");
             setClassificationIgnored(item?.itemIgnored ?? false);
-          }}><option value="">Choose item…</option>{props.stores.stockItems.map((item) => <option key={item.tallyGuid} value={item.tallyGuid}>{item.name} · {item.parentName}</option>)}</select></label>}
+          }}><option value="">Choose item…</option>{props.stores.stockItems.map((item) => <option key={item.tallyGuid} value={item.tallyGuid}>{item.name} · {[item.primaryGroupName, item.secondaryGroupName].filter(Boolean).join(" › ") || "Ungrouped"}</option>)}</select></label>}
         <label>Catalog role<select value={classificationRole} onChange={(event) => setClassificationRole(event.target.value as CatalogRole)}>{Object.entries(roleLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>
         <label className="bulk-receipt-exception"><input type="checkbox" checked={classificationIgnored} onChange={(event) => setClassificationIgnored(event.target.checked)} /> Ignored</label>
       </div>
       <div className="settings-actions"><button className="button" type="button" disabled={busy} onClick={() => void saveClassification()}>Save role and visibility</button></div>
 
       <div className="table-scroll catalog-status-list">
-        <table><thead><tr><th>Tally group</th><th>Role</th><th>Items</th><th>Visibility</th></tr></thead><tbody>
-          {props.stores.catalogGroups.map((entry) => <tr key={entry.name}><td>{entry.name}</td><td>{roleLabels[entry.role]}</td><td>{entry.itemCount}</td><td>{entry.ignored ? "Ignored" : "Tracked"}</td></tr>)}
+        <table><thead><tr><th>Primary group</th><th>Secondary group</th><th>Role</th><th>Items</th><th>Visibility</th></tr></thead><tbody>
+          {props.stores.catalogGroups.map((entry) => <tr key={entry.name}><td>{entry.primaryName}</td><td>{entry.type === "SECONDARY" ? entry.name : "—"}</td><td>{roleLabels[entry.role]}</td><td>{entry.itemCount}</td><td>{entry.ignored ? "Ignored" : "Tracked"}</td></tr>)}
         </tbody></table>
       </div>
 

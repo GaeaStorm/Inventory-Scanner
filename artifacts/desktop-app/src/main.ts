@@ -29,6 +29,9 @@ import type { Permission } from "./operations/types";
 interface DesktopInfo {
   appVersion: string;
   apiBaseUrl: string;
+  computerName: string;
+  deploymentRole: "PRODUCTION_SERVER" | "LAN_CLIENT";
+  tallyComputerHost: string;
   dataDirectory: string;
   excelPath: string;
   databasePath: string;
@@ -37,7 +40,9 @@ interface DesktopInfo {
 }
 
 const DEFAULT_PORT = 5000;
+const AUTOMATIC_BACKUP_INTERVAL_MS = 2 * 60 * 60 * 1000;
 const developmentRendererUrl = process.env.ELECTRON_RENDERER_URL;
+const remoteServerUrl = (process.env.INVENTORY_SCANNER_REMOTE_URL ?? "").trim().replace(/\/+$/, "");
 
 function applicationIconPath(): string {
   return app.isPackaged
@@ -53,6 +58,7 @@ let storesService: StoresService | null = null;
 let planningService: PlanningService | null = null;
 let operationsService: OperationsService | null = null;
 let applicationDatabase: ApplicationDatabase | null = null;
+let automaticBackupTimer: NodeJS.Timeout | null = null;
 
 function preferredPort(): number {
   const configured = Number(process.env.INVENTORY_SCANNER_PORT ?? DEFAULT_PORT);
@@ -110,7 +116,7 @@ async function startApi(): Promise<DesktopInfo> {
   desktopApi.use((_request, response, next) => {
     response.setHeader("Access-Control-Allow-Origin", "*");
     response.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Inventory-Session");
-    response.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,OPTIONS");
+    response.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS");
     if (_request.method === "OPTIONS") {
       response.sendStatus(204);
       return;
@@ -136,6 +142,60 @@ async function startApi(): Promise<DesktopInfo> {
   desktopApi.use("/api/stores", createStoresRouter(storesService, operationsService));
   if (!planningService) throw new Error("The Planning service is unavailable.");
   desktopApi.use("/api/planning", createPlanningRouter(planningService, operationsService));
+  desktopApi.get("/api/tally/state", requireHttpPermission("TALLY_REVIEW"), async (_request, response) => {
+    if (!tallyService) throw new Error("The Tally service is unavailable.");
+    response.json(await tallyService.getState());
+  });
+  desktopApi.post("/api/tally/test", requireHttpPermission("PURCHASING_MANAGE"), async (request, response) => {
+    if (!tallyService) throw new Error("The Tally service is unavailable.");
+    response.json(await tallyService.testConnection(request.body));
+  });
+  desktopApi.post("/api/tally/sync", requireHttpPermission("PURCHASING_MANAGE"), async (request, response) => {
+    if (!tallyService || !storesService) throw new Error("The Tally or Stores service is unavailable.");
+    const snapshot = await tallyService.syncStores(request.body);
+    if (snapshot.stockItems.length > 0 && storesService.getState().dataMode === "demo") {
+      planningService?.resetForCatalogReplacement();
+    }
+    const summary = storesService.sync(snapshot);
+    operationsService?.database.reconcileLegacyLots();
+    response.json({ snapshot, summary, state: storesService.getState() });
+  });
+  desktopApi.post("/api/stores/review", requireHttpPermission("TALLY_REVIEW"), (request, response) => {
+    response.json(storesService!.review(request.body, operationsService!.requireActor(
+      String(request.header("x-inventory-session") ?? "").trim(),
+      "TALLY_REVIEW",
+    )));
+  });
+  desktopApi.post("/api/stores/export-batch", requireHttpPermission("TALLY_REVIEW"), (request, response) => {
+    response.json(storesService!.exportBatch(request.body, operationsService!.requireActor(
+      String(request.header("x-inventory-session") ?? "").trim(),
+      "TALLY_REVIEW",
+    )));
+  });
+  desktopApi.post("/api/stores/confirm-import", requireHttpPermission("TALLY_REVIEW"), (request, response) => {
+    response.json(storesService!.confirmImport(request.body, operationsService!.requireActor(
+      String(request.header("x-inventory-session") ?? "").trim(),
+      "TALLY_REVIEW",
+    )));
+  });
+  desktopApi.post("/api/stores/backup", requireHttpPermission("SETTINGS_MANAGE"), (request, response) => {
+    response.json(storesService!.backup("manual", operationsService!.requireActor(
+      String(request.header("x-inventory-session") ?? "").trim(),
+      "SETTINGS_MANAGE",
+    )));
+  });
+  desktopApi.get("/api/stores/generated-files", requireHttpPermission("TALLY_REVIEW"), (_request, response) => {
+    const folder = storesService!.getState().database.exportFolder;
+    const files = existsSync(folder) ? readdirSync(folder)
+      .filter((name) => /\.(xlsx|xls|csv|xml)$/i.test(name))
+      .map((name) => {
+        const filePath = path.join(folder, name);
+        const stats = statSync(filePath);
+        return { path: filePath, name, extension: path.extname(name).slice(1).toLocaleLowerCase(), sizeBytes: stats.size, modifiedAt: stats.mtime.toISOString() };
+      })
+      .sort((left, right) => right.modifiedAt.localeCompare(left.modifiedAt)) : [];
+    response.json(files);
+  });
 
   // Keep the original endpoint compatible with older clients, but make the
   // SQLite Stores Catalog authoritative after Tally synchronization.
@@ -154,6 +214,10 @@ async function startApi(): Promise<DesktopInfo> {
     })));
   });
   desktopApi.use(inventoryApi);
+  desktopApi.use((error: unknown, _request: Request, response: Response, _next: NextFunction) => {
+    const message = error instanceof Error ? error.message : String(error);
+    response.status(/sign in|permission/i.test(message) ? 401 : 400).json({ error: message });
+  });
 
   const requestedPort = preferredPort();
   try {
@@ -169,6 +233,9 @@ async function startApi(): Promise<DesktopInfo> {
   return {
     appVersion: app.getVersion(),
     apiBaseUrl: `http://127.0.0.1:${port}`,
+    computerName: os.hostname(),
+    deploymentRole: "PRODUCTION_SERVER",
+    tallyComputerHost: process.env.INVENTORY_TALLY_HOST?.trim() || "accounts",
     dataDirectory,
     excelPath,
     databasePath: storesService.database.databasePath,
@@ -269,6 +336,10 @@ function registerIpcHandlers(): void {
   ipcMain.handle("auth:login", (_event, input: unknown) => {
     if (!operationsService) throw new Error("The inventory operations service is unavailable.");
     return operationsService.login(input as never);
+  });
+  ipcMain.handle("auth:forgot-password", (_event, input: unknown) => {
+    if (!operationsService) throw new Error("The inventory operations service is unavailable.");
+    return operationsService.forgotCredential(input as never);
   });
   ipcMain.handle("auth:resume", (_event, token: unknown) => {
     if (!operationsService) throw new Error("The inventory operations service is unavailable.");
@@ -512,9 +583,17 @@ function registerIpcHandlers(): void {
     if (!planningService) throw new Error("The Planning service is unavailable.");
     return planningService.saveProductOrderWorkflowState(input as never, requireActor(token, "PRODUCT_ORDER_MANAGE"));
   });
+  ipcMain.handle("planning:delete-product-order-workflow-state", (_event, token: unknown, stateId: unknown) => {
+    if (!planningService) throw new Error("The Planning service is unavailable.");
+    return planningService.deleteProductOrderWorkflowState(String(stateId ?? ""), requireActor(token, "PRODUCT_ORDER_MANAGE"));
+  });
   ipcMain.handle("planning:save-product-order-field-definition", (_event, token: unknown, input: unknown) => {
     if (!planningService) throw new Error("The Planning service is unavailable.");
     return planningService.saveProductOrderFieldDefinition(input as never, requireActor(token, "PRODUCT_ORDER_MANAGE"));
+  });
+  ipcMain.handle("planning:delete-product-order-field-definition", (_event, token: unknown, fieldId: unknown) => {
+    if (!planningService) throw new Error("The Planning service is unavailable.");
+    return planningService.deleteProductOrderFieldDefinition(String(fieldId ?? ""), requireActor(token, "PRODUCT_ORDER_MANAGE"));
   });
   ipcMain.handle("planning:export-restock", (_event, token: unknown, input: unknown) => {
     if (!planningService) throw new Error("The Planning service is unavailable.");
@@ -549,6 +628,15 @@ function registerIpcHandlers(): void {
   operation("operations:resolve-sync-exception", "SYNC_EXCEPTION_RESOLVE", (input, actor) => operationsService!.resolveSyncException(input, actor));
   operation("operations:reverse-movement", "TRANSACTION_REVERSE", (input, actor) => operationsService!.reverseMovement(input, actor));
   operation("operations:review-manual-tally", "TALLY_REVIEW", (input, actor) => operationsService!.reviewManualTally(input, actor));
+}
+
+function registerRemoteClientIpcHandlers(): void {
+  ipcMain.handle("desktop:get-info", () => {
+    if (!desktopInfo) throw new Error("The Production server address is unavailable.");
+    return desktopInfo;
+  });
+  ipcMain.handle("desktop:print-html", async (_event, _token: unknown, html: unknown) =>
+    printHtmlDocument(printableHtml(html)));
 }
 
 async function createWindow(): Promise<void> {
@@ -590,8 +678,47 @@ async function createWindow(): Promise<void> {
   }
 }
 
+function runAutomaticBackup(): void {
+  if (!storesService) return;
+  try {
+    storesService.database.backupIfDue(AUTOMATIC_BACKUP_INTERVAL_MS);
+  } catch (error) {
+    console.error(
+      "Automatic Inventory Scanner backup failed:",
+      error instanceof Error ? error.message : String(error),
+    );
+  }
+}
+
+function startAutomaticBackups(): void {
+  runAutomaticBackup();
+  automaticBackupTimer = setInterval(
+    runAutomaticBackup,
+    AUTOMATIC_BACKUP_INTERVAL_MS,
+  );
+  automaticBackupTimer.unref();
+}
+
 async function bootstrap(): Promise<void> {
   Menu.setApplicationMenu(null);
+  if (remoteServerUrl) {
+    const parsed = new URL(remoteServerUrl);
+    desktopInfo = {
+      appVersion: app.getVersion(),
+      apiBaseUrl: remoteServerUrl,
+      computerName: os.hostname(),
+      deploymentRole: "LAN_CLIENT",
+      tallyComputerHost: "accounts",
+      dataDirectory: "",
+      excelPath: "",
+      databasePath: "",
+      port: Number(parsed.port || 80),
+      scannerUrls: [remoteServerUrl],
+    };
+    registerRemoteClientIpcHandlers();
+    await createWindow();
+    return;
+  }
   applicationDatabase = new ApplicationDatabase(
     StoresDatabase.databasePathFor(app.getPath("userData")),
   );
@@ -607,6 +734,7 @@ async function bootstrap(): Promise<void> {
   process.env.TALLY_CACHE_PATH = tallyService.cachePath;
   desktopInfo = await startApi();
   registerIpcHandlers();
+  startAutomaticBackups();
   await createWindow();
 }
 
@@ -640,6 +768,8 @@ app.on("window-all-closed", () => {
 });
 
 app.on("before-quit", () => {
+  if (automaticBackupTimer) clearInterval(automaticBackupTimer);
+  automaticBackupTimer = null;
   apiServer?.close();
   apiServer = null;
   planningService = null;

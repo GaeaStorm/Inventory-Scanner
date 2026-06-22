@@ -71,7 +71,7 @@ export default function TabLayout() {
       <Tabs.Screen
         name="history"
         options={{
-          title: "History",
+          title: "Queue",
           tabBarIcon: ({ color, size }) => (
             <View>
               <Feather name="list" color={color} size={size} />

@@ -29,6 +29,8 @@ export interface StoresStockItem {
   tallyName: string;
   name: string;
   parentName: string;
+  primaryGroupName: string;
+  secondaryGroupName: string;
   hasBom: boolean;
   tallyClosingQuantity: number;
   localAvailableQuantity: number;
@@ -230,6 +232,8 @@ export type StoresDataMode = "empty" | "demo" | "tally";
 
 export interface StoresCatalogGroup {
   name: string;
+  primaryName: string;
+  type: "PRIMARY" | "SECONDARY";
   role: CatalogRole;
   ignored: boolean;
   itemCount: number;

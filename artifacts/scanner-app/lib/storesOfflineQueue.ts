@@ -5,6 +5,8 @@ const DEVICE_KEY = "inventory-scanner:stores-device-id:v1";
 const CATALOG_PREFIX = "inventory-scanner:stores-catalog:v1:";
 const BOX_PREFIX = "inventory-scanner:stores-box:v1:";
 const MAX_QUEUE_ENTRIES = 2500;
+const MAX_CACHED_CATALOGS = 5;
+const MAX_CACHED_BOXES = 100;
 
 export type QueuedStoresOperationType = "MATERIAL_OUT" | "ADJUSTMENT";
 
@@ -61,7 +63,7 @@ async function readQueue(): Promise<QueuedStoresOperation[]> {
 }
 
 async function writeQueue(queue: QueuedStoresOperation[]): Promise<void> {
-  await AsyncStorage.setItem(QUEUE_KEY, JSON.stringify(queue.slice(-MAX_QUEUE_ENTRIES)));
+  await AsyncStorage.setItem(QUEUE_KEY, JSON.stringify(queue));
 }
 
 function summarize(queue: QueuedStoresOperation[]): OfflineQueueSummary {
@@ -97,6 +99,11 @@ export async function enqueueStoresOperation(
       }
       return summarize(queue);
     }
+    if (queue.length >= MAX_QUEUE_ENTRIES) {
+      throw new Error(
+        "This phone's offline queue is full. Synchronize or review rejected transactions before recording more.",
+      );
+    }
     queue.push({
       ...operation,
       createdAt: new Date().toISOString(),
@@ -111,6 +118,19 @@ export async function enqueueStoresOperation(
 
 export async function getStoresQueueSummary(): Promise<OfflineQueueSummary> {
   return summarize(await readQueue());
+}
+
+export async function getStoresQueue(): Promise<QueuedStoresOperation[]> {
+  return readQueue();
+}
+
+export async function removeStoresOperation(clientTransactionId: string): Promise<OfflineQueueSummary> {
+  return serialized(async () => {
+    const queue = await readQueue();
+    const next = queue.filter((entry) => entry.clientTransactionId !== clientTransactionId);
+    await writeQueue(next);
+    return summarize(next);
+  });
 }
 
 export async function synchronizeStoresQueue(serverUrl: string): Promise<OfflineQueueSummary> {
@@ -175,6 +195,7 @@ export async function cacheStoresCatalog<T>(serverUrl: string, catalog: T): Prom
     cachedAt: new Date().toISOString(),
     catalog,
   }));
+  await pruneCachePrefix(CATALOG_PREFIX, MAX_CACHED_CATALOGS);
 }
 
 export async function loadCachedStoresCatalog<T>(serverUrl: string): Promise<T | null> {
@@ -192,6 +213,7 @@ export async function cacheStoresBox<T extends { boxId: string }>(serverUrl: str
     `${BOX_PREFIX}${cacheSuffix(serverUrl)}:${encodeURIComponent(box.boxId)}`,
     JSON.stringify({ cachedAt: new Date().toISOString(), box }),
   );
+  await pruneCachePrefix(BOX_PREFIX, MAX_CACHED_BOXES);
 }
 
 export async function loadCachedStoresBox<T>(serverUrl: string, boxId: string): Promise<T | null> {
@@ -204,4 +226,25 @@ export async function loadCachedStoresBox<T>(serverUrl: string, boxId: string): 
   } catch {
     return null;
   }
+}
+
+async function pruneCachePrefix(prefix: string, maximum: number): Promise<void> {
+  const keys = (await AsyncStorage.getAllKeys()).filter((key) => key.startsWith(prefix));
+  if (keys.length <= maximum) return;
+  const entries = await AsyncStorage.multiGet(keys);
+  const oldest = entries
+    .map(([key, raw]) => {
+      try {
+        const cachedAt = raw
+          ? Date.parse((JSON.parse(raw) as { cachedAt?: string }).cachedAt ?? "")
+          : 0;
+        return { key, cachedAt: Number.isFinite(cachedAt) ? cachedAt : 0 };
+      } catch {
+        return { key, cachedAt: 0 };
+      }
+    })
+    .sort((left, right) => left.cachedAt - right.cachedAt)
+    .slice(0, Math.max(0, keys.length - maximum))
+    .map((entry) => entry.key);
+  if (oldest.length > 0) await AsyncStorage.multiRemove(oldest);
 }

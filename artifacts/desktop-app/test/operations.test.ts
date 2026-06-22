@@ -12,7 +12,7 @@ import type { ActorContext, ConditionBalance } from "../src/operations/types";
 import { PlanningDatabase } from "../src/planning/database";
 import { traceabilityColumns } from "../src/renderer/traceability";
 import { parseBomWorkbook } from "../src/renderer/bom-import";
-import { StoresDatabase } from "../src/stores/database";
+import { retainedBackupPaths, StoresDatabase } from "../src/stores/database";
 import type { BulkVendorReceiptInput } from "../src/stores/types";
 
 interface Context {
@@ -93,6 +93,33 @@ function balance(context: Context, condition: "AVAILABLE" | "PENDING_INSPECTION"
   return row;
 }
 
+test("backup retention keeps today and only the newest backup from yesterday", () => {
+  const now = new Date(2026, 5, 20, 12, 0, 0);
+  const at = (day: number, hour: number) => new Date(2026, 5, day, hour, 0, 0).getTime();
+  const retained = retainedBackupPaths([
+    { path: "today-morning", mtime: at(20, 8) },
+    { path: "today-noon", mtime: at(20, 12) },
+    { path: "yesterday-morning", mtime: at(19, 8) },
+    { path: "yesterday-evening", mtime: at(19, 18) },
+    { path: "older", mtime: at(18, 18) },
+  ], now);
+  assert.deepEqual(
+    [...retained].sort(),
+    ["today-morning", "today-noon", "yesterday-evening"].sort(),
+  );
+});
+
+test("scheduled backup is created only when the newest snapshot is due", () => {
+  const context = createContext();
+  try {
+    const created = context.stores.backupIfDue(2 * 60 * 60 * 1000);
+    assert.ok(created);
+    assert.equal(context.stores.backupIfDue(2 * 60 * 60 * 1000), null);
+  } finally {
+    closeContext(context);
+  }
+});
+
 test("production BOM parser detects product/version and uses component type for matching", () => {
   const workbook = XLSX.utils.book_new();
   XLSX.utils.book_append_sheet(workbook, XLSX.utils.aoa_to_sheet([
@@ -118,6 +145,16 @@ test("production BOM parser detects product/version and uses component type for 
 test("catalog group roles and item ignore overrides drive planning visibility", () => {
   const context = createContext();
   try {
+    const timestamp = new Date().toISOString();
+    context.host.db.prepare(
+      "INSERT INTO tally_stock_groups(name, parent_name, active, synced_at) VALUES (?, ?, 1, ?)",
+    ).run("COMPONENTS", "Primary", timestamp);
+    context.host.db.prepare(
+      "INSERT INTO tally_stock_groups(name, parent_name, active, synced_at) VALUES (?, ?, 1, ?)",
+    ).run("RESISTORS", "COMPONENTS", timestamp);
+    context.host.db.prepare(
+      "UPDATE tally_stock_items SET parent_name = 'RESISTORS' WHERE tally_guid = ?",
+    ).run(context.componentGuid);
     context.stores.setCatalogClassification({
       scope: "GROUP",
       groupName: "MANUFACTURED PRODUCTS",
@@ -133,6 +170,10 @@ test("catalog group roles and item ignore overrides drive planning visibility", 
     let state = context.stores.getState();
     assert.equal(state.stockItems.find((item) => item.tallyGuid === context.productGuid)?.catalogRole, "FINISHED_PRODUCT");
     assert.equal(state.stockItems.find((item) => item.tallyGuid === context.componentGuid)?.catalogRole, "COMPONENT");
+    assert.equal(state.stockItems.find((item) => item.tallyGuid === context.componentGuid)?.primaryGroupName, "COMPONENTS");
+    assert.equal(state.stockItems.find((item) => item.tallyGuid === context.componentGuid)?.secondaryGroupName, "RESISTORS");
+    assert.ok(state.catalogGroups.some((group) => group.name === "COMPONENTS" && group.type === "PRIMARY"));
+    assert.ok(state.catalogGroups.some((group) => group.name === "RESISTORS" && group.type === "SECONDARY" && group.primaryName === "COMPONENTS"));
 
     context.stores.setCatalogClassification({
       scope: "ITEM",
@@ -143,6 +184,29 @@ test("catalog group roles and item ignore overrides drive planning visibility", 
     state = context.stores.getState();
     assert.equal(state.stockItems.find((item) => item.tallyGuid === context.componentGuid)?.ignored, true);
     assert.equal(context.planning.getState().items.some((item) => item.tallyItemGuid === context.componentGuid), false);
+  } finally {
+    closeContext(context);
+  }
+});
+
+test("forgotten credentials can be reset and phones use a shared hidden audit identity", () => {
+  const context = createContext();
+  try {
+    context.operations.forgotCredential({
+      username: "administrator",
+      credential: "replacement-password",
+      credentialType: "PASSWORD",
+    });
+    const session = context.operations.login({
+      username: "administrator",
+      credential: "replacement-password",
+      deviceLabel: "Test desktop",
+    });
+    assert.equal(session.user.username, "administrator");
+    const phone = context.operations.sharedPhoneActor();
+    assert.equal(phone.displayName, "Phone scanner");
+    assert.equal(phone.role, "STORE");
+    assert.equal(context.operations.listUsers().some((user) => user.userId === phone.userId), false);
   } finally {
     closeContext(context);
   }
@@ -178,6 +242,43 @@ test("production-order tracker persists workflow states, spreadsheet fields, and
     assert.equal(saved.pendingQuantity, 2);
     assert.equal(saved.valueIncludingGst, 118000);
     assert.equal(saved.customFields[field.key], "A. Customer");
+  } finally {
+    closeContext(context);
+  }
+});
+
+test("production overview states and custom fields can be deleted safely", () => {
+  const context = createContext();
+  try {
+    const unusedState = context.planning.saveProductOrderWorkflowState({
+      name: "Temporary state",
+      color: "#123456",
+    });
+    const field = context.planning.saveProductOrderFieldDefinition({
+      label: "Temporary field",
+      type: "TEXT",
+    });
+    context.planning.deleteProductOrderWorkflowState(unusedState.id);
+    context.planning.deleteProductOrderFieldDefinition(field.id);
+    let state = context.planning.getState();
+    assert.equal(state.productOrderWorkflowStates.some((entry) => entry.id === unusedState.id), false);
+    assert.equal(state.productOrderFieldDefinitions.some((entry) => entry.id === field.id), false);
+
+    const product = context.stores.getState().stockItems[0];
+    assert.ok(product);
+    const inUse = context.planning.saveProductOrderWorkflowState({ name: "In use" });
+    context.planning.saveProductOrder({
+      externalReference: "DELETE-GUARD",
+      productTallyGuid: product.tallyGuid,
+      quantity: 1,
+      workflowStateId: inUse.id,
+    });
+    assert.throws(
+      () => context.planning.deleteProductOrderWorkflowState(inUse.id),
+      /used by 1 production order/,
+    );
+    state = context.planning.getState();
+    assert.equal(state.productOrderWorkflowStates.some((entry) => entry.id === inUse.id), true);
   } finally {
     closeContext(context);
   }

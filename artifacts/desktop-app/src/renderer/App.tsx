@@ -30,7 +30,7 @@ import type {
 const tabs: Array<{ id: AppTab; label: string; icon: string; permission?: Permission }> = [
   { id: "dashboard", label: "Inventory Dashboard", icon: "▦", permission: "RESTOCK_VIEW" },
   { id: "tracker", label: "Inventory Tracker", icon: "▤", permission: "INVENTORY_VIEW" },
-  { id: "operations", label: "Product Overview", icon: "↻", permission: "INVENTORY_VIEW" },
+  { id: "operations", label: "Orders & Production", icon: "↻", permission: "INVENTORY_VIEW" },
   { id: "qr", label: "QR Code Creator", icon: "⌗", permission: "QR_MANAGE" },
   { id: "settings", label: "Settings", icon: "⚙", permission: "SETTINGS_MANAGE" },
   { id: "tally", label: "Tally Syncer", icon: "⇄", permission: "TALLY_REVIEW" },
@@ -294,6 +294,16 @@ export default function App() {
             <div className="page-heading"><div><p className="eyebrow">APPLICATION SETTINGS</p><h1>Scanner, database, and exports</h1></div></div>
             <div className="settings-grid">
               <article className="panel">
+                <div className="panel__header"><div><p className="eyebrow">COMPANY LAN</p><h2>{desktopInfo?.deploymentRole === "LAN_CLIENT" ? "LAN client" : "Production server"}</h2></div><span className="health-badge">{desktopInfo?.deploymentRole === "LAN_CLIENT" ? "REMOTE" : "AUTHORITATIVE"}</span></div>
+                <dl className="settings-details">
+                  <div><dt>This computer</dt><dd>{desktopInfo?.computerName ?? "Production"}</dd></div>
+                  <div><dt>Mode</dt><dd>{desktopInfo?.deploymentRole === "LAN_CLIENT" ? "Connected to Production" : "Production server"}</dd></div>
+                  <div><dt>LAN clients</dt><dd>{desktopInfo?.scannerUrls.join(", ") || "No LAN address detected"}</dd></div>
+                  <div><dt>Tally computer</dt><dd>{desktopInfo?.tallyComputerHost ?? "accounts"}:9000</dd></div>
+                </dl>
+                <p className="table-footnote">{desktopInfo?.deploymentRole === "LAN_CLIENT" ? "This installation has no local company database. Your role and all changes are validated by Production." : "Keep this computer running during company use. Accounts exposes Tally over the LAN; all inventory records and backups remain here."}</p>
+              </article>
+              <article className="panel">
                 <div className="panel__header"><div><p className="eyebrow">PHONE CONNECTION</p><h2>Connect the Expo scanner</h2></div></div>
                 <div className="scanner-settings">
                   <div className="scanner-qr-card">{scannerQrUrl ? <img src={scannerQrUrl} alt="Phone scanner connection QR" /> : <span>No LAN address detected</span>}</div>
@@ -309,14 +319,14 @@ export default function App() {
               </article>
             </div>
 
-            <BackupRestorePanel
+            {desktopInfo?.deploymentRole !== "LAN_CLIENT" && <BackupRestorePanel
               stores={stores}
               onChanged={handleStoresChanged}
               onNotice={setNotice}
               onError={setError}
-            />
+            />}
 
-            <article className="panel settings-wide-panel">
+            {desktopInfo?.deploymentRole !== "LAN_CLIENT" && <article className="panel settings-wide-panel">
               <div className="panel__header"><div><p className="eyebrow">LEGACY EXCEL AUDIT</p><h2>Existing workbook location</h2></div></div>
               <label className="path-field">Workbook path<input value={workbookPath} onChange={(event) => setWorkbookPath(event.target.value)} /></label>
               <div className="settings-actions">
@@ -324,12 +334,12 @@ export default function App() {
                 <button className="button button--secondary" type="button" onClick={() => void perform(async () => { const folder = await window.desktop.chooseWorkbookFolder(workbookPath); if (folder) { const result = await setWorkbookLocation(folder); setWorkbookPath(result.workbook.path); } })}>Browse…</button>
                 {dashboard?.workbook.path && <button className="button button--secondary" type="button" onClick={() => void window.desktop.openWorkbookFolder(dashboard.workbook.path)}>Open folder</button>}
               </div>
-            </article>
+            </article>}
           </section>
         )}
 
         {activeTab === "tally" && stores && (
-          <TallyTab stores={stores} operations={operations} onChanged={handleStoresChanged} onOperationsChanged={refresh} />
+          <TallyTab stores={stores} operations={operations} localFiles={desktopInfo?.deploymentRole !== "LAN_CLIENT"} onChanged={handleStoresChanged} onOperationsChanged={refresh} />
         )}
       </main>
     </div>

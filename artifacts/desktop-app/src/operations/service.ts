@@ -9,6 +9,7 @@ import type {
   CreateFaultInput,
   CustomerReturnInput,
   FinalizeCountInput,
+  ForgotCredentialInput,
   LoginInput,
   Permission,
   ProductionCompletionInput,
@@ -59,6 +60,14 @@ export class OperationsService {
 
   login(input: LoginInput) {
     return this.database.login(input);
+  }
+
+  forgotCredential(input: ForgotCredentialInput) {
+    return this.database.forgotCredential(input);
+  }
+
+  sharedPhoneActor() {
+    return this.database.sharedPhoneActor();
   }
 
   resume(token: string) {

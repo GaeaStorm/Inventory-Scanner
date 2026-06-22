@@ -46,17 +46,14 @@ export default function RestockActionCenter({
   onError,
 }: Props) {
   const [search, setSearch] = useState("");
-  const finishedProductGroups = useMemo(
-    () => new Set(stores.catalogGroups.filter((group) => group.role === "FINISHED_PRODUCT" && !group.ignored).map((group) => group.name)),
-    [stores.catalogGroups],
-  );
   const finishedProducts = useMemo(
-    () => stores.stockItems.filter((item) => !item.ignored && finishedProductGroups.has(item.parentName) && item.catalogStatus !== "DUPLICATE"),
-    [finishedProductGroups, stores.stockItems],
+    () => stores.stockItems.filter((item) => !item.ignored && item.catalogRole === "FINISHED_PRODUCT" && item.catalogStatus !== "DUPLICATE"),
+    [stores.stockItems],
   );
   const [productGuid, setProductGuid] = useState("");
   const [health, setHealth] = useState("");
-  const [supplier, setSupplier] = useState("");
+  const [primaryGroup, setPrimaryGroup] = useState("");
+  const [secondaryGroup, setSecondaryGroup] = useState("");
   const [selectedGuid, setSelectedGuid] = useState(planning.items[0]?.tallyItemGuid ?? "");
   const [busy, setBusy] = useState(false);
   const [sort, setSort] = useState<{ key: keyof RestockPlanningItem; direction: "asc" | "desc" }>({ key: "health", direction: "asc" });
@@ -77,18 +74,26 @@ export default function RestockActionCenter({
     () => [...stores.suppliers].filter((entry) => entry.name !== "Opening Legacy Stock").sort((a, b) => a.name.localeCompare(b.name)),
     [stores.suppliers],
   );
-  const supplierNames = useMemo(
-    () => [...new Set(planning.items.map((item) => item.preferredSupplierName).filter(Boolean))].sort(),
+  const primaryGroupNames = useMemo(
+    () => [...new Set(planning.items.map((item) => item.primaryGroupName).filter(Boolean))].sort(),
     [planning.items],
+  );
+  const secondaryGroupNames = useMemo(
+    () => [...new Set(planning.items
+      .filter((item) => !primaryGroup || item.primaryGroupName === primaryGroup)
+      .map((item) => item.secondaryGroupName)
+      .filter(Boolean))].sort(),
+    [planning.items, primaryGroup],
   );
   const filtered = useMemo(() => {
     const needle = search.trim().toLocaleLowerCase();
     const requiredGuids = new Set(selectedBom?.lines.map((line) => line.componentTallyGuid) ?? []);
     const rows = planning.items.filter((item) => {
       if (productGuid && !requiredGuids.has(item.tallyItemGuid)) return false;
-      if (needle && !`${item.itemName} ${item.groupName} ${item.preferredSupplierName}`.toLocaleLowerCase().includes(needle)) return false;
+      if (needle && !`${item.itemName} ${item.primaryGroupName} ${item.secondaryGroupName} ${item.preferredSupplierName}`.toLocaleLowerCase().includes(needle)) return false;
       if (health && item.health !== health) return false;
-      if (supplier && item.preferredSupplierName !== supplier) return false;
+      if (primaryGroup && item.primaryGroupName !== primaryGroup) return false;
+      if (secondaryGroup && item.secondaryGroupName !== secondaryGroup) return false;
       return true;
     });
     return rows.sort((left, right) => {
@@ -99,7 +104,7 @@ export default function RestockActionCenter({
         : String(a ?? "").localeCompare(String(b ?? ""), undefined, { numeric: true });
       return sort.direction === "asc" ? comparison : -comparison;
     });
-  }, [planning.items, productGuid, selectedBom, search, health, supplier, sort]);
+  }, [planning.items, productGuid, selectedBom, search, health, primaryGroup, secondaryGroup, sort]);
 
   function toggleSort(key: keyof RestockPlanningItem) {
     setSort((current) => current.key === key
@@ -165,17 +170,18 @@ export default function RestockActionCenter({
             const bom = planning.boms.find((entry) => entry.productTallyGuid === guid && entry.status === "ACTIVE");
             const first = planning.items.find((item) => item.tallyItemGuid === bom?.lines[0]?.componentTallyGuid);
             if (first) choose(first);
-          }}><option value="">Choose a Finished Product…</option>{finishedProducts.map((item) => <option key={item.tallyGuid} value={item.tallyGuid}>{item.name} · {item.parentName}</option>)}</select>
+          }}><option value="">Choose a Finished Product…</option>{finishedProducts.map((item) => <option key={item.tallyGuid} value={item.tallyGuid}>{item.name} · {[item.primaryGroupName, item.secondaryGroupName].filter(Boolean).join(" › ") || "Ungrouped"}</option>)}</select>
           <select aria-label="Filter by status" value={health} onChange={(event) => setHealth(event.target.value)}><option value="">All statuses</option>{Object.entries(healthLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select>
-          <select aria-label="Filter by supplier" value={supplier} onChange={(event) => setSupplier(event.target.value)}><option value="">All suppliers</option>{supplierNames.map((entry) => <option key={entry}>{entry}</option>)}</select>
-          <button className="button button--secondary" type="button" onClick={() => { setSearch(""); setProductGuid(""); setHealth(""); setSupplier(""); }}>Clear filters</button>
+          <select aria-label="Filter by primary group" value={primaryGroup} onChange={(event) => { setPrimaryGroup(event.target.value); setSecondaryGroup(""); }}><option value="">All primary groups</option>{primaryGroupNames.map((entry) => <option key={entry}>{entry}</option>)}</select>
+          <select aria-label="Filter by secondary group" value={secondaryGroup} onChange={(event) => setSecondaryGroup(event.target.value)} disabled={secondaryGroupNames.length === 0}><option value="">All secondary groups</option>{secondaryGroupNames.map((entry) => <option key={entry}>{entry}</option>)}</select>
+          <button className="button button--secondary" type="button" onClick={() => { setSearch(""); setProductGuid(""); setHealth(""); setPrimaryGroup(""); setSecondaryGroup(""); }}>Clear filters</button>
         </div>
         <div className="table-scroll planning-restock-table"><table>
           <thead><tr><th>{sortLabel("Status", "health")}</th><th>{sortLabel("Stock Item", "itemName")}</th><th className="numeric">{sortLabel("On hand", "onHand")}</th><th className="numeric">{sortLabel("Reserved", "reserved")}</th><th className="numeric">{sortLabel("Service", "serviceReserve")}</th><th className="numeric">{sortLabel("Available", "available")}</th><th className="numeric">{sortLabel("Incoming", "incoming")}</th><th className="numeric">{sortLabel("Projected", "projected")}</th><th className="numeric">{sortLabel("Reorder", "reorderPoint")}</th><th className="numeric">{sortLabel("Target", "targetStock")}</th><th className="numeric">{sortLabel("Suggested order", "suggestedOrderQuantity")}</th><th>{sortLabel("Supplier", "preferredSupplierName")}</th></tr></thead>
           <tbody>
             {filtered.map((item) => <tr key={item.tallyItemGuid} className={selectedGuid === item.tallyItemGuid ? "selected-row" : ""} onClick={() => choose(item)}>
               <td><span className={`planning-health planning-health--${item.health.toLocaleLowerCase().replaceAll("_", "-")}`}>{healthLabels[item.health]}</span></td>
-              <td><strong>{item.itemName}</strong><small className="table-subtext">{item.groupName || "No group"}{item.catalogSource === "LOCAL" ? " · Local-only" : ""}</small></td>
+              <td><strong>{item.itemName}</strong><small className="table-subtext">{[item.primaryGroupName, item.secondaryGroupName].filter(Boolean).join(" › ") || "No group"}{item.catalogSource === "LOCAL" ? " · Local-only" : ""}</small></td>
               <td className="numeric">{item.onHand}</td><td className="numeric">{item.reserved}</td><td className="numeric">{item.serviceReserve}</td><td className="numeric">{item.available}</td><td className="numeric">{item.incoming}</td><td className="numeric">{item.projected}</td><td className="numeric">{item.reorderPoint}</td><td className="numeric">{item.targetStock}</td><td className="numeric"><strong>{item.suggestedOrderQuantity}</strong></td><td>{item.preferredSupplierName || "—"}</td>
             </tr>)}
             {filtered.length === 0 && <tr><td colSpan={12} className="empty-table">No Stock Items match these filters.</td></tr>}

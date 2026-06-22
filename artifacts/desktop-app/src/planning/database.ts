@@ -528,6 +528,37 @@ export class PlanningDatabase {
     return this.getProductOrderWorkflowStates().find((state) => state.id === stateId)!;
   }
 
+  deleteProductOrderWorkflowState(stateIdValue: string): void {
+    this.ensureReady();
+    const stateId = text(stateIdValue);
+    const state = this.db.prepare(`
+      SELECT id, name FROM planning_product_order_workflow_states WHERE id = ?
+    `).get(stateId) as Row | undefined;
+    if (!state) throw new Error("Workflow state not found.");
+    const stateCount = Number((this.db.prepare(`
+      SELECT COUNT(*) AS count FROM planning_product_order_workflow_states
+    `).get() as Row).count);
+    if (stateCount <= 1) throw new Error("At least one workflow state must remain.");
+    const orderCount = Number((this.db.prepare(`
+      SELECT COUNT(*) AS count FROM planning_product_orders WHERE workflow_state_id = ?
+    `).get(stateId) as Row).count);
+    if (orderCount > 0) {
+      throw new Error(
+        `${text(state.name)} is used by ${orderCount} production order${orderCount === 1 ? "" : "s"}. Move those orders to another state before deleting it.`,
+      );
+    }
+    this.host.transaction("deleting a production workflow state", () => {
+      this.db.prepare("DELETE FROM planning_product_order_workflow_states WHERE id = ?").run(stateId);
+      this.db.prepare(`
+        UPDATE planning_product_order_workflow_states
+        SET position = (
+          SELECT COUNT(*) FROM planning_product_order_workflow_states earlier
+          WHERE earlier.position <= planning_product_order_workflow_states.position
+        )
+      `).run();
+    });
+  }
+
   saveProductOrderFieldDefinition(input: SaveProductOrderFieldDefinitionInput): ProductOrderFieldDefinition {
     this.ensureReady();
     const label = text(input.label);
@@ -551,6 +582,25 @@ export class PlanningDatabase {
       ) VALUES (?, ?, ?, ?, ?, ?)
     `).run(id, key, label, type, position, nowIso());
     return this.getProductOrderFieldDefinitions().find((field) => field.id === id)!;
+  }
+
+  deleteProductOrderFieldDefinition(fieldIdValue: string): void {
+    this.ensureReady();
+    const fieldId = text(fieldIdValue);
+    const field = this.db.prepare(`
+      SELECT id FROM planning_product_order_field_definitions WHERE id = ?
+    `).get(fieldId);
+    if (!field) throw new Error("Custom field not found.");
+    this.host.transaction("deleting a production order custom field", () => {
+      this.db.prepare("DELETE FROM planning_product_order_field_definitions WHERE id = ?").run(fieldId);
+      this.db.prepare(`
+        UPDATE planning_product_order_field_definitions
+        SET position = (
+          SELECT COUNT(*) FROM planning_product_order_field_definitions earlier
+          WHERE earlier.position <= planning_product_order_field_definitions.position
+        )
+      `).run();
+    });
   }
 
   updateProductOrderWorkflowState(orderId: string, workflowStateId: string): void {
@@ -943,11 +993,36 @@ export class PlanningDatabase {
   }
 
   private getPlanningItems(): RestockPlanningItem[] {
+    const groupParents = new Map((this.db.prepare(
+      "SELECT name, parent_name FROM tally_stock_groups WHERE active = 1",
+    ).all() as Row[]).map((row) => [text(row.name).toLocaleLowerCase(), text(row.parent_name)]));
+    const groupSettings = new Map((this.db.prepare(
+      "SELECT group_name, catalog_role, ignored FROM catalog_group_settings",
+    ).all() as Row[]).map((row) => [text(row.group_name).toLocaleLowerCase(), {
+      role: text(row.catalog_role),
+      ignored: Number(row.ignored) === 1,
+    }]));
+    const splitGroup = (directName: string) => {
+      let current = directName;
+      const visited = new Set<string>();
+      for (;;) {
+        const key = current.toLocaleLowerCase();
+        if (visited.has(key)) break;
+        visited.add(key);
+        const parent = groupParents.get(key) ?? "";
+        if (!parent || parent.toLocaleLowerCase() === "primary") break;
+        current = parent;
+      }
+      return {
+        primaryGroupName: current,
+        secondaryGroupName: current.toLocaleLowerCase() === directName.toLocaleLowerCase() ? "" : directName,
+      };
+    };
     const rows = this.db.prepare(`
       SELECT item.id, item.tally_guid,
         COALESCE(NULLIF(item.local_name_override, ''), item.name) AS name,
         item.parent_name, item.source, item.catalog_status,
-        COALESCE(item.catalog_role_override, group_settings.catalog_role, 'OTHER') AS catalog_role,
+        item.catalog_role_override,
         policy.planning_method, policy.reorder_point, policy.target_stock,
         policy.service_reserve, policy.preferred_supplier_id,
         supplier.name AS preferred_supplier_name, policy.lead_time_days,
@@ -963,13 +1038,11 @@ export class PlanningDatabase {
             AND po.status <> 'CLOSED'
             AND pol.ordered_quantity > pol.received_quantity), 0) AS incoming
       FROM tally_stock_items item
-      LEFT JOIN catalog_group_settings group_settings ON group_settings.group_name = item.parent_name COLLATE NOCASE
       LEFT JOIN planning_restock_policies policy ON policy.stock_item_id = item.id
       LEFT JOIN suppliers supplier ON supplier.id = policy.preferred_supplier_id
       LEFT JOIN planning_recommendations recommendation ON recommendation.stock_item_id = item.id
       WHERE item.active = 1
         AND item.catalog_ignored = 0
-        AND COALESCE(group_settings.ignored, 0) = 0
         AND item.catalog_status <> 'DUPLICATE'
         AND (
           item.catalog_status <> 'OBSOLETE'
@@ -982,6 +1055,12 @@ export class PlanningDatabase {
       ORDER BY item.name
     `).all() as Row[];
     return rows.map((row) => {
+      const groups = splitGroup(text(row.parent_name));
+      const primarySettings = groupSettings.get(groups.primaryGroupName.toLocaleLowerCase());
+      const secondarySettings = groups.secondaryGroupName
+        ? groupSettings.get(groups.secondaryGroupName.toLocaleLowerCase())
+        : undefined;
+      if (primarySettings?.ignored || secondarySettings?.ignored) return null;
       const configured = row.planning_method != null;
       const lookbackDays = Number(row.usage_lookback_days ?? 90);
       const averageDailyUsage = this.usageForItem(Number(row.id), lookbackDays);
@@ -1031,9 +1110,11 @@ export class PlanningDatabase {
         tallyItemGuid: text(row.tally_guid),
         itemName: text(row.name),
         groupName: text(row.parent_name),
+        primaryGroupName: groups.primaryGroupName,
+        secondaryGroupName: groups.secondaryGroupName,
         catalogSource: row.source === "LOCAL" ? "LOCAL" : "TALLY",
         catalogStatus: obsolete ? "OBSOLETE" : "ACTIVE",
-        catalogRole: text(row.catalog_role) as RestockPlanningItem["catalogRole"],
+        catalogRole: (text(row.catalog_role_override) || secondarySettings?.role || primarySettings?.role || "OTHER") as RestockPlanningItem["catalogRole"],
         planningMethod: row.planning_method ?? "MANUAL",
         reorderPoint,
         targetStock,
@@ -1064,7 +1145,7 @@ export class PlanningDatabase {
         health,
         dataWarnings: warnings,
       };
-    });
+    }).filter((item): item is RestockPlanningItem => item !== null);
   }
 
   getState(): PlanningState {
@@ -1117,6 +1198,8 @@ export class PlanningDatabase {
       productOrderWorkflowStates,
       productOrderFieldDefinitions,
       groups: [...new Set(items.map((item) => item.groupName).filter(Boolean))].sort(),
+      primaryGroups: [...new Set(items.map((item) => item.primaryGroupName).filter(Boolean))].sort(),
+      secondaryGroups: [...new Set(items.map((item) => item.secondaryGroupName).filter(Boolean))].sort(),
     };
   }
 

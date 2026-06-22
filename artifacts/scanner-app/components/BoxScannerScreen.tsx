@@ -25,11 +25,8 @@ import {
   cacheStoresCatalog,
   createStoresClientTransactionId,
   enqueueStoresOperation,
-  getStoresQueueSummary,
   loadCachedStoresBox,
   loadCachedStoresCatalog,
-  synchronizeStoresQueue,
-  type OfflineQueueSummary,
 } from "@/lib/storesOfflineQueue";
 
 const DEBOUNCE_MS = 2000;
@@ -199,7 +196,7 @@ function Dropdown<T extends { id?: number | string; tallyGuid?: string; name?: s
 export default function BoxScannerScreen() {
   const c = useColors();
   const insets = useSafeAreaInsets();
-  const { serverUrl } = useSync();
+  const { serverUrl, queueSummary, syncPending, refreshQueue } = useSync();
   const [permission, requestPermission] = useCameraPermissions();
   const [scanned, setScanned] = useState(false);
   const [scanArmed, setScanArmed] = useState(false);
@@ -223,7 +220,6 @@ export default function BoxScannerScreen() {
   const [error, setError] = useState("");
   const [success, setSuccess] = useState("");
   const [connectionState, setConnectionState] = useState<"online" | "offline" | "unknown">("unknown");
-  const [queueSummary, setQueueSummary] = useState<OfflineQueueSummary>({ pending: 0, rejected: 0, total: 0 });
   const [usingCachedData, setUsingCachedData] = useState(false);
   const lastScanTime = useRef(0);
 
@@ -233,32 +229,6 @@ export default function BoxScannerScreen() {
       candidate.tallyGuid === item.tallyItemGuid || candidate.name.toLocaleLowerCase() === item.itemName.toLocaleLowerCase(),
     )).filter((value): value is CatalogItem => Boolean(value));
   }, [box, catalog]);
-
-  useEffect(() => {
-    let cancelled = false;
-    const refreshQueue = async () => {
-      try {
-        const summary = serverUrl
-          ? await synchronizeStoresQueue(serverUrl)
-          : await getStoresQueueSummary();
-        if (!cancelled) {
-          setQueueSummary(summary);
-          if (serverUrl) setConnectionState("online");
-        }
-      } catch {
-        if (!cancelled) {
-          setConnectionState("offline");
-          setQueueSummary(await getStoresQueueSummary());
-        }
-      }
-    };
-    void refreshQueue();
-    const timer = setInterval(() => void refreshQueue(), 30_000);
-    return () => {
-      cancelled = true;
-      clearInterval(timer);
-    };
-  }, [serverUrl]);
 
   useEffect(() => {
     if (workflow !== "ADJUSTMENT" || !selectedItem || !destination || !serverUrl) {
@@ -453,16 +423,15 @@ export default function BoxScannerScreen() {
             eventDate: today(),
           };
 
-      const queued = await enqueueStoresOperation({
+      await enqueueStoresOperation({
         clientTransactionId,
         type: workflow,
         payload,
       });
-      setQueueSummary(queued);
+      await refreshQueue();
 
       try {
-        const synchronized = await synchronizeStoresQueue(serverUrl);
-        setQueueSummary(synchronized);
+        const synchronized = await syncPending();
         setConnectionState("online");
         const stillQueued = synchronized.pending > 0;
         setSuccess(stillQueued
@@ -472,7 +441,7 @@ export default function BoxScannerScreen() {
             : "Adjustment synchronized and validated by the desktop.");
       } catch {
         setConnectionState("offline");
-        setQueueSummary(await getStoresQueueSummary());
+        await refreshQueue();
         setSuccess("Saved safely on this phone. It will synchronize automatically when the desktop is reachable.");
       }
       if (Platform.OS !== "web") {

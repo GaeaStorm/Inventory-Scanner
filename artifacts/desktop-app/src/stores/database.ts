@@ -47,8 +47,7 @@ import type {
   VendorReceiptInput,
 } from "./types";
 
-const SCHEMA_VERSION = 9;
-const BACKUP_RETENTION = 30;
+const SCHEMA_VERSION = 10;
 const LEGACY_SUPPLIER_NAME = "Opening Legacy Stock";
 const LEGACY_SUPPLIER_GUID = "LOCAL:LEGACY_OPENING";
 
@@ -56,6 +55,44 @@ type Row = Record<string, any>;
 
 function nowIso(): string {
   return new Date().toISOString();
+}
+
+function localDayKey(value: Date): string {
+  const year = value.getFullYear();
+  const month = String(value.getMonth() + 1).padStart(2, "0");
+  const day = String(value.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+export interface BackupRetentionCandidate {
+  path: string;
+  mtime: number;
+}
+
+/**
+ * Keep every backup created today plus only the newest backup from yesterday.
+ * Older files are deliberately excluded so scheduled snapshots cannot grow
+ * the application-data folder forever.
+ */
+export function retainedBackupPaths(
+  backups: BackupRetentionCandidate[],
+  now = new Date(),
+): Set<string> {
+  const today = localDayKey(now);
+  const yesterdayDate = new Date(now);
+  yesterdayDate.setDate(now.getDate() - 1);
+  const yesterday = localDayKey(yesterdayDate);
+  const sorted = [...backups].sort((left, right) => right.mtime - left.mtime);
+  const retained = new Set(
+    sorted
+      .filter((backup) => localDayKey(new Date(backup.mtime)) === today)
+      .map((backup) => backup.path),
+  );
+  const previousDay = sorted.find(
+    (backup) => localDayKey(new Date(backup.mtime)) === yesterday,
+  );
+  if (previousDay) retained.add(previousDay.path);
+  return retained;
 }
 
 function businessDate(value?: string): string {
@@ -256,9 +293,11 @@ export class StoresDatabase {
       .map((name) => ({
         path: path.join(backupFolder, name),
         mtime: statSync(path.join(backupFolder, name)).mtimeMs,
-      }))
-      .sort((left, right) => right.mtime - left.mtime);
-    for (const old of backups.slice(BACKUP_RETENTION)) unlinkSync(old.path);
+      }));
+    const retained = retainedBackupPaths(backups);
+    for (const backup of backups) {
+      if (!retained.has(backup.path)) unlinkSync(backup.path);
+    }
   }
 
   private backupBeforeMigration(): void {
@@ -662,6 +701,24 @@ export class StoresDatabase {
         this.db.prepare("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)").run(9, nowIso());
       }, "adding catalog roles and ignore settings");
     }
+
+    if (current < 10) {
+      this.transaction(() => {
+        this.db.exec(`
+          CREATE TABLE tally_stock_groups (
+            name TEXT PRIMARY KEY COLLATE NOCASE,
+            parent_name TEXT NOT NULL DEFAULT '',
+            tally_guid TEXT NOT NULL DEFAULT '',
+            alter_id TEXT NOT NULL DEFAULT '',
+            active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0,1)),
+            synced_at TEXT NOT NULL
+          ) STRICT;
+          CREATE INDEX idx_tally_stock_groups_parent
+            ON tally_stock_groups(parent_name COLLATE NOCASE, active, name COLLATE NOCASE);
+        `);
+        this.db.prepare("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)").run(10, nowIso());
+      }, "adding primary and secondary Tally group hierarchy");
+    }
   }
 
   transaction<T>(work: () => T, operation = "updating inventory"): T {
@@ -810,8 +867,28 @@ export class StoresDatabase {
     );
     this.createVerifiedBackup(this.db, backupPath);
     this.pruneBackups(backupFolder);
+    try {
+      this.db.exec("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA optimize;");
+    } catch {
+      // The validated snapshot is still usable if optional SQLite housekeeping
+      // is temporarily blocked by another request.
+    }
 
     return { path: backupPath, createdAt, valid: true };
+  }
+
+  backupIfDue(intervalMs: number, now = new Date()): StoresBackupResult | null {
+    const backupFolder = this.getBackupFolder();
+    mkdirSync(backupFolder, { recursive: true });
+    const latestMtime = readdirSync(backupFolder)
+      .filter((name) => name.endsWith(".sqlite"))
+      .map((name) => statSync(path.join(backupFolder, name)).mtimeMs)
+      .reduce((latest, value) => Math.max(latest, value), 0);
+    if (latestMtime > 0 && now.getTime() - latestMtime < intervalMs) {
+      this.pruneBackups(backupFolder);
+      return null;
+    }
+    return this.backup("automatic-2-hour");
   }
 
   private schemaVersionForFile(databasePath: string): number {
@@ -833,30 +910,39 @@ export class StoresDatabase {
   listBackups(): StoresBackupInfo[] {
     const folder = this.getBackupFolder();
     if (!existsSync(folder)) return [];
-    return readdirSync(folder)
+    const candidates = readdirSync(folder)
       .filter((name) => name.endsWith(".sqlite"))
       .map((fileName) => {
         const backupPath = path.join(folder, fileName);
-        const stats = statSync(backupPath);
+        return {
+          fileName,
+          path: backupPath,
+          mtime: statSync(backupPath).mtimeMs,
+        };
+      });
+    const retained = retainedBackupPaths(candidates);
+    return candidates
+      .filter((candidate) => retained.has(candidate.path))
+      .map((candidate) => {
+        const stats = statSync(candidate.path);
         let valid = false;
         let schemaVersion = 0;
         try {
-          valid = this.validateBackupFile(backupPath, true);
-          schemaVersion = this.schemaVersionForFile(backupPath);
+          valid = this.validateBackupFile(candidate.path, true);
+          schemaVersion = this.schemaVersionForFile(candidate.path);
         } catch {
           valid = false;
         }
         return {
-          path: backupPath,
-          fileName,
+          path: candidate.path,
+          fileName: candidate.fileName,
           createdAt: stats.mtime.toISOString(),
           sizeBytes: stats.size,
           valid,
           schemaVersion,
         };
       })
-      .sort((left, right) => right.createdAt.localeCompare(left.createdAt))
-      .slice(0, BACKUP_RETENTION);
+      .sort((left, right) => right.createdAt.localeCompare(left.createdAt));
   }
 
   restoreBackup(backupPathValue: string): StoresRestoreResult {
@@ -1138,6 +1224,19 @@ export class StoresDatabase {
       const historyId = Number(historyInsert.lastInsertRowid);
 
       this.db.exec("UPDATE tally_stock_items SET active = 0 WHERE source = 'TALLY'");
+      this.db.exec("UPDATE tally_stock_groups SET active = 0");
+      for (const group of snapshot.stockGroups) {
+        this.db.prepare(`
+          INSERT INTO tally_stock_groups(name, parent_name, tally_guid, alter_id, active, synced_at)
+          VALUES (?, ?, ?, ?, 1, ?)
+          ON CONFLICT(name) DO UPDATE SET
+            parent_name = excluded.parent_name,
+            tally_guid = excluded.tally_guid,
+            alter_id = excluded.alter_id,
+            active = 1,
+            synced_at = excluded.synced_at
+        `).run(group.name, group.parent, group.guid, group.alterId, snapshot.syncedAt);
+      }
       const itemIdByGuid = new Map<string, number>();
       const itemIdByName = new Map<string, number>();
       for (const item of snapshot.stockItems) {
@@ -1356,6 +1455,10 @@ export class StoresDatabase {
       this.db.prepare(`
         UPDATE sync_history SET completed_at = ?, status = 'SUCCESS', summary_json = ?, warnings_json = ? WHERE id = ?
       `).run(nowIso(), json(summary), json(warnings), historyId);
+      this.db.exec(`
+        DELETE FROM sync_history
+        WHERE id NOT IN (SELECT id FROM sync_history ORDER BY id DESC LIMIT 100)
+      `);
     });
 
     return summary;
@@ -2311,11 +2414,40 @@ export class StoresDatabase {
   }
 
   getState(): StoresState {
+    const groupRows = this.db.prepare(`
+      SELECT name, parent_name FROM tally_stock_groups WHERE active = 1 ORDER BY name COLLATE NOCASE
+    `).all() as Row[];
+    const groupParents = new Map(groupRows.map((row) => [text(row.name).toLocaleLowerCase(), {
+      name: text(row.name),
+      parentName: text(row.parent_name),
+    }]));
+    const groupSettings = new Map((this.db.prepare(`
+      SELECT group_name, catalog_role, ignored FROM catalog_group_settings
+    `).all() as Row[]).map((row) => [text(row.group_name).toLocaleLowerCase(), {
+      role: text(row.catalog_role) as StoresStockItem["catalogRole"],
+      ignored: Number(row.ignored) === 1,
+    }]));
+    const splitGroup = (directName: string) => {
+      const direct = text(directName);
+      if (!direct) return { primaryGroupName: "", secondaryGroupName: "" };
+      let current = direct;
+      const visited = new Set<string>();
+      for (;;) {
+        const key = current.toLocaleLowerCase();
+        if (visited.has(key)) break;
+        visited.add(key);
+        const parent = groupParents.get(key)?.parentName ?? "";
+        if (!parent || parent.toLocaleLowerCase() === "primary") break;
+        current = parent;
+      }
+      return {
+        primaryGroupName: current,
+        secondaryGroupName: current.toLocaleLowerCase() === direct.toLocaleLowerCase() ? "" : direct,
+      };
+    };
     const stockRows = this.db.prepare(`
       SELECT tsi.*, primary_item.tally_guid AS duplicate_of_tally_guid,
         COALESCE(NULLIF(primary_item.local_name_override, ''), primary_item.name) AS duplicate_of_name,
-        group_settings.catalog_role AS group_catalog_role,
-        COALESCE(group_settings.ignored, 0) AS group_ignored,
         COALESCE((SELECT SUM(pl.quantity_remaining) FROM purchase_lots pl WHERE pl.stock_item_id = tsi.id), 0) AS local_available,
         COALESCE((SELECT SUM(balance.quantity) FROM ops_lot_balances balance JOIN ops_lots lot ON lot.id = balance.lot_id WHERE lot.stock_item_id = tsi.id AND balance.condition = 'PENDING_INSPECTION'), 0) AS local_pending,
         COALESCE((SELECT SUM(balance.quantity) FROM ops_lot_balances balance JOIN ops_lots lot ON lot.id = balance.lot_id WHERE lot.stock_item_id = tsi.id AND balance.condition = 'FAULTY'), 0) AS local_faulty,
@@ -2324,18 +2456,27 @@ export class StoresDatabase {
         COALESCE((SELECT COUNT(*) FROM ops_serials serial WHERE serial.stock_item_id = tsi.id AND serial.active = 1 AND serial.condition IN ('AVAILABLE','PENDING_INSPECTION','FAULTY')), 0) AS serialized_quantity
       FROM tally_stock_items tsi
       LEFT JOIN tally_stock_items primary_item ON primary_item.id = tsi.duplicate_of_item_id
-      LEFT JOIN catalog_group_settings group_settings ON group_settings.group_name = tsi.parent_name COLLATE NOCASE
       WHERE tsi.active = 1
         OR EXISTS (SELECT 1 FROM purchase_lots pl WHERE pl.stock_item_id = tsi.id AND pl.quantity_remaining > 0)
         OR EXISTS (SELECT 1 FROM ops_lot_balances balance JOIN ops_lots lot ON lot.id = balance.lot_id WHERE lot.stock_item_id = tsi.id AND balance.quantity > 0)
       ORDER BY COALESCE(NULLIF(tsi.local_name_override, ''), tsi.name)
     `).all() as Row[];
-    const stockItems: StoresStockItem[] = stockRows.map((row) => ({
+    const stockItems: StoresStockItem[] = stockRows.map((row) => {
+      const groups = splitGroup(text(row.parent_name));
+      const primarySettings = groupSettings.get(groups.primaryGroupName.toLocaleLowerCase());
+      const secondarySettings = groups.secondaryGroupName
+        ? groupSettings.get(groups.secondaryGroupName.toLocaleLowerCase())
+        : undefined;
+      const itemIgnored = Number(row.catalog_ignored) === 1;
+      const groupIgnored = Boolean(primarySettings?.ignored || secondarySettings?.ignored);
+      return {
       id: Number(row.id),
       tallyGuid: text(row.tally_guid),
       tallyName: text(row.name),
       name: text(row.local_name_override) || text(row.name),
       parentName: text(row.parent_name),
+      primaryGroupName: groups.primaryGroupName,
+      secondaryGroupName: groups.secondaryGroupName,
       hasBom: Number(row.has_bom) === 1,
       tallyClosingQuantity: Number(row.tally_closing_quantity),
       localAvailableQuantity: Number(row.local_available),
@@ -2349,34 +2490,40 @@ export class StoresDatabase {
       catalogStatus: ["DUPLICATE", "OBSOLETE"].includes(text(row.catalog_status))
         ? text(row.catalog_status) as StoresStockItem["catalogStatus"]
         : "ACTIVE",
-      catalogRole: (text(row.catalog_role_override) || text(row.group_catalog_role) || "OTHER") as StoresStockItem["catalogRole"],
+      catalogRole: (text(row.catalog_role_override) || secondarySettings?.role || primarySettings?.role || "OTHER") as StoresStockItem["catalogRole"],
       itemRoleOverride: row.catalog_role_override == null ? null : text(row.catalog_role_override) as StoresStockItem["itemRoleOverride"],
-      itemIgnored: Number(row.catalog_ignored) === 1,
-      groupIgnored: Number(row.group_ignored) === 1,
-      ignored: Number(row.catalog_ignored) === 1 || Number(row.group_ignored) === 1,
+      itemIgnored,
+      groupIgnored,
+      ignored: itemIgnored || groupIgnored,
       duplicateOfTallyGuid: row.duplicate_of_tally_guid == null ? null : text(row.duplicate_of_tally_guid),
       duplicateOfName: row.duplicate_of_name == null ? null : text(row.duplicate_of_name),
-    }));
+    }});
 
     const suppliers: StoresSupplier[] = (this.db.prepare("SELECT id, tally_guid, name FROM suppliers WHERE name <> ? ORDER BY name").all(LEGACY_SUPPLIER_NAME) as Row[]).map((row) => ({
       id: Number(row.id), tallyGuid: text(row.tally_guid), name: text(row.name),
     }));
-    const catalogGroups = (this.db.prepare(`
-      SELECT item.parent_name AS name,
-        COALESCE(settings.catalog_role, 'OTHER') AS catalog_role,
-        COALESCE(settings.ignored, 0) AS ignored,
-        COUNT(*) AS item_count
-      FROM tally_stock_items item
-      LEFT JOIN catalog_group_settings settings ON settings.group_name = item.parent_name COLLATE NOCASE
-      WHERE item.active = 1 AND item.parent_name <> ''
-      GROUP BY item.parent_name
-      ORDER BY item.parent_name
-    `).all() as Row[]).map((row) => ({
-      name: text(row.name),
-      role: text(row.catalog_role) as StoresState["catalogGroups"][number]["role"],
-      ignored: Number(row.ignored) === 1,
-      itemCount: Number(row.item_count),
-    }));
+    const knownGroupNames = new Set(groupRows.map((row) => text(row.name)));
+    for (const item of stockItems) {
+      if (item.parentName) knownGroupNames.add(item.parentName);
+    }
+    const catalogGroups = [...knownGroupNames].map((name) => {
+      const split = splitGroup(name);
+      const type = split.secondaryGroupName ? "SECONDARY" as const : "PRIMARY" as const;
+      const settings = groupSettings.get(name.toLocaleLowerCase());
+      const primarySettings = type === "SECONDARY"
+        ? groupSettings.get(split.primaryGroupName.toLocaleLowerCase())
+        : undefined;
+      return {
+        name,
+        primaryName: split.primaryGroupName || name,
+        type,
+        role: settings?.role ?? primarySettings?.role ?? "OTHER",
+        ignored: Boolean(settings?.ignored || primarySettings?.ignored),
+        itemCount: stockItems.filter((item) => type === "PRIMARY"
+          ? item.primaryGroupName.toLocaleLowerCase() === name.toLocaleLowerCase()
+          : item.secondaryGroupName.toLocaleLowerCase() === name.toLocaleLowerCase()).length,
+      };
+    }).sort((left, right) => left.primaryName.localeCompare(right.primaryName) || left.type.localeCompare(right.type) || left.name.localeCompare(right.name));
 
     const purchaseOrders: StoresPurchaseOrder[] = (this.db.prepare(`
       SELECT po.*, supplier.name AS supplier_name FROM purchase_orders po

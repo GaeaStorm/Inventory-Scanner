@@ -41,6 +41,8 @@ export interface RestockPolicy {
   tallyItemGuid: string;
   itemName: string;
   groupName: string;
+  primaryGroupName: string;
+  secondaryGroupName: string;
   catalogSource: "TALLY" | "LOCAL";
   catalogStatus: "ACTIVE" | "OBSOLETE";
   catalogRole: import("../stores/types").CatalogRole;
@@ -276,4 +278,6 @@ export interface PlanningState {
   productOrderWorkflowStates: ProductOrderWorkflowState[];
   productOrderFieldDefinitions: ProductOrderFieldDefinition[];
   groups: string[];
+  primaryGroups: string[];
+  secondaryGroups: string[];
 }

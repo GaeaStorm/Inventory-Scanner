@@ -11,12 +11,13 @@ import type {
 interface Props {
   stores: StoresState;
   operations?: OperationsState | null;
+  localFiles?: boolean;
   onChanged: (state: StoresState) => void;
   onOperationsChanged?: () => Promise<void>;
 }
 
 const DEFAULT_SETTINGS: TallyConnectionSettings = {
-  host: "localhost",
+  host: "accounts",
   port: 9000,
   company: "",
   timeoutMs: 15_000,
@@ -36,7 +37,7 @@ function formatBytes(value: number): string {
   return `${(value / 1024 ** 2).toFixed(1)} MB`;
 }
 
-export default function TallyTab({ stores, operations, onChanged, onOperationsChanged }: Props) {
+export default function TallyTab({ stores, operations, localFiles = true, onChanged, onOperationsChanged }: Props) {
   const [settings, setSettings] = useState<TallyConnectionSettings>(DEFAULT_SETTINGS);
   const [companies, setCompanies] = useState<TallyCompany[]>([]);
   const [reviewer, setReviewer] = useState("");
@@ -193,16 +194,16 @@ export default function TallyTab({ stores, operations, onChanged, onOperationsCh
     <section className="tab-page">
       <div className="page-heading">
         <div><p className="eyebrow">READ FROM TALLY · EXPORT EVERYTHING TALLY-READY</p><h1>Tally Syncer</h1><p>Catalog reads, voucher review, Material In/Out, Stock Items, name changes, duplicate review, products, and active BOM definitions are managed here. Files are generated for review and import; the app does not post directly into Tally.</p></div>
-        <button className="button button--secondary" type="button" onClick={() => void window.desktop.stores.openPath(stores.database.exportFolder)}>Open export folder</button>
+        {localFiles && <button className="button button--secondary" type="button" onClick={() => void window.desktop.stores.openPath(stores.database.exportFolder)}>Open export folder</button>}
       </div>
       {error && <div className="alert alert--error">{error}</div>}
       {notice && <div className="alert alert--success">{notice}</div>}
 
       <div className="tally-grid">
         <article className="panel tally-connection-panel">
-          <div className="panel__header"><div><p className="eyebrow">TALLYPRIME GOLD 7.0</p><h2>Local read-only connection</h2></div><span className="health-badge">EXPORT REQUESTS ONLY</span></div>
+          <div className="panel__header"><div><p className="eyebrow">TALLYPRIME GOLD 7.0 · ACCOUNTS COMPUTER</p><h2>LAN read-only connection</h2></div><span className="health-badge">EXPORT REQUESTS ONLY</span></div>
           <div className="settings-form-grid">
-            <label>Host<input value={settings.host} onChange={(event) => update("host", event.target.value)} placeholder="localhost or 192.168.1.25" /></label>
+            <label>Accounts computer<input value={settings.host} onChange={(event) => update("host", event.target.value)} placeholder="accounts or 192.168.1.25" /></label>
             <label>Port<input type="number" min="1" max="65535" value={settings.port} onChange={(event) => update("port", Number(event.target.value))} /></label>
             <label>History from<input type="date" value={settings.historyFrom} onChange={(event) => update("historyFrom", event.target.value)} /></label>
             <label>Timeout<select value={settings.timeoutMs} onChange={(event) => update("timeoutMs", Number(event.target.value))}><option value={5000}>5 seconds</option><option value={15000}>15 seconds</option><option value={30000}>30 seconds</option><option value={60000}>60 seconds</option></select></label>
@@ -210,6 +211,7 @@ export default function TallyTab({ stores, operations, onChanged, onOperationsCh
             <label className="field--wide tally-history-toggle"><input type="checkbox" checked={settings.fullVoucherHistory} onChange={(event) => update("fullVoucherHistory", event.target.checked)} /><span><strong>Complete voucher-history scan</strong><small>Read vouchers in one-year chunks, detect custom Receipt Note/GRN voucher types through their Tally voucher-type hierarchy, and retain only stores-relevant records.</small></span></label>
           </div>
           <div className="settings-actions"><button className="button button--secondary" disabled={Boolean(busy)} type="button" onClick={() => void testConnection()}>{busy === "test" ? "Testing…" : "Test connection"}</button><button className="button" disabled={Boolean(busy) || !settings.company} type="button" onClick={() => void sync()}>{busy === "sync" ? "Reading complete history…" : "Sync Stores Catalog and history"}</button></div>
+          <div className="read-only-note"><strong>Company deployment:</strong> this app and its database run on the Production computer. Tally remains open on the Accounts computer and exposes its XML server on this address and port.</div>
           <div className="read-only-note"><strong>Cutover behavior:</strong> the first successful historical sync reconstructs current supplier lots from GRNs and assigns any unmatched current quantity to Opening Legacy Stock. The complete scan reads historical vouchers transiently, but only Stock Items, suppliers, POs, Receipt Notes/GRNs, BOMs, and rate-supporting Purchase records are persisted.</div>
         </article>
 
@@ -237,7 +239,7 @@ export default function TallyTab({ stores, operations, onChanged, onOperationsCh
         </div>
         <p className="table-footnote">Generate creates every available Tally-oriented workbook and XML file. Use the download icon to choose where to save a copy.</p>
         <div className="table-scroll"><table><thead><tr><th>File</th><th>Type</th><th>Generated</th><th>Size</th><th /></tr></thead><tbody>
-          {generatedFiles.map((file) => <tr key={file.path}><td><strong>{file.name}</strong></td><td>{file.extension.toUpperCase()}</td><td>{formatDate(file.modifiedAt)}</td><td>{formatBytes(file.sizeBytes)}</td><td className="table-actions"><button className="button button--ghost button--small" type="button" title={`Download ${file.name}`} aria-label={`Download ${file.name}`} onClick={() => void downloadFile(file)}>⇩</button></td></tr>)}
+          {generatedFiles.map((file) => <tr key={file.path}><td><strong>{file.name}</strong></td><td>{file.extension.toUpperCase()}</td><td>{formatDate(file.modifiedAt)}</td><td>{formatBytes(file.sizeBytes)}</td><td className="table-actions">{localFiles ? <button className="button button--ghost button--small" type="button" title={`Download ${file.name}`} aria-label={`Download ${file.name}`} onClick={() => void downloadFile(file)}>⇩</button> : <small>On Production</small>}</td></tr>)}
           {generatedFiles.length === 0 && <tr><td colSpan={5} className="empty-table">No generated files yet. Select Generate to create the complete Tally file set.</td></tr>}
         </tbody></table></div>
       </article>

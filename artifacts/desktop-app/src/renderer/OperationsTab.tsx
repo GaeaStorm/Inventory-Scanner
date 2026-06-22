@@ -12,6 +12,7 @@ import type {
   SupplierFaultRecord,
   UserRole,
 } from "./types";
+import OrderRegister from "./OrderRegister";
 import ProductionOrderKanban from "./ProductionOrderKanban";
 import { traceabilityColumns } from "./traceability";
 
@@ -77,8 +78,8 @@ function ItemPicker({ stores, value, onChange, labelText = "Stock item", include
   const items = stores.stockItems.filter((item) => !item.ignored && (includeInactive || item.active))
     .filter((item) => role === "FINISHED_PRODUCT" ? item.catalogRole === "FINISHED_PRODUCT" : role === "MATERIAL" ? item.catalogRole !== "FINISHED_PRODUCT" : true)
     .filter((item) =>
-    !search.trim() || `${item.name} ${item.parentName}`.toLocaleLowerCase().includes(search.trim().toLocaleLowerCase()));
-  return <div className="search-picker"><label>{labelText}<input placeholder="Filter items…" value={search} onChange={(event) => setSearch(event.target.value)} /></label><select aria-label={labelText} value={value} onChange={(event) => onChange(event.target.value)}><option value="">Select…</option>{items.map((item) => <option key={item.tallyGuid} value={item.tallyGuid}>{item.name} · {item.parentName}</option>)}</select></div>;
+    !search.trim() || `${item.name} ${item.primaryGroupName} ${item.secondaryGroupName}`.toLocaleLowerCase().includes(search.trim().toLocaleLowerCase()));
+  return <div className="search-picker"><label>{labelText}<input placeholder="Filter items…" value={search} onChange={(event) => setSearch(event.target.value)} /></label><select aria-label={labelText} value={value} onChange={(event) => onChange(event.target.value)}><option value="">Select…</option>{items.map((item) => <option key={item.tallyGuid} value={item.tallyGuid}>{item.name} · {[item.primaryGroupName, item.secondaryGroupName].filter(Boolean).join(" › ") || "Ungrouped"}</option>)}</select></div>;
 }
 
 function SupplierPicker({ stores, value, onChange }: { stores: StoresState; value: string; onChange: (value: string) => void }) {
@@ -114,7 +115,7 @@ function OperationPanel({ eyebrow, title, children, actions }: { eyebrow: string
 
 export default function OperationsTab({ stores, planning, operations, auth, permissions, onRefresh, onNotice, onError }: Props) {
   const [busy, setBusy] = useState(false);
-  const [productView, setProductView] = useState<"tracker" | "execution">("tracker");
+  const [productView, setProductView] = useState<"register" | "board">("register");
 
   async function run(action: () => Promise<unknown>, message: string) {
     setBusy(true);
@@ -131,13 +132,13 @@ export default function OperationsTab({ stores, planning, operations, auth, perm
   }
 
   return <section className="tab-page operations-page">
-    <div className="page-heading"><div><p className="eyebrow">PRODUCTS</p><h1>Product Overview</h1></div><button className="button button--secondary" type="button" onClick={() => void onRefresh()}>Refresh</button></div>
-    <nav className="planning-subnav" aria-label="Product overview sections">
-      <button type="button" className={productView === "tracker" ? "planning-subnav__active" : ""} onClick={() => setProductView("tracker")}>Order tracker</button>
-      <button type="button" className={productView === "execution" ? "planning-subnav__active" : ""} onClick={() => setProductView("execution")}>Production execution</button>
+    <div className="page-heading"><div><p className="eyebrow">CUSTOMER ORDERS</p><h1>Orders &amp; Production</h1></div><button className="button button--secondary" type="button" onClick={() => void onRefresh()}>Refresh</button></div>
+    <nav className="planning-subnav" aria-label="Orders and production sections">
+      <button type="button" className={productView === "register" ? "planning-subnav__active" : ""} onClick={() => setProductView("register")}>Order Register</button>
+      <button type="button" className={productView === "board" ? "planning-subnav__active" : ""} onClick={() => setProductView("board")}>Production Board</button>
     </nav>
-    {productView === "tracker"
-      ? <ProductionOrderKanban
+    {productView === "register"
+      ? <OrderRegister
           planning={planning}
           stores={stores}
           canManage={permissions.includes("PRODUCT_ORDER_MANAGE")}
@@ -145,7 +146,14 @@ export default function OperationsTab({ stores, planning, operations, auth, perm
           onNotice={onNotice}
           onError={onError}
         />
-      : <Production stores={stores} planning={planning} operations={operations} busy={busy} run={run} />}
+      : <ProductionOrderKanban
+          planning={planning}
+          stores={stores}
+          canManage={permissions.includes("PRODUCT_ORDER_MANAGE")}
+          onRefresh={onRefresh}
+          onNotice={onNotice}
+          onError={onError}
+        />}
   </section>;
 }
 
@@ -470,16 +478,21 @@ function Exceptions({ operations, busy, run }: { operations: OperationsState; bu
 }
 
 function History({ stores, operations, busy, canReverse, canReview, run }: { stores: StoresState; operations: OperationsState; busy: boolean; canReverse: boolean; canReview: boolean; run: (action: () => Promise<unknown>, message: string) => Promise<void> }) {
-  const [item, setItem] = useState(""); const [group, setGroup] = useState(""); const [supplier, setSupplier] = useState(""); const [productOrder, setProductOrder] = useState(""); const [movementType, setMovementType] = useState(""); const [condition, setCondition] = useState(""); const [batch, setBatch] = useState(""); const [serial, setSerial] = useState(""); const [dateFrom, setDateFrom] = useState(""); const [dateTo, setDateTo] = useState(""); const [operator, setOperator] = useState(""); const [status, setStatus] = useState("");
-  const rows = useMemo(() => operations.movements.filter((entry) => (!item || entry.tallyItemGuid === item) && (!group || entry.itemGroup === group) && (!supplier || String(entry.supplierId ?? "") === supplier) && (!productOrder || entry.productOrderId.toLocaleLowerCase().includes(productOrder.toLocaleLowerCase())) && (!movementType || entry.movementType === movementType) && (!condition || entry.sourceCondition === condition || entry.targetCondition === condition) && (!batch || entry.lines.some((line) => line.batchNumber.toLocaleLowerCase().includes(batch.toLocaleLowerCase()))) && (!serial || entry.lines.some((line) => line.serialNumbers.some((value) => value.toLocaleLowerCase().includes(serial.toLocaleLowerCase())))) && (!dateFrom || entry.eventDate >= dateFrom) && (!dateTo || entry.eventDate <= dateTo) && (!operator || entry.operator.toLocaleLowerCase().includes(operator.toLocaleLowerCase())) && (!status || entry.status === status)), [operations.movements, item, group, supplier, productOrder, movementType, condition, batch, serial, dateFrom, dateTo, operator, status]);
+  const [item, setItem] = useState(""); const [primaryGroup, setPrimaryGroup] = useState(""); const [secondaryGroup, setSecondaryGroup] = useState(""); const [supplier, setSupplier] = useState(""); const [productOrder, setProductOrder] = useState(""); const [movementType, setMovementType] = useState(""); const [condition, setCondition] = useState(""); const [batch, setBatch] = useState(""); const [serial, setSerial] = useState(""); const [dateFrom, setDateFrom] = useState(""); const [dateTo, setDateTo] = useState(""); const [operator, setOperator] = useState(""); const [status, setStatus] = useState("");
+  const groupByGuid = useMemo(() => new Map(stores.stockItems.map((entry) => [entry.tallyGuid, entry])), [stores.stockItems]);
+  const rows = useMemo(() => operations.movements.filter((entry) => {
+    const groups = groupByGuid.get(entry.tallyItemGuid);
+    return (!item || entry.tallyItemGuid === item) && (!primaryGroup || groups?.primaryGroupName === primaryGroup) && (!secondaryGroup || groups?.secondaryGroupName === secondaryGroup) && (!supplier || String(entry.supplierId ?? "") === supplier) && (!productOrder || entry.productOrderId.toLocaleLowerCase().includes(productOrder.toLocaleLowerCase())) && (!movementType || entry.movementType === movementType) && (!condition || entry.sourceCondition === condition || entry.targetCondition === condition) && (!batch || entry.lines.some((line) => line.batchNumber.toLocaleLowerCase().includes(batch.toLocaleLowerCase()))) && (!serial || entry.lines.some((line) => line.serialNumbers.some((value) => value.toLocaleLowerCase().includes(serial.toLocaleLowerCase())))) && (!dateFrom || entry.eventDate >= dateFrom) && (!dateTo || entry.eventDate <= dateTo) && (!operator || entry.operator.toLocaleLowerCase().includes(operator.toLocaleLowerCase())) && (!status || entry.status === status);
+  }), [operations.movements, groupByGuid, item, primaryGroup, secondaryGroup, supplier, productOrder, movementType, condition, batch, serial, dateFrom, dateTo, operator, status]);
   const [selected, setSelected] = useState(operations.movements[0]?.id ?? "");
   const movement = operations.movements.find((entry) => entry.id === selected) ?? null;
   const [reverseQty, setReverseQty] = useState(1); const [reverseReason, setReverseReason] = useState(""); const [reverseSerials, setReverseSerials] = useState("");
   const [reviewReference, setReviewReference] = useState("");
-  const groups = [...new Set(stores.stockItems.map((entry) => entry.parentName))].sort();
+  const primaryGroups = [...new Set(stores.stockItems.map((entry) => entry.primaryGroupName).filter(Boolean))].sort();
+  const secondaryGroups = [...new Set(stores.stockItems.filter((entry) => !primaryGroup || entry.primaryGroupName === primaryGroup).map((entry) => entry.secondaryGroupName).filter(Boolean))].sort();
   return <div className="planning-section-stack">
     <OperationPanel eyebrow="MOVEMENT REPORT" title="Complete linked inventory history">
-      <div className="operations-history-filters"><ItemPicker stores={stores} value={item} onChange={setItem} /><label>Item group<select value={group} onChange={(event) => setGroup(event.target.value)}><option value="">All</option>{groups.map((entry) => <option key={entry}>{entry}</option>)}</select></label><SupplierPicker stores={stores} value={supplier} onChange={setSupplier} /><label>Product order<input value={productOrder} onChange={(event) => setProductOrder(event.target.value)} /></label><label>Movement type<select value={movementType} onChange={(event) => setMovementType(event.target.value)}><option value="">All</option>{[...new Set(operations.movements.map((entry) => entry.movementType))].map((entry) => <option key={entry}>{entry}</option>)}</select></label><label>Condition<select value={condition} onChange={(event) => setCondition(event.target.value)}><option value="">All</option><option>AVAILABLE</option><option>PENDING_INSPECTION</option><option>FAULTY</option><option>SCRAPPED</option><option>RETURNED_TO_SUPPLIER</option></select></label><label>Batch<input value={batch} onChange={(event) => setBatch(event.target.value)} /></label><label>Serial<input value={serial} onChange={(event) => setSerial(event.target.value)} /></label><label>From<input type="date" value={dateFrom} onChange={(event) => setDateFrom(event.target.value)} /></label><label>To<input type="date" value={dateTo} onChange={(event) => setDateTo(event.target.value)} /></label><label>Operator<input value={operator} onChange={(event) => setOperator(event.target.value)} /></label><label>Status<select value={status} onChange={(event) => setStatus(event.target.value)}><option value="">All</option><option>APPLIED</option><option>REVERSED</option><option>EXCEPTION</option><option>MANUAL_REVIEW</option></select></label></div>
+      <div className="operations-history-filters"><ItemPicker stores={stores} value={item} onChange={setItem} /><label>Primary group<select value={primaryGroup} onChange={(event) => { setPrimaryGroup(event.target.value); setSecondaryGroup(""); }}><option value="">All</option>{primaryGroups.map((entry) => <option key={entry}>{entry}</option>)}</select></label><label>Secondary group<select value={secondaryGroup} onChange={(event) => setSecondaryGroup(event.target.value)} disabled={secondaryGroups.length === 0}><option value="">All</option>{secondaryGroups.map((entry) => <option key={entry}>{entry}</option>)}</select></label><SupplierPicker stores={stores} value={supplier} onChange={setSupplier} /><label>Product order<input value={productOrder} onChange={(event) => setProductOrder(event.target.value)} /></label><label>Movement type<select value={movementType} onChange={(event) => setMovementType(event.target.value)}><option value="">All</option>{[...new Set(operations.movements.map((entry) => entry.movementType))].map((entry) => <option key={entry}>{entry}</option>)}</select></label><label>Condition<select value={condition} onChange={(event) => setCondition(event.target.value)}><option value="">All</option><option>AVAILABLE</option><option>PENDING_INSPECTION</option><option>FAULTY</option><option>SCRAPPED</option><option>RETURNED_TO_SUPPLIER</option></select></label><label>Batch<input value={batch} onChange={(event) => setBatch(event.target.value)} /></label><label>Serial<input value={serial} onChange={(event) => setSerial(event.target.value)} /></label><label>From<input type="date" value={dateFrom} onChange={(event) => setDateFrom(event.target.value)} /></label><label>To<input type="date" value={dateTo} onChange={(event) => setDateTo(event.target.value)} /></label><label>Operator<input value={operator} onChange={(event) => setOperator(event.target.value)} /></label><label>Status<select value={status} onChange={(event) => setStatus(event.target.value)}><option value="">All</option><option>APPLIED</option><option>REVERSED</option><option>EXCEPTION</option><option>MANUAL_REVIEW</option></select></label></div>
       <div className="table-scroll"><table><thead><tr><th>Date</th><th>Movement</th><th>Item</th><th>Qty</th><th>From</th><th>To</th><th>Supplier / receipt</th><th>Product order</th><th>Operator</th><th>Status</th></tr></thead><tbody>{rows.map((entry) => <tr key={entry.id} className={selected === entry.id ? "selected-row" : ""} onClick={() => { setSelected(entry.id); setReverseQty(Math.max(1, entry.reversibleQuantity)); }}><td>{entry.eventDate}</td><td>{label(entry.movementType)}</td><td>{entry.itemName}</td><td>{entry.quantity}</td><td>{entry.sourceCondition ? label(entry.sourceCondition) : "—"}</td><td>{entry.targetCondition ? label(entry.targetCondition) : "—"}</td><td>{entry.supplierName || entry.receiptReference || "—"}</td><td>{entry.productOrderId || "—"}</td><td>{entry.operator}</td><td><Status value={entry.status} /></td></tr>)}{rows.length === 0 && <tr><td colSpan={10} className="empty-table">No movements match these filters.</td></tr>}</tbody></table></div>
     </OperationPanel>
     {movement && <OperationPanel eyebrow="MOVEMENT DETAIL" title={`${label(movement.movementType)} · ${movement.id}`}>

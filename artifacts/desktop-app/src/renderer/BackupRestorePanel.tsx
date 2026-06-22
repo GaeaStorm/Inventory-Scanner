@@ -45,7 +45,7 @@ export default function BackupRestorePanel(props: {
         <div>
           <p className="eyebrow">BACKUP AND RESTORE</p>
           <h2>Validated SQLite snapshots</h2>
-          <p>Every restore creates a new safety backup first. The selected file is integrity-checked before replacement.</p>
+          <p>Automatic backups run every two hours. The app keeps all of today&apos;s snapshots and the newest snapshot from yesterday. Every restore creates a validated safety backup first.</p>
         </div>
       </div>
       <div className="settings-actions">

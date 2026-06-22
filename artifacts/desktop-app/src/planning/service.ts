@@ -87,9 +87,21 @@ export class PlanningService {
     return this.getState();
   }
 
+  deleteProductOrderWorkflowState(stateId: string, actor: ActorContext) {
+    requirePermission(actor, "PRODUCT_ORDER_MANAGE");
+    this.database.deleteProductOrderWorkflowState(stateId);
+    return this.getState();
+  }
+
   saveProductOrderFieldDefinition(input: SaveProductOrderFieldDefinitionInput, actor: ActorContext) {
     requirePermission(actor, "PRODUCT_ORDER_MANAGE");
     this.database.saveProductOrderFieldDefinition(input);
+    return this.getState();
+  }
+
+  deleteProductOrderFieldDefinition(fieldId: string, actor: ActorContext) {
+    requirePermission(actor, "PRODUCT_ORDER_MANAGE");
+    this.database.deleteProductOrderFieldDefinition(fieldId);
     return this.getState();
   }
 

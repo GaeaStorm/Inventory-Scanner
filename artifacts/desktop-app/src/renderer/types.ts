@@ -3,6 +3,9 @@ export type AppTab = "tracker" | "operations" | "dashboard" | "qr" | "settings" 
 export interface DesktopInfo {
   appVersion: string;
   apiBaseUrl: string;
+  computerName: string;
+  deploymentRole: "PRODUCTION_SERVER" | "LAN_CLIENT";
+  tallyComputerHost: string;
   dataDirectory: string;
   excelPath: string;
   databasePath: string;
@@ -107,6 +110,7 @@ export type {
   CreateFaultInput,
   CustomerReturnInput,
   FinalizeCountInput,
+  ForgotCredentialInput,
   LoginInput,
   ManualTallyReview,
   OperationsMovement,

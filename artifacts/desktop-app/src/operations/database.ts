@@ -21,6 +21,7 @@ import type {
   CustomerReturnInput,
   FaultResolution,
   FinalizeCountInput,
+  ForgotCredentialInput,
   LoginInput,
   ManualTallyReview,
   MovementLotLine,
@@ -57,6 +58,7 @@ import { permissionsForRole, requirePermission } from "./permissions";
 const MODULE_NAME = "operations";
 const SESSION_HOURS = 12;
 const EXPIRING_SOON_DAYS = 30;
+const SHARED_PHONE_USER_ID = "SYSTEM:SHARED_PHONE";
 
 type Row = Record<string, any>;
 
@@ -632,7 +634,7 @@ export class OperationsDatabase {
   }
 
   listUsers(): AuthUser[] {
-    return (this.db.prepare("SELECT * FROM ops_users ORDER BY active DESC, display_name COLLATE NOCASE").all() as Row[])
+    return (this.db.prepare("SELECT * FROM ops_users WHERE id <> ? ORDER BY active DESC, display_name COLLATE NOCASE").all(SHARED_PHONE_USER_ID) as Row[])
       .map((row) => this.mapUser(row));
   }
 
@@ -641,7 +643,7 @@ export class OperationsDatabase {
       ? this.listUsers().find((user) => user.userId === actor.userId) ?? null
       : null;
     return {
-      needsBootstrap: Number((this.db.prepare("SELECT COUNT(*) AS count FROM ops_users").get() as Row).count) === 0,
+      needsBootstrap: Number((this.db.prepare("SELECT COUNT(*) AS count FROM ops_users WHERE id <> ?").get(SHARED_PHONE_USER_ID) as Row).count) === 0,
       currentUser,
       permissions: currentUser ? permissionsForRole(currentUser.role) : [],
       users: currentUser?.role === "ADMIN" ? this.listUsers() : [],
@@ -696,6 +698,51 @@ export class OperationsDatabase {
       }
       return this.createSession(text(row.id), text(input.deviceLabel));
     });
+  }
+
+  forgotCredential(input: ForgotCredentialInput): void {
+    const username = text(input.username);
+    const credentialType = input.credentialType === "PIN" ? "PIN" : "PASSWORD";
+    const hashed = hashCredential(String(input.credential ?? ""), credentialType);
+    this.transaction("resetting a forgotten credential", () => {
+      const row = this.db.prepare(
+        "SELECT id FROM ops_users WHERE username = ? COLLATE NOCASE AND active = 1 AND id <> ?",
+      ).get(username, SHARED_PHONE_USER_ID) as Row | undefined;
+      if (!row) throw new Error("No active account was found for that username.");
+      this.db.prepare(`
+        UPDATE ops_users SET credential_hash = ?, credential_salt = ?, credential_type = ?,
+          must_reset_credential = 0, version = version + 1, updated_at = ? WHERE id = ?
+      `).run(hashed.hash, hashed.salt, credentialType, nowIso(), row.id);
+      this.db.prepare("DELETE FROM ops_sessions WHERE user_id = ?").run(row.id);
+    });
+  }
+
+  sharedPhoneActor(): ActorContext {
+    const realUserCount = Number((this.db.prepare(
+      "SELECT COUNT(*) AS count FROM ops_users WHERE id <> ?",
+    ).get(SHARED_PHONE_USER_ID) as Row).count);
+    if (realUserCount === 0) {
+      throw new Error("Finish desktop administrator setup before connecting a phone scanner.");
+    }
+    let row = this.db.prepare("SELECT * FROM ops_users WHERE id = ?").get(SHARED_PHONE_USER_ID) as Row | undefined;
+    if (!row) {
+      const timestamp = nowIso();
+      const hashed = hashCredential(randomBytes(32).toString("hex"), "PASSWORD");
+      this.db.prepare(`
+        INSERT INTO ops_users(
+          id, display_name, username, credential_hash, credential_salt, credential_type,
+          role, active, must_reset_credential, audit_identity, created_at, updated_at
+        ) VALUES (?, 'Phone scanner', '__shared_phone__', ?, ?, 'PASSWORD', 'STORE', 1, 0, 'PHONE:SHARED', ?, ?)
+      `).run(SHARED_PHONE_USER_ID, hashed.hash, hashed.salt, timestamp, timestamp);
+      row = this.db.prepare("SELECT * FROM ops_users WHERE id = ?").get(SHARED_PHONE_USER_ID) as Row;
+    }
+    return {
+      userId: text(row.id),
+      username: text(row.username),
+      displayName: text(row.display_name),
+      auditIdentity: text(row.audit_identity),
+      role: "STORE",
+    };
   }
 
   actorForToken(token: string): ActorContext | null {

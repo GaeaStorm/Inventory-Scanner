@@ -43,6 +43,7 @@ import type {
   CreateCountSessionInput,
   RecordCountEntryInput,
   FinalizeCountInput,
+  ForgotCredentialInput,
   ProductionReturnInput,
   SupplierReturnInput,
   CustomerReturnInput,
@@ -64,6 +65,7 @@ declare global {
         state: (token?: string) => Promise<AuthState>;
         bootstrap: (input: BootstrapAdminInput) => Promise<AuthSession>;
         login: (input: LoginInput) => Promise<AuthSession>;
+        forgotPassword: (input: ForgotCredentialInput) => Promise<void>;
         resume: (token: string) => Promise<AuthSession>;
         logout: () => Promise<void>;
         token: () => string;
@@ -117,7 +119,9 @@ declare global {
         ) => Promise<PlanningState>;
         updateProductOrderWorkflowState: (orderId: string, workflowStateId: string) => Promise<PlanningState>;
         saveProductOrderWorkflowState: (input: SaveProductOrderWorkflowStateInput) => Promise<PlanningState>;
+        deleteProductOrderWorkflowState: (stateId: string) => Promise<PlanningState>;
         saveProductOrderFieldDefinition: (input: SaveProductOrderFieldDefinitionInput) => Promise<PlanningState>;
+        deleteProductOrderFieldDefinition: (fieldId: string) => Promise<PlanningState>;
         exportRestock: (input: PlanningExportInput) => Promise<PlanningExportResult>;
       };
       operations: {

@@ -63,7 +63,8 @@ export default function BoxQrCodeCreatorTab({ stores, onChanged }: Props) {
   const [expectedRevision, setExpectedRevision] = useState<number | undefined>();
   const [selectedGuids, setSelectedGuids] = useState<string[]>([]);
   const [search, setSearch] = useState("");
-  const [groupFilter, setGroupFilter] = useState("ALL");
+  const [primaryGroupFilter, setPrimaryGroupFilter] = useState("ALL");
+  const [secondaryGroupFilter, setSecondaryGroupFilter] = useState("ALL");
   const [stockFilter, setStockFilter] = useState<"ALL" | "AVAILABLE" | "EMPTY">("ALL");
   const [bomFilter, setBomFilter] = useState<"ALL" | "BOM" | "NO_BOM">("ALL");
   const [qrDataUrl, setQrDataUrl] = useState("");
@@ -83,22 +84,30 @@ export default function BoxQrCodeCreatorTab({ stores, onChanged }: Props) {
     () => selectedGuids.map((guid) => stores.stockItems.find((item) => item.tallyGuid === guid)).filter(Boolean),
     [selectedGuids, stores.stockItems],
   );
-  const groupOptions = useMemo(
-    () => [...new Set(selectableItems.map((item) => item.parentName || "Ungrouped"))].sort((left, right) => left.localeCompare(right)),
+  const primaryGroupOptions = useMemo(
+    () => [...new Set(selectableItems.map((item) => item.primaryGroupName || "Ungrouped"))].sort((left, right) => left.localeCompare(right)),
     [selectableItems],
+  );
+  const secondaryGroupOptions = useMemo(
+    () => [...new Set(selectableItems
+      .filter((item) => primaryGroupFilter === "ALL" || (item.primaryGroupName || "Ungrouped") === primaryGroupFilter)
+      .map((item) => item.secondaryGroupName)
+      .filter(Boolean))].sort((left, right) => left.localeCompare(right)),
+    [primaryGroupFilter, selectableItems],
   );
   const filtered = useMemo(() => {
     const query = search.trim().toLocaleLowerCase();
     return selectableItems.filter((item) => {
       if (selectedGuids.includes(item.tallyGuid)) return false;
-      if (groupFilter !== "ALL" && (item.parentName || "Ungrouped") !== groupFilter) return false;
+      if (primaryGroupFilter !== "ALL" && (item.primaryGroupName || "Ungrouped") !== primaryGroupFilter) return false;
+      if (secondaryGroupFilter !== "ALL" && item.secondaryGroupName !== secondaryGroupFilter) return false;
       if (stockFilter === "AVAILABLE" && item.localAvailableQuantity <= 0) return false;
       if (stockFilter === "EMPTY" && item.localAvailableQuantity > 0) return false;
       if (bomFilter === "BOM" && !item.hasBom) return false;
       if (bomFilter === "NO_BOM" && item.hasBom) return false;
-      return !query || [item.name, item.parentName, item.tallyGuid].some((value) => value.toLocaleLowerCase().includes(query));
+      return !query || [item.name, item.primaryGroupName, item.secondaryGroupName, item.tallyGuid].some((value) => value.toLocaleLowerCase().includes(query));
     });
-  }, [bomFilter, groupFilter, search, selectedGuids, stockFilter, selectableItems]);
+  }, [bomFilter, primaryGroupFilter, secondaryGroupFilter, search, selectedGuids, stockFilter, selectableItems]);
 
   useEffect(() => {
     setQrDataUrl("");
@@ -271,16 +280,17 @@ export default function BoxQrCodeCreatorTab({ stores, onChanged }: Props) {
           <div className="panel__header"><div><p className="eyebrow">STORES CATALOG</p><h2>Select one to five items</h2></div><span className="table-count">{selectedGuids.length}/5 selected</span></div>
           <label className="box-qr-search-field">Search Tally Stock Items<input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Item name, group, or GUID" /></label>
           <div className="box-qr-catalog-filters">
-            <label>Group<select value={groupFilter} onChange={(event) => setGroupFilter(event.target.value)}><option value="ALL">All groups</option>{groupOptions.map((group) => <option key={group} value={group}>{group}</option>)}</select></label>
+            <label>Primary group<select value={primaryGroupFilter} onChange={(event) => { setPrimaryGroupFilter(event.target.value); setSecondaryGroupFilter("ALL"); }}><option value="ALL">All primary groups</option>{primaryGroupOptions.map((group) => <option key={group} value={group}>{group}</option>)}</select></label>
+            <label>Secondary group<select value={secondaryGroupFilter} onChange={(event) => setSecondaryGroupFilter(event.target.value)} disabled={secondaryGroupOptions.length === 0}><option value="ALL">All secondary groups</option>{secondaryGroupOptions.map((group) => <option key={group} value={group}>{group}</option>)}</select></label>
             <label>Stock<select value={stockFilter} onChange={(event) => setStockFilter(event.target.value as typeof stockFilter)}><option value="ALL">All stock</option><option value="AVAILABLE">Available only</option><option value="EMPTY">Zero stock</option></select></label>
             <label>Product type<select value={bomFilter} onChange={(event) => setBomFilter(event.target.value as typeof bomFilter)}><option value="ALL">All items</option><option value="BOM">Has BOM</option><option value="NO_BOM">No BOM</option></select></label>
-            <button type="button" className="text-button" onClick={() => { setSearch(""); setGroupFilter("ALL"); setStockFilter("ALL"); setBomFilter("ALL"); }}>Clear filters</button>
+            <button type="button" className="text-button" onClick={() => { setSearch(""); setPrimaryGroupFilter("ALL"); setSecondaryGroupFilter("ALL"); setStockFilter("ALL"); setBomFilter("ALL"); }}>Clear filters</button>
           </div>
           <div className="box-qr-catalog-result-count">Showing {filtered.length} of {selectableItems.length} catalog items</div>
           <div className="box-qr-catalog-scroll" tabIndex={0}>
             {filtered.map((item) => (
               <button key={item.tallyGuid} type="button" className="box-qr-catalog-action" disabled={selectedGuids.length >= 5} onClick={() => setSelectedGuids((current) => [...current, item.tallyGuid])}>
-                <span><strong>{item.name}</strong><small>{item.parentName || "Ungrouped"} · Available {item.localAvailableQuantity}</small></span><b>＋</b>
+                <span><strong>{item.name}</strong><small>{[item.primaryGroupName, item.secondaryGroupName].filter(Boolean).join(" › ") || "Ungrouped"} · Available {item.localAvailableQuantity}</small></span><b>＋</b>
               </button>
             ))}
             {filtered.length === 0 && <p className="empty-table">No matching synchronized Stock Items.</p>}

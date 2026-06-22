@@ -29,8 +29,14 @@ export function createPlanningRouter(service: PlanningService, operations: Opera
   router.post("/product-order-workflow-states", (request, response) => response.status(201).json(
     service.saveProductOrderWorkflowState(request.body, actor(request, "PRODUCT_ORDER_MANAGE")),
   ));
+  router.delete("/product-order-workflow-states/:stateId", (request, response) => response.json(
+    service.deleteProductOrderWorkflowState(request.params.stateId, actor(request, "PRODUCT_ORDER_MANAGE")),
+  ));
   router.post("/product-order-fields", (request, response) => response.status(201).json(
     service.saveProductOrderFieldDefinition(request.body, actor(request, "PRODUCT_ORDER_MANAGE")),
+  ));
+  router.delete("/product-order-fields/:fieldId", (request, response) => response.json(
+    service.deleteProductOrderFieldDefinition(request.params.fieldId, actor(request, "PRODUCT_ORDER_MANAGE")),
   ));
   router.post("/export", (request, response) => response.json(service.exportRestock(request.body, actor(request, "RESTOCK_MANAGE"))));
 

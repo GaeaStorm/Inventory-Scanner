@@ -13,6 +13,7 @@ export function createStoresRouter(service: StoresService, operations: Operation
   const router = Router();
   const actor = (request: Request, permission?: Parameters<OperationsService["requireActor"]>[1]) =>
     operations.requireActor(tokenFrom(request), permission);
+  const phoneActor = () => operations.sharedPhoneActor();
 
   router.get("/state", (request, response) => {
     actor(request, "INVENTORY_VIEW");
@@ -23,11 +24,12 @@ export function createStoresRouter(service: StoresService, operations: Operation
     response.status(201).json(service.createLocalStockItem(request.body, actor(request, "CATALOG_MANAGE")));
   });
   router.post("/catalog/status", (request, response) => response.json(service.setCatalogStatus(request.body, actor(request, "CATALOG_MANAGE"))));
+  router.post("/catalog/classification", (request, response) => response.json(service.setCatalogClassification(request.body, actor(request, "CATALOG_MANAGE"))));
   router.post("/catalog/rename", (request, response) => response.json(service.renameStockItem(request.body, actor(request, "CATALOG_MANAGE"))));
   router.post("/catalog/export-cleanup", (request, response) => response.json(service.exportCatalogCleanup(actor(request, "CATALOG_MANAGE"))));
 
   router.get("/catalog", (request, response) => {
-    actor(request, "INVENTORY_VIEW");
+    phoneActor();
     const state = service.getState();
     const selectable = state.stockItems.filter((item) =>
       !item.ignored
@@ -46,7 +48,7 @@ export function createStoresRouter(service: StoresService, operations: Operation
   });
 
   router.get("/boxes/:boxId", (request, response) => {
-    actor(request, "INVENTORY_VIEW");
+    phoneActor();
     const box = service.getBox(request.params.boxId);
     if (!box) {
       response.status(404).json({ error: "Box not found in the Local Stores Database." });
@@ -63,11 +65,11 @@ export function createStoresRouter(service: StoresService, operations: Operation
   router.post("/vendor-receipts", (request, response) => response.status(201).json(service.vendorReceipt(request.body, actor(request, "RECEIVE_MATERIAL"))));
   router.post("/vendor-receipts/bulk", (request, response) => response.status(201).json(service.bulkVendorReceipt(request.body, actor(request, "RECEIVE_MATERIAL"))));
   router.post("/material-out", (request, response) => response.status(201).json(service.materialOut(request.body, actor(request, "MATERIAL_ISSUE"))));
-  router.post("/offline-batch", (request, response) => response.json(service.processOfflineBatch(request.body, actor(request, "MATERIAL_ISSUE"))));
+  router.post("/offline-batch", (request, response) => response.json(service.processOfflineBatch(request.body, phoneActor())));
   router.post("/opening-quantity", (request, response) => response.json(service.setOpeningQuantity(request.body, actor(request, "STOCK_ADJUST"))));
 
   router.get("/adjustment-context", (request, response) => {
-    actor(request, "INVENTORY_VIEW");
+    phoneActor();
     const context = service.adjustmentContext(
       String(request.query.tallyItemGuid ?? ""),
       String(request.query.destinationTallyItemGuid ?? ""),

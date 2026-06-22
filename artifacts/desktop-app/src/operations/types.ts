@@ -130,6 +130,12 @@ export interface LoginInput {
   deviceLabel?: string;
 }
 
+export interface ForgotCredentialInput {
+  username: string;
+  credential: string;
+  credentialType?: "PASSWORD" | "PIN";
+}
+
 export interface SaveUserInput {
   id?: string;
   displayName: string;

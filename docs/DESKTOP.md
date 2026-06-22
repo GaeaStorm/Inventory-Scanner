@@ -85,7 +85,7 @@ The operational database is stored under Electron's per-user application-data fo
 - macOS: `~/Library/Application Support/Inventory Scanner/data/inventory-scanner.sqlite`
 - Linux: `~/.config/Inventory Scanner/data/inventory-scanner.sqlite`
 
-Do not move the active database into Dropbox, OneDrive, Google Drive, or a shared network folder. Use the Settings tab to choose a separate backup folder and to create a validated manual backup. The app also backs up before migrations and before export generation, retaining the 30 most recent SQLite backups.
+Do not move the active database into Dropbox, OneDrive, Google Drive, a NAS, or a shared network folder. Use the Settings tab to choose a separate backup folder and to create a validated manual backup. The app also backs up before migrations and exports and automatically when the newest backup is at least two hours old. It retains all backups from today and the newest backup from yesterday.
 
 Excel and optional CSV files are generated as review/audit outputs. The legacy `stock_transactions.xlsx` path remains available for compatibility but is no longer authoritative.
 
@@ -100,6 +100,21 @@ Excel and optional CSV files are generated as review/audit outputs. The legacy `
 The preferred port is `5000`. Set `INVENTORY_SCANNER_PORT` before launching to
 choose a different port. If the preferred port is occupied, the app selects an
 available port and displays it in the dashboard.
+
+## Multiple computers on the LAN
+
+The current architecture supports one authoritative desktop host plus many API
+clients. Set `INVENTORY_SCANNER_REMOTE_URL=http://production:5000` on the five
+client computers. In that mode the same desktop interface connects to
+Production and does not create a local company database. They must not run
+independent authoritative databases, and the live SQLite file must not be
+placed on a shared drive.
+
+The server listens on the LAN and serializes writes through one SQLite
+connection with transaction IDs and retry handling. Tally, backups, generated
+files, and the SQLite file remain on the Production host. Tally itself may run
+on the Accounts computer; configure `INVENTORY_TALLY_HOST=accounts` on
+Production and allow Production to reach Accounts TCP port 9000.
 
 ## Signing public releases
 

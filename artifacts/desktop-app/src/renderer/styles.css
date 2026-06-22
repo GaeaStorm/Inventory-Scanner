@@ -2945,6 +2945,10 @@ code {
   font-size: 12px;
 }
 
+.production-config-list b {
+  font-weight: 600;
+}
+
 .production-config-list i {
   width: 10px;
   height: 10px;
@@ -2955,6 +2959,20 @@ code {
   margin-left: auto;
   color: #8993a4;
   text-transform: capitalize;
+}
+
+.production-config-delete {
+  margin-left: 4px;
+  border: 0;
+  background: transparent;
+  color: #b42318;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.production-config-delete:disabled {
+  color: #aeb5c0;
+  cursor: not-allowed;
 }
 
 .production-config-list p {

@@ -8,7 +8,7 @@ import type {
 } from "./types";
 
 const DEFAULT_SETTINGS: TallyConnectionSettings = {
-  host: "localhost",
+  host: process.env.INVENTORY_TALLY_HOST?.trim() || "accounts",
   port: 9000,
   company: "",
   timeoutMs: 15_000,

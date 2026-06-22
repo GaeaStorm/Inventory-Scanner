@@ -57,7 +57,10 @@ blocked until the two company sample vouchers are mapped.
 
 ## Backup and restore
 
-Backups use SQLite `VACUUM INTO`, are integrity-checked, and retain the latest 30 files. A restore:
+Backups use SQLite `VACUUM INTO` and are integrity-checked. The desktop creates a
+backup when the newest snapshot is at least two hours old. Retention keeps every
+snapshot created today plus only the newest snapshot from the previous calendar
+day. A restore:
 
 1. validates the selected backup and schema version;
 2. creates a new safety backup of the current database;
