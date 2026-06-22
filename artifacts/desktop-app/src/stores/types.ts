@@ -4,6 +4,7 @@ export type StoresWorkflow =
   | "ADJUSTMENT";
 
 export type AdjustmentDirection = "RETURN_TO_STOCK" | "ADDITIONAL_OUT";
+export type MaterialOutPurpose = "PRODUCTION" | "SERVICING" | "CUSTOMER_EXTRAS";
 
 export type AdjustmentReason =
   | "UNUSED_MATERIAL"
@@ -361,7 +362,8 @@ export interface MaterialOutInput {
   clientTransactionId: string;
   boxId: string;
   tallyItemGuid: string;
-  destinationTallyItemGuid: string;
+  purpose?: MaterialOutPurpose;
+  destinationTallyItemGuid?: string;
   quantity: number;
   eventDate?: string;
   productOrderId?: string;
@@ -375,7 +377,7 @@ export interface AdjustmentInput {
   clientTransactionId: string;
   boxId: string;
   tallyItemGuid: string;
-  destinationTallyItemGuid: string;
+  destinationTallyItemGuid?: string;
   quantity: number;
   direction: AdjustmentDirection;
   reason: AdjustmentReason;

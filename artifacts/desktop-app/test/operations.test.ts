@@ -36,6 +36,7 @@ function createContext(): Context {
   const session = operations.bootstrapAdmin({
     displayName: "Test Administrator",
     username: "administrator",
+    email: "administrator@example.com",
     credential: "correct-horse-battery-staple",
   });
   const actor = operations.actorForToken(session.token);
@@ -192,8 +193,15 @@ test("catalog group roles and item ignore overrides drive planning visibility", 
 test("forgotten credentials can be reset and phones use a shared hidden audit identity", () => {
   const context = createContext();
   try {
+    assert.throws(() => context.operations.forgotCredential({
+      username: "administrator",
+      email: "wrong@example.com",
+      credential: "replacement-password",
+      credentialType: "PASSWORD",
+    }), /do not match/);
     context.operations.forgotCredential({
       username: "administrator",
+      email: "administrator@example.com",
       credential: "replacement-password",
       credentialType: "PASSWORD",
     });
@@ -203,6 +211,7 @@ test("forgotten credentials can be reset and phones use a shared hidden audit id
       deviceLabel: "Test desktop",
     });
     assert.equal(session.user.username, "administrator");
+    assert.equal(session.user.email, "administrator@example.com");
     const phone = context.operations.sharedPhoneActor();
     assert.equal(phone.displayName, "Phone scanner");
     assert.equal(phone.role, "STORE");
@@ -212,13 +221,12 @@ test("forgotten credentials can be reset and phones use a shared hidden audit id
   }
 });
 
-test("production-order tracker persists workflow states, spreadsheet fields, and custom fields", () => {
+test("production-order tracker persists canonical stages, stage history, spreadsheet fields, and custom fields", () => {
   const context = createContext();
   try {
     const product = context.stores.getState().stockItems.find((item) => item.catalogRole === "FINISHED_PRODUCT")
       ?? context.stores.getState().stockItems[0];
     assert.ok(product);
-    const state = context.planning.saveProductOrderWorkflowState({ name: "Quality Check", color: "#0052CC" });
     const field = context.planning.saveProductOrderFieldDefinition({ label: "Customer contact", type: "TEXT" });
     const saved = context.planning.saveProductOrder({
       externalReference: "PO-KANBAN-1",
@@ -234,51 +242,41 @@ test("production-order tracker persists workflow states, spreadsheet fields, and
       cracStatus: "Pending",
       taskRemarks: "Inventory check pending",
       responsiblePerson: "Snehal Sawant",
-      workflowStateId: state.id,
+      workflowStateId: "initial-testing",
       customFields: { [field.key]: "A. Customer" },
     });
     assert.equal(saved.organisation, "Akademika Test Customer");
-    assert.equal(saved.workflowStateName, "Quality Check");
+    assert.equal(saved.workflowStateName, "Initial Testing");
+    assert.equal(saved.stageHistory.length, 1);
     assert.equal(saved.pendingQuantity, 2);
     assert.equal(saved.valueIncludingGst, 118000);
     assert.equal(saved.customFields[field.key], "A. Customer");
+    context.planning.updateProductOrderWorkflowState(saved.id, "material-purchase");
+    context.planning.updateProductOrderWorkflowState(saved.id, "quality-control");
+    const advanced = context.planning.getState().productOrders.find((order) => order.id === saved.id);
+    assert.equal(advanced?.workflowStateName, "Quality Control");
+    assert.equal(advanced?.stageHistory.length, 3);
   } finally {
     closeContext(context);
   }
 });
 
-test("production overview states and custom fields can be deleted safely", () => {
+test("order stages are fixed while custom fields can be deleted safely", () => {
   const context = createContext();
   try {
-    const unusedState = context.planning.saveProductOrderWorkflowState({
-      name: "Temporary state",
-      color: "#123456",
-    });
     const field = context.planning.saveProductOrderFieldDefinition({
       label: "Temporary field",
       type: "TEXT",
     });
-    context.planning.deleteProductOrderWorkflowState(unusedState.id);
     context.planning.deleteProductOrderFieldDefinition(field.id);
     let state = context.planning.getState();
-    assert.equal(state.productOrderWorkflowStates.some((entry) => entry.id === unusedState.id), false);
+    assert.equal(state.productOrderWorkflowStates.length, 15);
     assert.equal(state.productOrderFieldDefinitions.some((entry) => entry.id === field.id), false);
-
-    const product = context.stores.getState().stockItems[0];
-    assert.ok(product);
-    const inUse = context.planning.saveProductOrderWorkflowState({ name: "In use" });
-    context.planning.saveProductOrder({
-      externalReference: "DELETE-GUARD",
-      productTallyGuid: product.tallyGuid,
-      quantity: 1,
-      workflowStateId: inUse.id,
-    });
     assert.throws(
-      () => context.planning.deleteProductOrderWorkflowState(inUse.id),
-      /used by 1 production order/,
+      () => context.planning.saveProductOrderWorkflowState({ name: "Temporary state" }),
+      /stages are fixed/,
     );
-    state = context.planning.getState();
-    assert.equal(state.productOrderWorkflowStates.some((entry) => entry.id === inUse.id), true);
+    assert.throws(() => context.planning.deleteProductOrderWorkflowState("po-pending"), /stages are fixed/);
   } finally {
     closeContext(context);
   }
@@ -300,7 +298,7 @@ test("migrations are additive and receipt splits keep only AVAILABLE in the lega
       faultySerialNumbers: ["F-1", "F-2"],
       faultReason: "Damaged on arrival",
     });
-    assert.equal(context.operations.moduleVersion, 3);
+    assert.equal(context.operations.moduleVersion, 4);
     assert.equal(balance(context, "AVAILABLE").quantity, 5);
     assert.equal(balance(context, "PENDING_INSPECTION").quantity, 3);
     assert.equal(balance(context, "FAULTY").quantity, 2);
@@ -323,7 +321,33 @@ test("migrations are additive and receipt splits keep only AVAILABLE in the lega
     const migrationRows = context.host.db.prepare(
       "SELECT version FROM application_module_migrations WHERE module_name = 'operations' ORDER BY version",
     ).all() as Array<{ version: number }>;
-    assert.deepEqual(migrationRows.map((row) => Number(row.version)), [1, 2, 3]);
+    assert.deepEqual(migrationRows.map((row) => Number(row.version)), [1, 2, 3, 4]);
+  } finally {
+    closeContext(context);
+  }
+});
+
+test("phone Material In needs no product and non-production Material Out needs no destination", () => {
+  const context = createContext();
+  try {
+    const materialIn = context.stores.recordMaterialInCorrection({
+      clientTransactionId: "found-extra-material",
+      boxId: "",
+      tallyItemGuid: context.componentGuid,
+      quantity: 2,
+      direction: "RETURN_TO_STOCK",
+      reason: "OTHER",
+      note: "Previously issued extras found in stores",
+    });
+    assert.equal(materialIn.quantity, 2);
+    const servicing = context.stores.recordMaterialOut({
+      clientTransactionId: "servicing-material-out",
+      boxId: "",
+      tallyItemGuid: context.componentGuid,
+      purpose: "SERVICING",
+      quantity: 1,
+    });
+    assert.equal(servicing.destinationName, "Servicing");
   } finally {
     closeContext(context);
   }
@@ -390,6 +414,7 @@ test("condition transitions, serial uniqueness, supplier faults, partial resolut
       serialNumbers: ["SER-1"],
     }, context.actor);
     assert.equal(returned.status, "RESOLVED");
+    context.host.db.prepare("UPDATE purchase_lots SET rate = 125, value = quantity_received * 125").run();
     context.operations.scrap({
       clientTransactionId: "scrap-pending",
       tallyItemGuid: context.componentGuid,
@@ -399,6 +424,8 @@ test("condition transitions, serial uniqueness, supplier faults, partial resolut
       reason: "Destroyed during inspection",
       serialNumbers: ["SER-6"],
     }, context.actor);
+    assert.equal(context.operations.getState().wastage.totalValue, 125);
+    assert.equal(context.operations.getState().wastage.byMaterial[0]?.name, "Test Component");
     assert.throws(() => receive(context, "duplicate-serial", {
       quantity: 1,
       acceptedQuantity: 1,
@@ -555,6 +582,20 @@ test("production completion, customer returns, idempotency, reversals and synchr
     };
     const issue = context.stores.recordMaterialOut(issueInput);
     context.operations.registerMaterialOut(issueInput, issue, context.actor);
+    assert.equal(Number((context.host.db.prepare(
+      "SELECT reserved_quantity FROM planning_reservations WHERE id = 'RES-1'",
+    ).get() as any).reserved_quantity), 1);
+    context.planning.saveProductOrder({
+      id: "ORDER-1",
+      externalReference: "PO-EXEC-1",
+      productTallyGuid: context.productGuid,
+      quantity: 2,
+      requiredDate: "2026-06-30",
+      workflowStateId: "pcb-soldering",
+    });
+    assert.equal(Number((context.host.db.prepare(
+      "SELECT reserved_quantity FROM planning_reservations WHERE id = 'RES-1'",
+    ).get() as any).reserved_quantity), 1);
     context.operations.productionReturn({
       clientTransactionId: "production-return",
       tallyItemGuid: context.componentGuid,

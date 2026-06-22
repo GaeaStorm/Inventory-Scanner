@@ -337,6 +337,10 @@ function registerIpcHandlers(): void {
     if (!operationsService) throw new Error("The inventory operations service is unavailable.");
     return operationsService.login(input as never);
   });
+  ipcMain.handle("auth:update-email", (_event, token: unknown, input: unknown) => {
+    if (!operationsService) throw new Error("The inventory operations service is unavailable.");
+    return operationsService.updateOwnEmail(input as never, requireActor(token));
+  });
   ipcMain.handle("auth:forgot-password", (_event, input: unknown) => {
     if (!operationsService) throw new Error("The inventory operations service is unavailable.");
     return operationsService.forgotCredential(input as never);

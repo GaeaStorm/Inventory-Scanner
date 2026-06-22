@@ -146,6 +146,12 @@ function credentialRules(credential: string, type: "PASSWORD" | "PIN"): void {
   if (credential.length < 8) throw new Error("A password must contain at least 8 characters.");
 }
 
+function emailAddress(value: unknown): string {
+  const email = text(value).toLocaleLowerCase();
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) throw new Error("Enter a valid email address.");
+  return email;
+}
+
 function hashCredential(credential: string, type: "PASSWORD" | "PIN"): { salt: string; hash: string } {
   credentialRules(credential, type);
   const salt = randomBytes(16).toString("hex");
@@ -563,6 +569,19 @@ const migrations: ApplicationDatabaseMigration[] = [
       `);
     },
   },
+  {
+    version: 4,
+    description: "Require a recovery email for every desktop user account",
+    up(database: DatabaseSync) {
+      database.exec(`
+        ALTER TABLE ops_users ADD COLUMN email TEXT NOT NULL DEFAULT '';
+        ALTER TABLE ops_users ADD COLUMN email_required INTEGER NOT NULL DEFAULT 1 CHECK (email_required IN (0,1));
+        UPDATE ops_users SET email_required = 0 WHERE id = '${SHARED_PHONE_USER_ID}';
+        CREATE UNIQUE INDEX idx_ops_users_email_unique
+          ON ops_users(email COLLATE NOCASE) WHERE email <> '';
+      `);
+    },
+  },
 ];
 
 export class OperationsDatabase {
@@ -622,6 +641,8 @@ export class OperationsDatabase {
       userId: text(row.id),
       username: text(row.username),
       displayName: text(row.display_name),
+      email: text(row.email),
+      needsEmail: Number(row.email_required) === 1 || !text(row.email),
       auditIdentity: text(row.audit_identity),
       role: text(row.role) as UserRole,
       active: Number(row.active) === 1,
@@ -656,6 +677,7 @@ export class OperationsDatabase {
       if (count !== 0) throw new Error("The initial administrator has already been created.");
       const displayName = text(input.displayName);
       const username = text(input.username);
+      const email = emailAddress(input.email);
       const credential = String(input.credential ?? "");
       const credentialType = input.credentialType === "PIN" ? "PIN" : "PASSWORD";
       if (!displayName || !username) throw new Error("Display name and username are required.");
@@ -665,9 +687,9 @@ export class OperationsDatabase {
       this.db.prepare(`
         INSERT INTO ops_users(
           id, display_name, username, credential_hash, credential_salt, credential_type,
-          role, active, must_reset_credential, audit_identity, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, 'ADMIN', 1, 0, ?, ?, ?)
-      `).run(userId, displayName, username, hashed.hash, hashed.salt, credentialType, `ADMIN:${username}`, timestamp, timestamp);
+          role, active, must_reset_credential, audit_identity, email, email_required, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, 'ADMIN', 1, 0, ?, ?, 0, ?, ?)
+      `).run(userId, displayName, username, hashed.hash, hashed.salt, credentialType, `ADMIN:${username}`, email, timestamp, timestamp);
       const actor: ActorContext = { userId, username, displayName, auditIdentity: `ADMIN:${username}`, role: "ADMIN" };
       this.audit(actor, "BOOTSTRAP_ADMIN", "USER", userId, { username });
       return this.createSession(userId, text(input.username) ? "Initial desktop" : "");
@@ -702,13 +724,14 @@ export class OperationsDatabase {
 
   forgotCredential(input: ForgotCredentialInput): void {
     const username = text(input.username);
+    const email = emailAddress(input.email);
     const credentialType = input.credentialType === "PIN" ? "PIN" : "PASSWORD";
     const hashed = hashCredential(String(input.credential ?? ""), credentialType);
     this.transaction("resetting a forgotten credential", () => {
       const row = this.db.prepare(
-        "SELECT id FROM ops_users WHERE username = ? COLLATE NOCASE AND active = 1 AND id <> ?",
-      ).get(username, SHARED_PHONE_USER_ID) as Row | undefined;
-      if (!row) throw new Error("No active account was found for that username.");
+        "SELECT id FROM ops_users WHERE username = ? COLLATE NOCASE AND email = ? COLLATE NOCASE AND active = 1 AND id <> ?",
+      ).get(username, email, SHARED_PHONE_USER_ID) as Row | undefined;
+      if (!row) throw new Error("The username and email address do not match an active account.");
       this.db.prepare(`
         UPDATE ops_users SET credential_hash = ?, credential_salt = ?, credential_type = ?,
           must_reset_credential = 0, version = version + 1, updated_at = ? WHERE id = ?
@@ -731,8 +754,8 @@ export class OperationsDatabase {
       this.db.prepare(`
         INSERT INTO ops_users(
           id, display_name, username, credential_hash, credential_salt, credential_type,
-          role, active, must_reset_credential, audit_identity, created_at, updated_at
-        ) VALUES (?, 'Phone scanner', '__shared_phone__', ?, ?, 'PASSWORD', 'STORE', 1, 0, 'PHONE:SHARED', ?, ?)
+          role, active, must_reset_credential, audit_identity, email, email_required, created_at, updated_at
+        ) VALUES (?, 'Phone scanner', '__shared_phone__', ?, ?, 'PASSWORD', 'STORE', 1, 0, 'PHONE:SHARED', '', 0, ?, ?)
       `).run(SHARED_PHONE_USER_ID, hashed.hash, hashed.salt, timestamp, timestamp);
       row = this.db.prepare("SELECT * FROM ops_users WHERE id = ?").get(SHARED_PHONE_USER_ID) as Row;
     }
@@ -783,6 +806,7 @@ export class OperationsDatabase {
       const id = text(input.id) || randomUUID();
       const displayName = text(input.displayName);
       const username = text(input.username);
+      const email = emailAddress(input.email);
       const role = input.role;
       if (!displayName || !username) throw new Error("Display name and username are required.");
       if (!["STORE", "ACCOUNTS", "PRODUCTION", "SALES", "ADMIN"].includes(role)) throw new Error("Choose a valid role.");
@@ -796,12 +820,12 @@ export class OperationsDatabase {
         this.db.prepare(`
           INSERT INTO ops_users(
             id, display_name, username, credential_hash, credential_salt, credential_type,
-            role, active, must_reset_credential, audit_identity, created_at, updated_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            role, active, must_reset_credential, audit_identity, email, email_required, created_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
         `).run(
           id, displayName, username, hashed.hash, hashed.salt, credentialType, role,
           input.active === false ? 0 : 1, input.mustResetCredential ? 1 : 0,
-          text(input.auditIdentity) || `${role}:${username}`, timestamp, timestamp,
+          text(input.auditIdentity) || `${role}:${username}`, email, timestamp, timestamp,
         );
       } else {
         if (input.expectedVersion != null && Number(existing.version) !== Number(input.expectedVersion)) {
@@ -810,17 +834,30 @@ export class OperationsDatabase {
         if (text(existing.id) === actor.userId && input.active === false) throw new Error("You cannot deactivate your own signed-in account.");
         this.db.prepare(`
           UPDATE ops_users SET display_name = ?, username = ?, role = ?, active = ?,
-            must_reset_credential = ?, audit_identity = ?, version = version + 1, updated_at = ?
+            must_reset_credential = ?, audit_identity = ?, email = ?, email_required = 0,
+            version = version + 1, updated_at = ?
           WHERE id = ?
         `).run(
           displayName, username, role, input.active === false ? 0 : 1,
           input.mustResetCredential ? 1 : 0, text(input.auditIdentity) || `${role}:${username}`,
-          timestamp, id,
+          email, timestamp, id,
         );
       }
       this.audit(actor, existing ? "USER_UPDATED" : "USER_CREATED", "USER", id, { username, role, active: input.active !== false });
       return this.listUsers().find((entry) => entry.userId === id)!;
     });
+  }
+
+  updateOwnEmail(input: { email: string }, actor: ActorContext): AuthUser {
+    const email = emailAddress(input.email);
+    this.transaction("saving an account recovery email", () => {
+      this.db.prepare(`
+        UPDATE ops_users SET email = ?, email_required = 0, version = version + 1, updated_at = ?
+        WHERE id = ?
+      `).run(email, nowIso(), actor.userId);
+      this.audit(actor, "USER_EMAIL_UPDATED", "USER", actor.userId, { email });
+    });
+    return this.listUsers().find((user) => user.userId === actor.userId)!;
   }
 
   resetCredential(input: ResetCredentialInput, actor: ActorContext): void {
@@ -1392,6 +1429,12 @@ export class OperationsDatabase {
         });
       }
       if (requestedSerials.length && serialOffset !== requestedSerials.length) throw new Error("Serial selection does not match the FIFO allocation.");
+      const purpose = text(input.purpose)
+        || (text(input.productOrderId) || text(input.destinationTallyItemGuid) ? "PRODUCTION" : "CUSTOMER_EXTRAS");
+      const destination = text(input.destinationTallyItemGuid)
+        ? this.db.prepare("SELECT id, COALESCE(NULLIF(local_name_override, ''), name) AS name FROM tally_stock_items WHERE tally_guid = ?")
+          .get(text(input.destinationTallyItemGuid)) as Row | undefined
+        : undefined;
       const movementId = this.insertMovement({
         clientTransactionId: text(input.clientTransactionId),
         movementType: "MATERIAL_ISSUE",
@@ -1401,23 +1444,65 @@ export class OperationsDatabase {
         sourceCondition: "AVAILABLE",
         targetCondition: null,
         productOrderId: text(input.productOrderId),
-        productName: text(input.destinationName),
+        productName: purpose === "PRODUCTION" ? text(destination?.name) : "",
         legacyMovementId: movement.id,
         notes: text(input.notes),
         metadata: {
           destinationTallyItemGuid: text(input.destinationTallyItemGuid),
+          purpose,
           substitutionForTallyGuid: text(input.substitutionForTallyGuid),
           additionalConsumption: input.additionalConsumption === true,
         },
         allocations: movementAllocations,
       }, actor);
       this.addManualTallyReview(movementId, "MATERIAL_ISSUE", "Material issue follows the existing Material Out review mapping.");
+      if (purpose === "PRODUCTION") {
+        this.consumeProductionReservation(
+          text(input.productOrderId),
+          text(input.destinationTallyItemGuid),
+          text(input.substitutionForTallyGuid) || text(input.tallyItemGuid),
+          movement.quantity,
+        );
+      }
       if (text(input.productOrderId)) {
         this.ensureProductionExecution(text(input.productOrderId), actor);
         this.db.prepare("UPDATE ops_production_executions SET status = 'IN_PROGRESS', version = version + 1, updated_at = ? WHERE product_order_id = ?")
           .run(nowIso(), text(input.productOrderId));
       }
     });
+  }
+
+  private consumeProductionReservation(productOrderId: string, productTallyGuid: string, componentTallyGuid: string, quantity: number): void {
+    const component = this.db.prepare("SELECT id FROM tally_stock_items WHERE tally_guid = ?").get(componentTallyGuid) as Row | undefined;
+    if (!component) return;
+    const rows = productOrderId
+      ? this.db.prepare(`
+          SELECT reservation.id, reservation.reserved_quantity
+          FROM planning_reservations reservation
+          WHERE reservation.product_order_id = ? AND reservation.component_item_id = ? AND reservation.status = 'ACTIVE'
+        `).all(productOrderId, component.id) as Row[]
+      : this.db.prepare(`
+          SELECT reservation.id, reservation.reserved_quantity
+          FROM planning_reservations reservation
+          JOIN planning_product_orders product_order ON product_order.id = reservation.product_order_id
+          JOIN tally_stock_items product ON product.id = product_order.product_item_id
+          WHERE product.tally_guid = ? AND reservation.component_item_id = ?
+            AND reservation.status = 'ACTIVE' AND product_order.status = 'CONFIRMED'
+          ORDER BY product_order.required_date, product_order.created_at
+        `).all(productTallyGuid, component.id) as Row[];
+    let remaining = quantity;
+    const update = this.db.prepare(`
+      UPDATE planning_reservations
+      SET reserved_quantity = ?, status = CASE WHEN ? = 0 THEN 'CONSUMED' ELSE status END, updated_at = ?
+      WHERE id = ?
+    `);
+    for (const row of rows) {
+      if (remaining <= 0) break;
+      const consumed = Math.min(remaining, Number(row.reserved_quantity));
+      const next = Number(row.reserved_quantity) - consumed;
+      update.run(next, next, nowIso(), row.id);
+      remaining -= consumed;
+    }
   }
 
   registerAdjustment(input: any, movement: { id: string; quantity: number; tallyItemGuid: string }, actor: ActorContext): void {
@@ -2153,10 +2238,19 @@ export class OperationsDatabase {
         const moved = this.moveSerials(part.lotId, Number(item.id), input.sourceCondition, "SCRAPPED", part.quantity, part.serialNumbers);
         return { ...part, sourceCondition: input.sourceCondition as StockCondition, targetCondition: "SCRAPPED" as StockCondition, serialNumbers: moved };
       });
+      const product = text(input.productOrderId)
+        ? this.db.prepare(`
+            SELECT COALESCE(NULLIF(item.local_name_override, ''), item.name) AS name
+            FROM planning_product_orders product_order
+            JOIN tally_stock_items item ON item.id = product_order.product_item_id
+            WHERE product_order.id = ?
+          `).get(text(input.productOrderId)) as Row | undefined
+        : undefined;
       const movementId = this.insertMovement({
         clientTransactionId: input.clientTransactionId, movementType: "SCRAP", eventDate: input.eventDate,
         stockItemId: Number(item.id), quantity, sourceCondition: input.sourceCondition, targetCondition: "SCRAPPED",
-        productOrderId: text(input.productOrderId), faultId: text(input.faultId), notes: [text(input.reason), text(input.notes)].filter(Boolean).join(" · "),
+        productOrderId: text(input.productOrderId), productName: text(product?.name),
+        faultId: text(input.faultId), notes: [text(input.reason), text(input.notes)].filter(Boolean).join(" · "),
         allocations: lines,
       }, actor);
       this.db.prepare(`
@@ -2854,13 +2948,45 @@ export class OperationsDatabase {
       FROM ops_scrap_records scrap JOIN ops_movements movement ON movement.id = scrap.movement_id
       ORDER BY scrap.recorded_at DESC
     `).all() as Row[]).map((row) => ({ ...row }));
+    const wastageRows = this.db.prepare(`
+      SELECT movement.item_name_snapshot AS material_name,
+        COALESCE(NULLIF(movement.product_name_snapshot, ''), 'Unassigned / general') AS product_name,
+        SUM(line.quantity) AS quantity,
+        SUM(line.quantity * COALESCE(lot.rate,
+          CASE WHEN lot.quantity_received > 0 THEN lot.value / lot.quantity_received END, 0)) AS value,
+        SUM(CASE WHEN lot.rate IS NULL AND lot.value IS NULL THEN line.quantity ELSE 0 END) AS unvalued_quantity
+      FROM ops_movements movement
+      JOIN ops_movement_lot_lines line ON line.movement_id = movement.id
+      JOIN purchase_lots lot ON lot.id = line.purchase_lot_id
+      WHERE movement.movement_type = 'SCRAP' AND movement.status <> 'REVERSED'
+      GROUP BY movement.item_name_snapshot,
+        COALESCE(NULLIF(movement.product_name_snapshot, ''), 'Unassigned / general')
+    `).all() as Row[];
+    const aggregateWastage = (key: "material_name" | "product_name") => {
+      const values = new Map<string, { name: string; quantity: number; value: number }>();
+      for (const row of wastageRows) {
+        const name = text(row[key]);
+        const current = values.get(name) ?? { name, quantity: 0, value: 0 };
+        current.quantity += Number(row.quantity);
+        current.value += Number(row.value);
+        values.set(name, current);
+      }
+      return [...values.values()].sort((left, right) => right.value - left.value || right.quantity - left.quantity);
+    };
+    const wastage = {
+      totalQuantity: wastageRows.reduce((sum, row) => sum + Number(row.quantity), 0),
+      totalValue: wastageRows.reduce((sum, row) => sum + Number(row.value), 0),
+      unvaluedQuantity: wastageRows.reduce((sum, row) => sum + Number(row.unvalued_quantity), 0),
+      byProduct: aggregateWastage("product_name"),
+      byMaterial: aggregateWastage("material_name"),
+    };
     const syncExceptions = this.getSyncExceptions();
     return {
       moduleVersion: this.moduleVersion, generatedAt: nowIso(), balances, movements: this.getMovements(), faults,
       faultSummary: [...faultSummaryMap.values()].sort((left, right) => right.unresolved - left.unresolved || left.supplierName.localeCompare(right.supplierName)),
       countSessions: countDetails.map(({ lines: _lines, ...session }) => session as StockCountSessionSummary), countDetails,
       supplierReturns, customerReturns, scrapRecords, productionExecutions: this.getProductionExecutions(),
-      syncExceptions, manualTallyReviews: this.getManualTallyReviews(),
+      syncExceptions, manualTallyReviews: this.getManualTallyReviews(), wastage,
       reports: {
         available: balances.filter((entry) => entry.condition === "AVAILABLE").reduce((sum, entry) => sum + entry.quantity, 0),
         pendingInspection: balances.filter((entry) => entry.condition === "PENDING_INSPECTION").reduce((sum, entry) => sum + entry.quantity, 0),

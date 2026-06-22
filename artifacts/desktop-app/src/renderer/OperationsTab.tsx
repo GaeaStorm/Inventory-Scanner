@@ -13,7 +13,6 @@ import type {
   UserRole,
 } from "./types";
 import OrderRegister from "./OrderRegister";
-import ProductionOrderKanban from "./ProductionOrderKanban";
 import { traceabilityColumns } from "./traceability";
 
 type Section = "overview" | "inspection" | "faults" | "counts" | "returns" | "production" | "exceptions" | "history" | "users";
@@ -115,7 +114,6 @@ function OperationPanel({ eyebrow, title, children, actions }: { eyebrow: string
 
 export default function OperationsTab({ stores, planning, operations, auth, permissions, onRefresh, onNotice, onError }: Props) {
   const [busy, setBusy] = useState(false);
-  const [productView, setProductView] = useState<"register" | "board">("register");
 
   async function run(action: () => Promise<unknown>, message: string) {
     setBusy(true);
@@ -133,27 +131,14 @@ export default function OperationsTab({ stores, planning, operations, auth, perm
 
   return <section className="tab-page operations-page">
     <div className="page-heading"><div><p className="eyebrow">CUSTOMER ORDERS</p><h1>Orders &amp; Production</h1></div><button className="button button--secondary" type="button" onClick={() => void onRefresh()}>Refresh</button></div>
-    <nav className="planning-subnav" aria-label="Orders and production sections">
-      <button type="button" className={productView === "register" ? "planning-subnav__active" : ""} onClick={() => setProductView("register")}>Order Register</button>
-      <button type="button" className={productView === "board" ? "planning-subnav__active" : ""} onClick={() => setProductView("board")}>Production Board</button>
-    </nav>
-    {productView === "register"
-      ? <OrderRegister
-          planning={planning}
-          stores={stores}
-          canManage={permissions.includes("PRODUCT_ORDER_MANAGE")}
-          onRefresh={onRefresh}
-          onNotice={onNotice}
-          onError={onError}
-        />
-      : <ProductionOrderKanban
-          planning={planning}
-          stores={stores}
-          canManage={permissions.includes("PRODUCT_ORDER_MANAGE")}
-          onRefresh={onRefresh}
-          onNotice={onNotice}
-          onError={onError}
-        />}
+    <OrderRegister
+      planning={planning}
+      stores={stores}
+      canManage={permissions.includes("PRODUCT_ORDER_MANAGE")}
+      onRefresh={onRefresh}
+      onNotice={onNotice}
+      onError={onError}
+    />
   </section>;
 }
 
@@ -509,14 +494,14 @@ function History({ stores, operations, busy, canReverse, canReview, run }: { sto
 function Users({ auth, busy, run }: { auth: AuthState; busy: boolean; run: (action: () => Promise<unknown>, message: string) => Promise<void> }) {
   const [selected, setSelected] = useState("");
   const current = auth.users.find((entry) => entry.userId === selected);
-  const [displayName, setDisplayName] = useState(""); const [username, setUsername] = useState(""); const [role, setRole] = useState<UserRole>("STORE"); const [active, setActive] = useState(true); const [auditIdentity, setAuditIdentity] = useState(""); const [credential, setCredential] = useState(""); const [credentialType, setCredentialType] = useState<"PASSWORD" | "PIN">("PASSWORD");
-  function choose(id: string) { const user = auth.users.find((entry) => entry.userId === id); setSelected(id); setDisplayName(user?.displayName ?? ""); setUsername(user?.username ?? ""); setRole(user?.role ?? "STORE"); setActive(user?.active ?? true); setAuditIdentity(user?.auditIdentity ?? ""); setCredential(""); setCredentialType(user?.credentialType ?? "PASSWORD"); }
+  const [displayName, setDisplayName] = useState(""); const [username, setUsername] = useState(""); const [email, setEmail] = useState(""); const [role, setRole] = useState<UserRole>("STORE"); const [active, setActive] = useState(true); const [auditIdentity, setAuditIdentity] = useState(""); const [credential, setCredential] = useState(""); const [credentialType, setCredentialType] = useState<"PASSWORD" | "PIN">("PASSWORD");
+  function choose(id: string) { const user = auth.users.find((entry) => entry.userId === id); setSelected(id); setDisplayName(user?.displayName ?? ""); setUsername(user?.username ?? ""); setEmail(user?.email ?? ""); setRole(user?.role ?? "STORE"); setActive(user?.active ?? true); setAuditIdentity(user?.auditIdentity ?? ""); setCredential(""); setCredentialType(user?.credentialType ?? "PASSWORD"); }
   return <div className="operations-two-column">
     <OperationPanel eyebrow="LOCAL USERS" title="Roles and audit identities">
-      <div className="table-scroll"><table><thead><tr><th>Name</th><th>Username</th><th>Role</th><th>Audit identity</th><th>Last login</th><th>Status</th></tr></thead><tbody>{auth.users.map((user) => <tr key={user.userId} className={selected === user.userId ? "selected-row" : ""} onClick={() => choose(user.userId)}><td>{user.displayName}</td><td>{user.username}</td><td>{user.role}</td><td>{user.auditIdentity}</td><td>{user.lastLogin ? dateTime(user.lastLogin) : "Never"}</td><td><Status value={user.active ? "ACTIVE" : "INACTIVE"} /></td></tr>)}</tbody></table></div><button className="button button--secondary" type="button" onClick={() => choose("")}>New user</button>
+      <div className="table-scroll"><table><thead><tr><th>Name</th><th>Username</th><th>Email</th><th>Role</th><th>Last login</th><th>Status</th></tr></thead><tbody>{auth.users.map((user) => <tr key={user.userId} className={selected === user.userId ? "selected-row" : ""} onClick={() => choose(user.userId)}><td>{user.displayName}</td><td>{user.username}</td><td>{user.email || "Required at next login"}</td><td>{user.role}</td><td>{user.lastLogin ? dateTime(user.lastLogin) : "Never"}</td><td><Status value={user.active ? "ACTIVE" : "INACTIVE"} /></td></tr>)}</tbody></table></div><button className="button button--secondary" type="button" onClick={() => choose("")}>New user</button>
     </OperationPanel>
     <OperationPanel eyebrow={current ? "EDIT USER" : "CREATE USER"} title={current?.displayName ?? "New local account"}>
-      <form className="operations-form operations-form-single" onSubmit={(event) => { event.preventDefault(); void run(() => window.desktop.operations.saveUser({ id: selected || undefined, displayName, username, role, active, auditIdentity: auditIdentity || undefined, credential: credential || undefined, credentialType }), selected ? "User updated." : "User created."); }}><label>Display name<input value={displayName} onChange={(event) => setDisplayName(event.target.value)} required /></label><label>Username<input value={username} onChange={(event) => setUsername(event.target.value)} required /></label><label>Role<select value={role} onChange={(event) => setRole(event.target.value as UserRole)}><option>STORE</option><option>ACCOUNTS</option><option>PRODUCTION</option><option>SALES</option><option>ADMIN</option></select></label><label>Audit identity<input value={auditIdentity} onChange={(event) => setAuditIdentity(event.target.value)} placeholder="Defaults to username" /></label><label>Credential type<select value={credentialType} onChange={(event) => setCredentialType(event.target.value as typeof credentialType)}><option>PASSWORD</option><option>PIN</option></select></label><label>{selected ? "New credential (optional)" : "Credential"}<input type="password" value={credential} onChange={(event) => setCredential(event.target.value)} required={!selected} /></label><label className="check-row"><input type="checkbox" checked={active} onChange={(event) => setActive(event.target.checked)} />Active account</label><button className="button" disabled={busy} type="submit">Save user</button>{selected && <button className="button button--secondary" disabled={busy || !credential} type="button" onClick={() => void run(() => window.desktop.operations.resetCredential({ userId: selected, credential, credentialType }), "Credential reset. Existing sessions were signed out.")}>Reset credential</button>}</form>
+      <form className="operations-form operations-form-single" onSubmit={(event) => { event.preventDefault(); void run(() => window.desktop.operations.saveUser({ id: selected || undefined, displayName, username, email, role, active, auditIdentity: auditIdentity || undefined, credential: credential || undefined, credentialType }), selected ? "User updated." : "User created."); }}><label>Display name<input value={displayName} onChange={(event) => setDisplayName(event.target.value)} required /></label><label>Username<input value={username} onChange={(event) => setUsername(event.target.value)} required /></label><label>Recovery email<input type="email" value={email} onChange={(event) => setEmail(event.target.value)} required /></label><label>Role<select value={role} onChange={(event) => setRole(event.target.value as UserRole)}><option>STORE</option><option>ACCOUNTS</option><option>PRODUCTION</option><option>SALES</option><option>ADMIN</option></select></label><label>Audit identity<input value={auditIdentity} onChange={(event) => setAuditIdentity(event.target.value)} placeholder="Defaults to username" /></label><label>Credential type<select value={credentialType} onChange={(event) => setCredentialType(event.target.value as typeof credentialType)}><option>PASSWORD</option><option>PIN</option></select></label><label>{selected ? "New credential (optional)" : "Credential"}<input type="password" value={credential} onChange={(event) => setCredential(event.target.value)} required={!selected} /></label><label className="check-row"><input type="checkbox" checked={active} onChange={(event) => setActive(event.target.checked)} />Active account</label><button className="button" disabled={busy} type="submit">Save user</button>{selected && <button className="button button--secondary" disabled={busy || !credential} type="button" onClick={() => void run(() => window.desktop.operations.resetCredential({ userId: selected, credential, credentialType }), "Credential reset. Existing sessions were signed out.")}>Reset credential</button>}</form>
     </OperationPanel>
   </div>;
 }

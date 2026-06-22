@@ -110,9 +110,12 @@ export default function QueueScreen() {
               <View key={entry.clientTransactionId} style={[styles.queueEntry, { backgroundColor: c.card, borderColor: c.border }]}>
                 <View style={styles.queueEntryText}>
                   <Text style={[styles.queueEntryTitle, { color: c.foreground }]}>
-                    {entry.type === "MATERIAL_OUT" ? "Material out" : "Stock adjustment"}
+                    {entry.type === "MATERIAL_OUT" ? "Material Out" : "Material In"}
                   </Text>
                   <Text style={[styles.queueEntryMeta, { color: c.mutedForeground }]}>
+                    {entry.type === "MATERIAL_OUT" && entry.payload.purpose
+                      ? `${String(entry.payload.purpose).replaceAll("_", " ")} · `
+                      : ""}
                     {new Date(entry.createdAt).toLocaleString()} · {entry.status === "REJECTED" ? "Rejected" : "Waiting"}
                   </Text>
                   {entry.lastError ? <Text style={styles.queueEntryError}>{entry.lastError}</Text> : null}

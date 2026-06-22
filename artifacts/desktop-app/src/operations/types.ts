@@ -95,6 +95,8 @@ export interface ActorContext {
 }
 
 export interface AuthUser extends ActorContext {
+  email: string;
+  needsEmail: boolean;
   active: boolean;
   credentialType: "PASSWORD" | "PIN";
   mustResetCredential: boolean;
@@ -120,6 +122,7 @@ export interface AuthState {
 export interface BootstrapAdminInput {
   displayName: string;
   username: string;
+  email: string;
   credential: string;
   credentialType?: "PASSWORD" | "PIN";
 }
@@ -132,6 +135,7 @@ export interface LoginInput {
 
 export interface ForgotCredentialInput {
   username: string;
+  email: string;
   credential: string;
   credentialType?: "PASSWORD" | "PIN";
 }
@@ -140,6 +144,7 @@ export interface SaveUserInput {
   id?: string;
   displayName: string;
   username: string;
+  email: string;
   role: UserRole;
   active?: boolean;
   auditIdentity?: string;
@@ -147,6 +152,10 @@ export interface SaveUserInput {
   credentialType?: "PASSWORD" | "PIN";
   mustResetCredential?: boolean;
   expectedVersion?: number;
+}
+
+export interface UpdateOwnEmailInput {
+  email: string;
 }
 
 export interface ResetCredentialInput {
@@ -229,6 +238,20 @@ export interface OperationsMovement {
   createdAt: string;
   reversibleQuantity: number;
   lines: MovementLotLine[];
+}
+
+export interface WastageBreakdown {
+  name: string;
+  quantity: number;
+  value: number;
+}
+
+export interface WastageReport {
+  totalQuantity: number;
+  totalValue: number;
+  unvaluedQuantity: number;
+  byProduct: WastageBreakdown[];
+  byMaterial: WastageBreakdown[];
 }
 
 export interface SupplierFaultResolutionEntry {
@@ -593,6 +616,7 @@ export interface OperationsState {
   productionExecutions: ProductionExecution[];
   syncExceptions: SyncExceptionRecord[];
   manualTallyReviews: ManualTallyReview[];
+  wastage: WastageReport;
   reports: {
     available: number;
     pendingInspection: number;

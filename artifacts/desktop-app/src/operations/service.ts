@@ -66,6 +66,10 @@ export class OperationsService {
     return this.database.forgotCredential(input);
   }
 
+  updateOwnEmail(input: { email: string }, actor: ActorContext) {
+    return this.database.updateOwnEmail(input, actor);
+  }
+
   sharedPhoneActor() {
     return this.database.sharedPhoneActor();
   }
@@ -174,6 +178,7 @@ export class OperationsService {
       clientTransactionId: input.clientTransactionId,
       boxId: input.boxId ?? "",
       tallyItemGuid: input.tallyItemGuid,
+      purpose: "PRODUCTION",
       destinationTallyItemGuid: input.destinationTallyItemGuid,
       quantity: input.quantity,
       eventDate: input.eventDate,

@@ -198,6 +198,7 @@ export class StoresService {
             clientTransactionId: input.clientTransactionId,
             boxId: input.boxId,
             tallyItemGuid: input.tallyItemGuid,
+            purpose: "CUSTOMER_EXTRAS",
             destinationTallyItemGuid: input.destinationTallyItemGuid,
             quantity: input.quantity,
             eventDate: input.eventDate,

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 
 import BackupRestorePanel from "./BackupRestorePanel";
+import AdministrationDashboard from "./AdministrationDashboard";
 import AuthGate from "./AuthGate";
 import BoxQrCodeCreatorTab from "./BoxQrCodeCreatorTab";
 import BulkMaterialInForm from "./BulkMaterialInForm";
@@ -13,7 +14,6 @@ import {
   getDashboard,
   getScannerQrUrl,
   setApiBaseUrl,
-  setWorkbookLocation,
 } from "./api";
 import type {
   AppTab,
@@ -29,6 +29,7 @@ import type {
 
 const tabs: Array<{ id: AppTab; label: string; icon: string; permission?: Permission }> = [
   { id: "dashboard", label: "Inventory Dashboard", icon: "▦", permission: "RESTOCK_VIEW" },
+  { id: "administration", label: "Admin Dashboard", icon: "₹", permission: "TALLY_REVIEW" },
   { id: "tracker", label: "Inventory Tracker", icon: "▤", permission: "INVENTORY_VIEW" },
   { id: "operations", label: "Orders & Production", icon: "↻", permission: "INVENTORY_VIEW" },
   { id: "qr", label: "QR Code Creator", icon: "⌗", permission: "QR_MANAGE" },
@@ -70,11 +71,11 @@ export default function App() {
   const [planning, setPlanning] = useState<PlanningState | null>(null);
   const [operations, setOperations] = useState<OperationsState | null>(null);
   const [selectedScannerUrl, setSelectedScannerUrl] = useState("");
-  const [workbookPath, setWorkbookPath] = useState("");
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState("");
   const [error, setError] = useState("");
+  const [requiredEmail, setRequiredEmail] = useState("");
 
   const refresh = useCallback(async () => {
     const [nextStores, nextPlanning, nextOperations, nextDashboard, nextAuth] = await Promise.all([
@@ -89,7 +90,6 @@ export default function App() {
     setOperations(nextOperations);
     setDashboard(nextDashboard);
     setAuth(nextAuth);
-    setWorkbookPath((current) => current || nextDashboard.workbook.path);
   }, []);
 
   useEffect(() => {
@@ -148,6 +148,22 @@ export default function App() {
     setPlanning(null);
     setOperations(null);
     setAuth(await window.desktop.auth.state());
+  }
+
+  async function saveRequiredEmail() {
+    setBusy(true);
+    setError("");
+    try {
+      const user = await window.desktop.auth.updateEmail({ email: requiredEmail });
+      setSession((current) => current ? { ...current, user } : current);
+      setAuth((current) => current ? { ...current, currentUser: user } : current);
+      setRequiredEmail("");
+      setNotice("Recovery email saved.");
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setBusy(false);
+    }
   }
 
   const handleStoresChanged = useCallback((state: StoresState) => {
@@ -285,6 +301,10 @@ export default function App() {
           />
         )}
 
+        {activeTab === "administration" && operations && planning && (
+          <AdministrationDashboard operations={operations} planning={planning} onRefresh={refresh} />
+        )}
+
         {activeTab === "qr" && stores && (
           <BoxQrCodeCreatorTab stores={stores} onChanged={handleStoresChanged} />
         )}
@@ -292,7 +312,7 @@ export default function App() {
         {activeTab === "settings" && stores && (
           <section className="tab-page">
             <div className="page-heading"><div><p className="eyebrow">APPLICATION SETTINGS</p><h1>Scanner, database, and exports</h1></div></div>
-            <div className="settings-grid">
+            <div className="settings-grid settings-grid--application">
               <article className="panel">
                 <div className="panel__header"><div><p className="eyebrow">COMPANY LAN</p><h2>{desktopInfo?.deploymentRole === "LAN_CLIENT" ? "LAN client" : "Production server"}</h2></div><span className="health-badge">{desktopInfo?.deploymentRole === "LAN_CLIENT" ? "REMOTE" : "AUTHORITATIVE"}</span></div>
                 <dl className="settings-details">
@@ -313,7 +333,7 @@ export default function App() {
                   </div>
                 </div>
               </article>
-              <article className="panel">
+              <article className="panel settings-database-card">
                 <div className="panel__header"><div><p className="eyebrow">SQLITE</p><h2>Operational database</h2></div><span className="health-badge">{stores.database.integrity.toUpperCase()}</span></div>
                 <dl className="settings-details"><div><dt>Path</dt><dd>{stores.database.path}</dd></div><div><dt>Schema</dt><dd>v{stores.database.schemaVersion}</dd></div><div><dt>Size</dt><dd>{formatBytes(stores.database.sizeBytes)}</dd></div><div><dt>Latest backup</dt><dd>{stores.database.latestBackup ?? "—"}</dd></div><div><dt>Host ID</dt><dd><code>{stores.database.hostId}</code></dd></div><div><dt>Writer mode</dt><dd>Authoritative desktop host</dd></div></dl>
               </article>
@@ -325,16 +345,6 @@ export default function App() {
               onNotice={setNotice}
               onError={setError}
             />}
-
-            {desktopInfo?.deploymentRole !== "LAN_CLIENT" && <article className="panel settings-wide-panel">
-              <div className="panel__header"><div><p className="eyebrow">LEGACY EXCEL AUDIT</p><h2>Existing workbook location</h2></div></div>
-              <label className="path-field">Workbook path<input value={workbookPath} onChange={(event) => setWorkbookPath(event.target.value)} /></label>
-              <div className="settings-actions">
-                <button className="button" disabled={busy} type="button" onClick={() => void perform(async () => { const result = await setWorkbookLocation(workbookPath); setDashboard((current) => current ? { ...current, workbook: result.workbook } : current); setWorkbookPath(result.workbook.path); }, "Legacy workbook location updated.")}>Save path</button>
-                <button className="button button--secondary" type="button" onClick={() => void perform(async () => { const folder = await window.desktop.chooseWorkbookFolder(workbookPath); if (folder) { const result = await setWorkbookLocation(folder); setWorkbookPath(result.workbook.path); } })}>Browse…</button>
-                {dashboard?.workbook.path && <button className="button button--secondary" type="button" onClick={() => void window.desktop.openWorkbookFolder(dashboard.workbook.path)}>Open folder</button>}
-              </div>
-            </article>}
           </section>
         )}
 
@@ -342,6 +352,14 @@ export default function App() {
           <TallyTab stores={stores} operations={operations} localFiles={desktopInfo?.deploymentRole !== "LAN_CLIENT"} onChanged={handleStoresChanged} onOperationsChanged={refresh} />
         )}
       </main>
+      {session.user.needsEmail && <div className="production-modal-backdrop">
+        <section className="panel auth-email-prompt" role="dialog" aria-modal="true" aria-label="Add recovery email">
+          <div><p className="eyebrow">ACCOUNT UPDATE REQUIRED</p><h2>Add your recovery email</h2><p>This existing account does not have an email address. Add one now so forgotten-password recovery can verify your identity.</p></div>
+          {error && <div className="alert alert--error">{error}</div>}
+          <label>Email address<input autoFocus type="email" value={requiredEmail} onChange={(event) => setRequiredEmail(event.target.value)} required /></label>
+          <button className="button" type="button" disabled={busy || !requiredEmail} onClick={() => void saveRequiredEmail()}>{busy ? "Saving…" : "Save email and continue"}</button>
+        </section>
+      </div>}
     </div>
   );
 }

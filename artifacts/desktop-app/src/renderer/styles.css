@@ -620,6 +620,16 @@ code {
   align-items: start;
 }
 
+.settings-grid--application {
+  align-items: stretch;
+  margin-bottom: 20px;
+}
+
+.settings-grid--application .settings-database-card {
+  grid-column: 1 / -1;
+  align-self: stretch;
+}
+
 .workbook-settings .muted strong {
   color: #44516a;
 }

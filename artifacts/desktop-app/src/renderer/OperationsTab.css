@@ -12,6 +12,23 @@
   gap: 18px;
 }
 
+.auth-email-prompt {
+  display: grid;
+  width: min(480px, 94vw);
+  gap: 18px;
+}
+
+.auth-email-prompt h2,
+.auth-email-prompt p {
+  margin: 0;
+}
+
+.auth-email-prompt label {
+  display: grid;
+  gap: 7px;
+  font-weight: 700;
+}
+
 .auth-card label,
 .operations-page label,
 .operations-page input,
@@ -471,6 +488,191 @@
   color: #9a6700 !important;
 }
 
+.administration-dashboard {
+  display: grid;
+  gap: 18px;
+}
+
+.administration-summary {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(170px, 1fr));
+  gap: 12px;
+}
+
+.administration-summary article {
+  display: grid;
+  gap: 5px;
+  min-height: 118px;
+  align-content: center;
+  padding: 18px;
+  border: 1px solid #dfe3e8;
+  border-radius: 10px;
+  background: #fff;
+}
+
+.administration-summary span,
+.administration-summary small {
+  color: #6b778c;
+}
+
+.administration-summary span {
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+}
+
+.administration-summary strong {
+  color: #172b4d;
+  font-size: 25px;
+}
+
+.administration-summary--warning {
+  border-color: #f0c36a !important;
+  background: #fffaf0 !important;
+}
+
+.administration-dashboard__grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+  align-items: start;
+}
+
+.administration-stage-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+  gap: 9px;
+}
+
+.administration-stage-list button {
+  display: grid;
+  grid-template-columns: 10px minmax(0, 1fr);
+  gap: 4px 9px;
+  align-items: center;
+  padding: 12px;
+  border: 1px solid #e1e6ed;
+  border-radius: 9px;
+  background: #fff;
+  color: #42526e;
+  cursor: pointer;
+  text-align: left;
+}
+
+.administration-stage-list button.active,
+.administration-stage-list button:hover {
+  border-color: #7a8fca;
+  background: #f4f6ff;
+}
+
+.administration-stage-list button > span {
+  grid-row: 1 / 4;
+  width: 8px;
+  height: 100%;
+  min-height: 44px;
+  border-radius: 999px;
+}
+
+.administration-stage-list small,
+.administration-stage-list b {
+  color: #7b8798;
+  font-size: 11px;
+  font-weight: 500;
+}
+
+.administration-stage-detail {
+  margin-top: 18px;
+  padding-top: 18px;
+  border-top: 1px solid #e6e9ef;
+}
+
+.administration-stage-detail h3 {
+  margin: 0 0 12px;
+}
+
+.administration-order-journey {
+  position: relative;
+  display: grid;
+  gap: 14px;
+  margin-top: 16px;
+  padding: 16px;
+  border: 1px solid #cfd7e6;
+  border-radius: 10px;
+  background: #f8faff;
+}
+
+.administration-order-journey > .icon-button {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+}
+
+.administration-order-journey h3,
+.administration-order-journey p {
+  margin: 0;
+}
+
+.administration-order-journey__stages {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+  gap: 8px;
+}
+
+.administration-order-journey__stages > div {
+  display: grid;
+  gap: 4px;
+  padding: 10px;
+  border-radius: 8px;
+  background: #fff;
+}
+
+.administration-order-journey__stages span,
+.administration-order-journey__stages small {
+  color: #6b778c;
+}
+
+.administration-breakdown__rows {
+  display: grid;
+}
+
+.administration-breakdown__row {
+  display: grid;
+  grid-template-columns: minmax(150px, 1fr) minmax(90px, .8fr) auto;
+  gap: 14px;
+  align-items: center;
+  padding: 12px 0;
+  border-top: 1px solid #ebecf0;
+}
+
+.administration-breakdown__row > div {
+  display: grid;
+  gap: 3px;
+}
+
+.administration-breakdown__row span {
+  color: #7b8798;
+  font-size: 11px;
+}
+
+.administration-breakdown__row i {
+  height: 7px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: #edf1f5;
+}
+
+.administration-breakdown__row i b {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: #b54708;
+}
+
+.administration-breakdown__row > strong {
+  color: #172b4d;
+  white-space: nowrap;
+}
+
 .operations-subnav,
 .operations-mode-tabs {
   display: flex;
@@ -702,6 +904,11 @@
   .order-detail-layout {
     grid-template-columns: 1fr;
   }
+
+  .administration-summary,
+  .administration-dashboard__grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
 }
 
 @media (max-width: 620px) {
@@ -742,5 +949,10 @@
   .order-detail-heading__meta {
     align-items: flex-start;
     flex-direction: column;
+  }
+
+  .administration-summary,
+  .administration-dashboard__grid {
+    grid-template-columns: 1fr;
   }
 }

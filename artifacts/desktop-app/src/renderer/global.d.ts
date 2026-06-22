@@ -65,6 +65,7 @@ declare global {
         state: (token?: string) => Promise<AuthState>;
         bootstrap: (input: BootstrapAdminInput) => Promise<AuthSession>;
         login: (input: LoginInput) => Promise<AuthSession>;
+        updateEmail: (input: { email: string }) => Promise<import("../operations/types").AuthUser>;
         forgotPassword: (input: ForgotCredentialInput) => Promise<void>;
         resume: (token: string) => Promise<AuthSession>;
         logout: () => Promise<void>;

@@ -172,6 +172,7 @@ export interface ProductOrder {
   workflowStateId: string;
   workflowStateName: string;
   workflowStateColor: string;
+  stageHistory: ProductOrderStageHistory[];
   bomVersionId: string | null;
   bomVersionLabel: string;
   feasibility: OrderFeasibility;
@@ -180,6 +181,15 @@ export interface ProductOrder {
   createdAt: string;
   updatedAt: string;
   requirements: ProductOrderRequirement[];
+}
+
+export interface ProductOrderStageHistory {
+  id: string;
+  stateId: string;
+  stateName: string;
+  enteredAt: string;
+  exitedAt: string | null;
+  durationHours: number;
 }
 
 export interface SaveProductOrderInput {

@@ -260,6 +260,86 @@ const migrations: ApplicationDatabaseMigration[] = [
       `);
     },
   },
+  {
+    version: 3,
+    description: "Standardize the customer-order lifecycle and record time spent in every stage",
+    up(database: DatabaseSync) {
+      database.exec(`
+        INSERT OR IGNORE INTO planning_product_order_workflow_states(id, name, color, position, terminal) VALUES
+          ('po-pending', 'PO Pending', '#6B778C', 1, 0),
+          ('po-generated', 'PO Generated', '#5268CA', 2, 0),
+          ('crf-pending', 'CRF Pending', '#9F7AEA', 3, 0),
+          ('crf-sent', 'CRF Sent', '#6554C0', 4, 0),
+          ('material-planning', 'Material Planning', '#5268CA', 5, 0),
+          ('material-purchase', 'Material Purchase', '#B7791F', 6, 0),
+          ('quality-control', 'Quality Control', '#B7791F', 7, 0),
+          ('pcb-soldering', 'PCB Soldering', '#246BCE', 8, 0),
+          ('initial-testing', 'Initial Testing', '#246BCE', 9, 0),
+          ('burn-test', 'Burn Test', '#246BCE', 10, 0),
+          ('final-testing', 'Final Testing', '#246BCE', 11, 0),
+          ('packing', 'Packing', '#246BCE', 12, 0),
+          ('pending-dispatch', 'Pending Dispatch', '#B7791F', 13, 0),
+          ('dispatched', 'Dispatched', '#23855B', 14, 1),
+          ('crac-generated', 'CRAC Generated', '#23855B', 15, 1);
+
+        UPDATE planning_product_order_workflow_states SET name = 'PO Pending', color = '#6B778C', position = 1, terminal = 0 WHERE id = 'po-pending';
+        UPDATE planning_product_order_workflow_states SET name = 'PO Generated', color = '#5268CA', position = 2, terminal = 0 WHERE id = 'po-generated';
+        UPDATE planning_product_order_workflow_states SET name = 'CRF Pending', color = '#9F7AEA', position = 3, terminal = 0 WHERE id = 'crf-pending';
+        UPDATE planning_product_order_workflow_states SET name = 'CRF Sent', color = '#6554C0', position = 4, terminal = 0 WHERE id = 'crf-sent';
+        UPDATE planning_product_order_workflow_states SET name = 'Material Planning', color = '#5268CA', position = 5, terminal = 0 WHERE id = 'material-planning';
+        UPDATE planning_product_order_workflow_states SET name = 'Material Purchase', color = '#B7791F', position = 6, terminal = 0 WHERE id = 'material-purchase';
+        UPDATE planning_product_order_workflow_states SET name = 'Quality Control', color = '#B7791F', position = 7, terminal = 0 WHERE id = 'quality-control';
+        UPDATE planning_product_order_workflow_states SET name = 'PCB Soldering', color = '#246BCE', position = 8, terminal = 0 WHERE id = 'pcb-soldering';
+        UPDATE planning_product_order_workflow_states SET name = 'Initial Testing', color = '#246BCE', position = 9, terminal = 0 WHERE id = 'initial-testing';
+        UPDATE planning_product_order_workflow_states SET name = 'Burn Test', color = '#246BCE', position = 10, terminal = 0 WHERE id = 'burn-test';
+        UPDATE planning_product_order_workflow_states SET name = 'Final Testing', color = '#246BCE', position = 11, terminal = 0 WHERE id = 'final-testing';
+        UPDATE planning_product_order_workflow_states SET name = 'Packing', color = '#246BCE', position = 12, terminal = 0 WHERE id = 'packing';
+        UPDATE planning_product_order_workflow_states SET name = 'Pending Dispatch', color = '#B7791F', position = 13, terminal = 0 WHERE id = 'pending-dispatch';
+        UPDATE planning_product_order_workflow_states SET name = 'Dispatched', color = '#23855B', position = 14, terminal = 1 WHERE id = 'dispatched';
+        UPDATE planning_product_order_workflow_states SET name = 'CRAC Generated', color = '#23855B', position = 15, terminal = 1 WHERE id = 'crac-generated';
+
+        UPDATE planning_product_orders SET workflow_state_id = CASE workflow_state_id
+          WHEN 'pending' THEN 'po-pending'
+          WHEN 'product-confirmation' THEN 'po-generated'
+          WHEN 'raw-material' THEN 'material-purchase'
+          WHEN 'pending-material' THEN 'material-purchase'
+          WHEN 'material-available' THEN 'material-planning'
+          WHEN 'in-production' THEN 'pcb-soldering'
+          WHEN 'ready-dispatch' THEN 'pending-dispatch'
+          WHEN 'hold' THEN 'po-pending'
+          ELSE workflow_state_id
+        END;
+        UPDATE planning_product_orders SET workflow_state_id = 'po-pending'
+        WHERE workflow_state_id NOT IN (
+          'po-pending','po-generated','crf-pending','crf-sent','material-planning',
+          'material-purchase','quality-control','pcb-soldering','initial-testing',
+          'burn-test','final-testing','packing','pending-dispatch','dispatched','crac-generated'
+        ) OR workflow_state_id IS NULL;
+
+        DELETE FROM planning_product_order_workflow_states WHERE id NOT IN (
+          'po-pending','po-generated','crf-pending','crf-sent','material-planning',
+          'material-purchase','quality-control','pcb-soldering','initial-testing',
+          'burn-test','final-testing','packing','pending-dispatch','dispatched','crac-generated'
+        );
+
+        CREATE TABLE planning_product_order_stage_history (
+          id TEXT PRIMARY KEY,
+          product_order_id TEXT NOT NULL REFERENCES planning_product_orders(id) ON DELETE CASCADE,
+          workflow_state_id TEXT NOT NULL REFERENCES planning_product_order_workflow_states(id),
+          entered_at TEXT NOT NULL,
+          exited_at TEXT
+        ) STRICT;
+        CREATE INDEX idx_planning_stage_history_state
+          ON planning_product_order_stage_history(workflow_state_id, entered_at, exited_at);
+        CREATE INDEX idx_planning_stage_history_order
+          ON planning_product_order_stage_history(product_order_id, entered_at);
+
+        INSERT INTO planning_product_order_stage_history(id, product_order_id, workflow_state_id, entered_at, exited_at)
+        SELECT lower(hex(randomblob(16))), id, workflow_state_id, updated_at, NULL
+        FROM planning_product_orders;
+      `);
+    },
+  },
 ];
 
 export class PlanningDatabase {
@@ -508,55 +588,14 @@ export class PlanningDatabase {
 
   saveProductOrderWorkflowState(input: SaveProductOrderWorkflowStateInput): ProductOrderWorkflowState {
     this.ensureReady();
-    const name = text(input.name);
-    if (!name) throw new Error("Enter a workflow state name.");
-    const existing = this.db.prepare(`
-      SELECT id FROM planning_product_order_workflow_states WHERE name = ? COLLATE NOCASE
-    `).get(name) as Row | undefined;
-    if (existing) throw new Error("A workflow state with this name already exists.");
-    const id = fieldKey(name) || randomUUID();
-    const duplicateId = this.db.prepare("SELECT 1 FROM planning_product_order_workflow_states WHERE id = ?").get(id);
-    const stateId = duplicateId ? `${id}-${randomUUID().slice(0, 6)}` : id;
-    const position = Number((this.db.prepare(`
-      SELECT COALESCE(MAX(position), 0) + 1 AS position FROM planning_product_order_workflow_states
-    `).get() as Row).position);
-    const color = /^#[0-9a-f]{6}$/i.test(text(input.color)) ? text(input.color).toUpperCase() : "#6B778C";
-    this.db.prepare(`
-      INSERT INTO planning_product_order_workflow_states(id, name, color, position, terminal)
-      VALUES (?, ?, ?, ?, ?)
-    `).run(stateId, name, color, position, input.terminal ? 1 : 0);
-    return this.getProductOrderWorkflowStates().find((state) => state.id === stateId)!;
+    void input;
+    throw new Error("Order stages are fixed so timing reports remain consistent.");
   }
 
   deleteProductOrderWorkflowState(stateIdValue: string): void {
     this.ensureReady();
-    const stateId = text(stateIdValue);
-    const state = this.db.prepare(`
-      SELECT id, name FROM planning_product_order_workflow_states WHERE id = ?
-    `).get(stateId) as Row | undefined;
-    if (!state) throw new Error("Workflow state not found.");
-    const stateCount = Number((this.db.prepare(`
-      SELECT COUNT(*) AS count FROM planning_product_order_workflow_states
-    `).get() as Row).count);
-    if (stateCount <= 1) throw new Error("At least one workflow state must remain.");
-    const orderCount = Number((this.db.prepare(`
-      SELECT COUNT(*) AS count FROM planning_product_orders WHERE workflow_state_id = ?
-    `).get(stateId) as Row).count);
-    if (orderCount > 0) {
-      throw new Error(
-        `${text(state.name)} is used by ${orderCount} production order${orderCount === 1 ? "" : "s"}. Move those orders to another state before deleting it.`,
-      );
-    }
-    this.host.transaction("deleting a production workflow state", () => {
-      this.db.prepare("DELETE FROM planning_product_order_workflow_states WHERE id = ?").run(stateId);
-      this.db.prepare(`
-        UPDATE planning_product_order_workflow_states
-        SET position = (
-          SELECT COUNT(*) FROM planning_product_order_workflow_states earlier
-          WHERE earlier.position <= planning_product_order_workflow_states.position
-        )
-      `).run();
-    });
+    void stateIdValue;
+    throw new Error("Order stages are fixed so timing reports remain consistent.");
   }
 
   saveProductOrderFieldDefinition(input: SaveProductOrderFieldDefinitionInput): ProductOrderFieldDefinition {
@@ -609,10 +648,29 @@ export class PlanningDatabase {
       SELECT id FROM planning_product_order_workflow_states WHERE id = ?
     `).get(text(workflowStateId)) as Row | undefined;
     if (!state) throw new Error("Workflow state not found.");
-    const result = this.db.prepare(`
-      UPDATE planning_product_orders SET workflow_state_id = ?, updated_at = ? WHERE id = ?
-    `).run(state.id, nowIso(), text(orderId));
-    if (Number(result.changes) === 0) throw new Error("Product order not found.");
+    if (text(state.id) === "quality-control" && !this.db.prepare(`
+      SELECT 1 FROM planning_product_order_stage_history
+      WHERE product_order_id = ? AND workflow_state_id = 'material-purchase'
+    `).get(text(orderId))) {
+      throw new Error("Quality Control is available only after the order has entered Material Purchase.");
+    }
+    this.host.transaction("updating an order stage", () => {
+      const order = this.db.prepare("SELECT workflow_state_id FROM planning_product_orders WHERE id = ?").get(text(orderId)) as Row | undefined;
+      if (!order) throw new Error("Product order not found.");
+      if (text(order.workflow_state_id) === text(state.id)) return;
+      const timestamp = nowIso();
+      this.db.prepare(`
+        UPDATE planning_product_order_stage_history SET exited_at = ?
+        WHERE product_order_id = ? AND exited_at IS NULL
+      `).run(timestamp, text(orderId));
+      this.db.prepare(`
+        INSERT INTO planning_product_order_stage_history(id, product_order_id, workflow_state_id, entered_at)
+        VALUES (?, ?, ?, ?)
+      `).run(randomUUID(), text(orderId), state.id, timestamp);
+      this.db.prepare(`
+        UPDATE planning_product_orders SET workflow_state_id = ?, updated_at = ? WHERE id = ?
+      `).run(state.id, timestamp, text(orderId));
+    });
   }
 
   saveProductOrder(input: SaveProductOrderInput): ProductOrder {
@@ -641,6 +699,12 @@ export class PlanningDatabase {
         `).get() as Row | undefined)?.id);
       if (!this.db.prepare("SELECT 1 FROM planning_product_order_workflow_states WHERE id = ?").get(workflowStateId)) {
         throw new Error("Choose a valid workflow state.");
+      }
+      if (workflowStateId === "quality-control" && !this.db.prepare(`
+        SELECT 1 FROM planning_product_order_stage_history
+        WHERE product_order_id = ? AND workflow_state_id = 'material-purchase'
+      `).get(orderId)) {
+        throw new Error("Quality Control is available only after the order has entered Material Purchase.");
       }
       this.db.prepare(`
         INSERT INTO planning_product_orders(
@@ -703,6 +767,18 @@ export class PlanningDatabase {
         input.priority === undefined ? text(existing?.priority) : text(input.priority),
         workflowStateId,
       );
+      if (!existing || text(existing.workflow_state_id) !== workflowStateId) {
+        if (existing) {
+          this.db.prepare(`
+            UPDATE planning_product_order_stage_history SET exited_at = ?
+            WHERE product_order_id = ? AND exited_at IS NULL
+          `).run(timestamp, orderId);
+        }
+        this.db.prepare(`
+          INSERT INTO planning_product_order_stage_history(id, product_order_id, workflow_state_id, entered_at)
+          VALUES (?, ?, ?, ?)
+        `).run(randomUUID(), orderId, workflowStateId, timestamp);
+      }
       if (input.customFields) {
         const definitions = new Map(this.getProductOrderFieldDefinitions().map((field) => [field.key, field]));
         const upsert = this.db.prepare(`
@@ -716,8 +792,15 @@ export class PlanningDatabase {
           upsert.run(orderId, definition.id, JSON.stringify(value ?? null));
         }
       }
-      this.db.prepare("DELETE FROM planning_reservations WHERE product_order_id = ?").run(orderId);
-      if (status === "CONFIRMED" && bom) this.createReservations(orderId, bom, quantity);
+      const reservationBasisChanged = !existing
+        || Number(existing.product_item_id) !== Number(product.id)
+        || Number(existing.quantity) !== quantity
+        || text(existing.status) !== status
+        || text(existing.bom_version_id) !== text(bom?.id);
+      if (reservationBasisChanged) {
+        this.db.prepare("DELETE FROM planning_reservations WHERE product_order_id = ?").run(orderId);
+        if (status === "CONFIRMED" && bom) this.createReservations(orderId, bom, quantity);
+      }
     });
     return this.getProductOrders().find((order) => order.id === orderId)!;
   }
@@ -876,6 +959,12 @@ export class PlanningDatabase {
       WHERE value.product_order_id = ?
       ORDER BY definition.position
     `);
+    const stageHistoryStatement = this.db.prepare(`
+      SELECT history.*, workflow.name AS state_name
+      FROM planning_product_order_stage_history history
+      JOIN planning_product_order_workflow_states workflow ON workflow.id = history.workflow_state_id
+      WHERE history.product_order_id = ? ORDER BY history.entered_at
+    `);
     const priorCommittedByComponent = new Map<number, number>();
     return rows.map((row) => {
       const requirements = (requirementsStatement.all(row.id) as Row[]).map((requirement): ProductOrderRequirement => {
@@ -921,6 +1010,18 @@ export class PlanningDatabase {
           return [text(field.field_key), text(field.value_json)];
         }
       }));
+      const stageHistory = (stageHistoryStatement.all(row.id) as Row[]).map((entry) => {
+        const end = entry.exited_at ? new Date(text(entry.exited_at)).valueOf() : Date.now();
+        const start = new Date(text(entry.entered_at)).valueOf();
+        return {
+          id: text(entry.id),
+          stateId: text(entry.workflow_state_id),
+          stateName: text(entry.state_name),
+          enteredAt: text(entry.entered_at),
+          exitedAt: entry.exited_at ? text(entry.exited_at) : null,
+          durationHours: Math.max(0, (end - start) / 3_600_000),
+        };
+      });
       return {
         id: text(row.id),
         fileNumber: text(row.file_number),
@@ -948,6 +1049,7 @@ export class PlanningDatabase {
         workflowStateId: text(row.workflow_state_id),
         workflowStateName: text(row.workflow_state_name) || "Pending",
         workflowStateColor: text(row.workflow_state_color) || "#6B778C",
+        stageHistory,
         bomVersionId: row.bom_version_id ? text(row.bom_version_id) : null,
         bomVersionLabel: row.bom_version_id ? `${text(row.bom_label)} (v${row.bom_version_number})` : "No active BOM",
         feasibility,

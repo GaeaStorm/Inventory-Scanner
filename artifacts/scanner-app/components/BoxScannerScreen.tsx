@@ -33,6 +33,7 @@ const DEBOUNCE_MS = 2000;
 const MAX_BOX_ITEMS = 5;
 
 type Workflow = "MATERIAL_OUT" | "ADJUSTMENT";
+type MaterialOutPurpose = "PRODUCTION" | "SERVICING" | "CUSTOMER_EXTRAS";
 type AdjustmentDirection = "RETURN_TO_STOCK" | "ADDITIONAL_OUT";
 type AdjustmentReason = "UNUSED_MATERIAL" | "MISCOUNT" | "DATA_ENTRY_ERROR" | "DAMAGE_OR_LOSS" | "OTHER";
 
@@ -207,6 +208,7 @@ export default function BoxScannerScreen() {
   const [catalog, setCatalog] = useState<CatalogResponse | null>(null);
   const [selectedItem, setSelectedItem] = useState<CatalogItem | null>(null);
   const [workflow, setWorkflow] = useState<Workflow>("MATERIAL_OUT");
+  const [materialOutPurpose, setMaterialOutPurpose] = useState<MaterialOutPurpose>("PRODUCTION");
   const [quantity, setQuantity] = useState("1");
   const [destination, setDestination] = useState<CatalogItem | null>(null);
   const [adjustmentDirection, setAdjustmentDirection] = useState<AdjustmentDirection>("RETURN_TO_STOCK");
@@ -286,6 +288,7 @@ export default function BoxScannerScreen() {
     setError(""); setSuccess(""); setWarning("");
     setSelectedItem(null); setDestination(null);
     setWorkflow("MATERIAL_OUT"); setQuantity("1");
+    setMaterialOutPurpose("PRODUCTION");
     setAdjustmentDirection("RETURN_TO_STOCK");
     setAdjustmentReason(ADJUSTMENT_REASONS[0]);
     setAdjustmentNote("");
@@ -359,7 +362,7 @@ export default function BoxScannerScreen() {
       setSelectedItem(first);
       if (!first) throw new Error("None of the items on this label could be matched to the cached Tally Stock Items.");
       if (nextCatalog.destinations.length === 0 && onlineFailure) {
-        setWarning((current) => `${current} No cached destination-product catalog is available yet, so this scan can be viewed but not submitted.`);
+        setWarning((current) => `${current} No cached destination-product catalog is available yet, so Production Material Out cannot be submitted offline.`);
       }
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
@@ -386,7 +389,7 @@ export default function BoxScannerScreen() {
   }
 
   async function submit(): Promise<void> {
-    if (!box || !selectedItem || !destination) return;
+    if (!box || !selectedItem || (workflow === "MATERIAL_OUT" && materialOutPurpose === "PRODUCTION" && !destination)) return;
     const qty = Number(quantity);
     if (!Number.isInteger(qty) || qty <= 0) {
       setError("Quantity must be a positive whole number.");
@@ -407,7 +410,8 @@ export default function BoxScannerScreen() {
             clientTransactionId,
             boxId: box.boxId,
             tallyItemGuid: selectedItem.tallyGuid,
-            destinationTallyItemGuid: destination.tallyGuid,
+            purpose: materialOutPurpose,
+            destinationTallyItemGuid: materialOutPurpose === "PRODUCTION" ? destination?.tallyGuid : undefined,
             quantity: qty,
             eventDate: today(),
           }
@@ -415,7 +419,6 @@ export default function BoxScannerScreen() {
             clientTransactionId,
             boxId: box.boxId,
             tallyItemGuid: selectedItem.tallyGuid,
-            destinationTallyItemGuid: destination.tallyGuid,
             quantity: qty,
             direction: "RETURN_TO_STOCK" as const,
             reason: "OTHER" as const,
@@ -460,7 +463,8 @@ export default function BoxScannerScreen() {
   if (!permission.granted) return <View style={[styles.permissionContainer, { backgroundColor: c.background }]}><Feather name="camera" size={48} color={c.mutedForeground} /><Text style={[styles.permissionTitle, { color: c.foreground }]}>Camera Access Required</Text><Text style={[styles.permissionText, { color: c.mutedForeground }]}>Allow camera access to scan inventory box labels.</Text><TouchableOpacity style={[styles.permissionBtn, { backgroundColor: colors.light.primary }]} onPress={requestPermission}><Text style={styles.permissionBtnText}>Allow Camera</Text></TouchableOpacity></View>;
 
   const validQuantity = Number.isInteger(Number(quantity)) && Number(quantity) > 0;
-  const canSubmit = Boolean(selectedItem && destination && validQuantity);
+  const canSubmit = Boolean(selectedItem && validQuantity
+    && (workflow === "ADJUSTMENT" || materialOutPurpose !== "PRODUCTION" || destination));
 
   return (
     <View style={styles.container}>
@@ -494,12 +498,21 @@ export default function BoxScannerScreen() {
                 <View style={styles.workflowWrap}>{([
                   ["MATERIAL_OUT", "Material Out", "upload"],
                   ["ADJUSTMENT", "Material In", "download"],
-                ] as const).map(([value, label, icon]) => <TouchableOpacity key={value} style={[styles.workflowButton, { borderColor: workflow === value ? colors.light.primary : c.border, backgroundColor: workflow === value ? colors.light.primary : c.background }]} onPress={() => { setWorkflow(value); setError(""); setAdjustmentConfirmed(false); }}><Feather name={icon} size={15} color={workflow === value ? "#fff" : c.foreground} /><Text style={[styles.workflowText, { color: workflow === value ? "#fff" : c.foreground }]}>{label}</Text></TouchableOpacity>)}</View>
+                ] as const).map(([value, label, icon]) => <TouchableOpacity key={value} style={[styles.workflowButton, { borderColor: workflow === value ? colors.light.primary : c.border, backgroundColor: workflow === value ? colors.light.primary : c.background }]} onPress={() => { setWorkflow(value); setError(""); setAdjustmentConfirmed(false); if (value === "ADJUSTMENT") setDestination(null); }}><Feather name={icon} size={15} color={workflow === value ? "#fff" : c.foreground} /><Text style={[styles.workflowText, { color: workflow === value ? "#fff" : c.foreground }]}>{label}</Text></TouchableOpacity>)}</View>
               </View>
 
-              {catalog && <Dropdown label="DESTINATION PRODUCT" value={destination} values={catalog.destinations} display={(item) => item.name} detail={(item) => item.hasBom ? "Has BOM" : item.parentName} onChange={(item) => { setDestination(item); setAdjustmentConfirmed(false); }} colors={c} required />}
+              {workflow === "MATERIAL_OUT" && <View style={styles.section}>
+                <Text style={[styles.label, { color: c.mutedForeground }]}>MATERIAL OUT FOR</Text>
+                <View style={styles.workflowWrap}>{([
+                  ["PRODUCTION", "Production"],
+                  ["SERVICING", "Servicing"],
+                  ["CUSTOMER_EXTRAS", "Customer Extras"],
+                ] as const).map(([value, label]) => <TouchableOpacity key={value} style={[styles.workflowButton, { borderColor: materialOutPurpose === value ? colors.light.primary : c.border, backgroundColor: materialOutPurpose === value ? colors.light.primary : c.background }]} onPress={() => { setMaterialOutPurpose(value); setError(""); if (value !== "PRODUCTION") setDestination(null); }}><Text style={[styles.workflowText, { color: materialOutPurpose === value ? "#fff" : c.foreground }]}>{label}</Text></TouchableOpacity>)}</View>
+              </View>}
 
-              {workflow === "ADJUSTMENT" && <Text style={styles.offlineNotice}>This records a new Material In entry. It does not modify or link back to a previous Material Out transaction.</Text>}
+              {workflow === "MATERIAL_OUT" && materialOutPurpose === "PRODUCTION" && catalog && <Dropdown label="DESTINATION PRODUCT" value={destination} values={catalog.destinations} display={(item) => item.name} detail={(item) => item.hasBom ? "Has BOM" : item.parentName} onChange={(item) => { setDestination(item); setAdjustmentConfirmed(false); }} colors={c} required />}
+
+              {workflow === "ADJUSTMENT" && <Text style={styles.offlineNotice}>Use Material In only when extra stock was previously taken out and has now been found. No product is associated with this entry.</Text>}
 
               <View style={styles.section}><Text style={[styles.label, { color: c.mutedForeground }]}>QUANTITY (WHOLE COUNT) *</Text><View style={styles.stepper}><TouchableOpacity style={[styles.stepButton, { backgroundColor: c.muted }]} onPress={() => setQuantity(String(Math.max(1, Number(quantity || 1) - 1)))}><Feather name="minus" size={20} color={c.foreground} /></TouchableOpacity><TextInput value={quantity} onChangeText={(value) => /^\d*$/.test(value) && setQuantity(value)} keyboardType="number-pad" selectTextOnFocus style={[styles.quantityInput, { color: c.foreground, borderColor: c.border, backgroundColor: c.background }]} /><TouchableOpacity style={[styles.stepButton, { backgroundColor: c.muted }]} onPress={() => setQuantity(String(Number(quantity || 0) + 1))}><Feather name="plus" size={20} color={c.foreground} /></TouchableOpacity></View></View>
 

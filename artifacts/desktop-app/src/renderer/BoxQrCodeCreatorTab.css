@@ -490,9 +490,9 @@
 /* v12: keep large catalogs inside their card and make filtering practical. */
 .box-qr-catalog-panel {
   display: flex;
-  height: calc(100vh - 155px);
-  min-height: 520px;
-  max-height: 760px;
+  height: calc(100vh - 110px);
+  min-height: 640px;
+  max-height: 900px;
   flex-direction: column;
   overflow: hidden;
 }
@@ -642,7 +642,7 @@
 
 /* v3 UI polish */
 .existing-box-list {
-  max-height: 280px;
+  max-height: 380px;
   overflow-y: auto;
 }
 

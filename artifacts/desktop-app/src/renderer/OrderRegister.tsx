@@ -17,7 +17,7 @@ interface Props {
   onError: (message: string) => void;
 }
 
-type QuickFilter = "all" | "overdue" | "blocked" | "ready";
+type QuickFilter = "all" | "overdue" | "blocked" | "dispatched";
 
 interface OrderGroup {
   key: string;
@@ -57,11 +57,7 @@ function isBlocked(line: ProductOrder): boolean {
 
 function isReady(line: ProductOrder): boolean {
   const state = line.workflowStateName.toLocaleLowerCase();
-  return line.pendingQuantity === 0
-    || line.status === "COMPLETED"
-    || state.includes("ready")
-    || state.includes("complete")
-    || state.includes("dispatch");
+  return line.status === "COMPLETED" || state === "dispatched" || state === "crac generated";
 }
 
 function groupDueDate(group: OrderGroup): string {
@@ -76,8 +72,8 @@ function attention(group: OrderGroup): { label: string; tone: string } {
   if (group.lines.some((line) => /pending|await/i.test(`${line.crfStatus} ${line.cracStatus}`))) {
     return { label: "Customer action required", tone: "warning" };
   }
-  if (group.lines.some(isReady) && openLines.length) return { label: "Partially ready", tone: "warning" };
-  if (group.lines.length > 0 && group.lines.every(isReady)) return { label: "Ready for dispatch", tone: "success" };
+  if (group.lines.some(isReady) && openLines.length) return { label: "Partially dispatched", tone: "warning" };
+  if (group.lines.length > 0 && group.lines.every(isReady)) return { label: "Dispatched", tone: "success" };
   return { label: "On track", tone: "neutral" };
 }
 
@@ -190,13 +186,13 @@ export default function OrderRegister({ planning, stores, canManage, onRefresh, 
       || (due === "week" && Boolean(dueDate && dueDate >= today() && dueDate <= new Date(Date.now() + 7 * 86_400_000).toISOString().slice(0, 10)))
       || (due === "unset" && !dueDate);
     return (!search || haystack.includes(search.toLocaleLowerCase()))
-      && (!status || groupAttention.label === status)
+      && (!status || group.lines.some((line) => line.workflowStateId === status))
       && (!owner || group.lines.some((line) => line.responsiblePerson === owner))
       && dueMatch
       && (quickFilter === "all"
         || (quickFilter === "overdue" && groupAttention.label === "Overdue")
         || (quickFilter === "blocked" && groupAttention.label === "Material blocked")
-        || (quickFilter === "ready" && groupAttention.label === "Ready for dispatch"));
+        || (quickFilter === "dispatched" && groupAttention.label === "Dispatched"));
   });
 
   const selected = groups.find((group) => group.key === selectedKey) ?? null;
@@ -266,13 +262,13 @@ export default function OrderRegister({ planning, stores, canManage, onRefresh, 
   return <div className="order-register">
     <div className="order-register-toolbar">
       <input className="order-register-search" value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search orders…" />
-      <select value={status} onChange={(event) => setStatus(event.target.value)}><option value="">All statuses</option><option>Overdue</option><option>Material blocked</option><option>Customer action required</option><option>Partially ready</option><option>Ready for dispatch</option><option>On track</option></select>
+      <select value={status} onChange={(event) => setStatus(event.target.value)}><option value="">All stages</option>{planning.productOrderWorkflowStates.map((stage) => <option key={stage.id} value={stage.id}>{stage.name}</option>)}</select>
       <select value={due} onChange={(event) => setDue(event.target.value)}><option value="">Any due date</option><option value="overdue">Overdue</option><option value="week">Due this week</option><option value="unset">Date not set</option></select>
       <select value={owner} onChange={(event) => setOwner(event.target.value)}><option value="">All owners</option>{owners.map((entry) => <option key={entry}>{entry}</option>)}</select>
       {canManage && <button className="button" type="button" onClick={() => setDraft(newDraft(planning))}>+ New order</button>}
     </div>
     <div className="order-quick-filters" aria-label="Quick order filters">
-      {(["all", "overdue", "blocked", "ready"] as QuickFilter[]).map((value) => <button type="button" key={value} className={quickFilter === value ? "active" : ""} onClick={() => setQuickFilter(value)}>{value === "all" ? "All" : value === "ready" ? "Ready to dispatch" : value[0].toLocaleUpperCase() + value.slice(1)}</button>)}
+      {(["all", "overdue", "blocked", "dispatched"] as QuickFilter[]).map((value) => <button type="button" key={value} className={quickFilter === value ? "active" : ""} onClick={() => setQuickFilter(value)}>{value === "all" ? "All" : value[0].toLocaleUpperCase() + value.slice(1)}</button>)}
     </div>
     <div className="order-register-table">
       <div className="order-register-row order-register-row--head"><span /><span>Due</span><span>Customer / PO</span><span>Lines</span><span>Progress</span><span>Attention</span><span>Owner</span></div>
@@ -313,6 +309,11 @@ function LineDrawer({ draft, setDraft, planning, products, busy, canManage, onSa
   canManage: boolean;
   onSave: () => void;
 }) {
+  const current = draft.id ? planning.productOrders.find((order) => order.id === draft.id) : null;
+  const materialPurchaseOccurred = current?.stageHistory.some((entry) => entry.stateId === "material-purchase")
+    || draft.workflowStateId === "material-purchase";
+  const stages = planning.productOrderWorkflowStates.filter((stage) =>
+    stage.id !== "quality-control" || materialPurchaseOccurred);
   return <div className="product-line-drawer-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setDraft(null); }}>
     <aside className="product-line-drawer" role="dialog" aria-modal="true" aria-label={draft.id ? "Edit product line" : "Add product line"}>
       <header><div><p className="eyebrow">{draft.id ? "EDIT PRODUCT LINE" : "NEW PRODUCT LINE"}</p><h2>{draft.externalReference || "New order"}</h2></div><button className="icon-button" type="button" onClick={() => setDraft(null)} aria-label="Close">×</button></header>
@@ -323,7 +324,7 @@ function LineDrawer({ draft, setDraft, planning, products, busy, canManage, onSa
         </div>
         <label>Product<select value={draft.productTallyGuid} onChange={(event) => setDraft({ ...draft, productTallyGuid: event.target.value })}><option value="">Select product…</option>{products.map((product) => <option key={product.tallyGuid} value={product.tallyGuid}>{product.name}</option>)}</select></label>
         <div className="product-line-drawer__pair"><label>Quantity ordered<input type="number" min={1} value={draft.quantity} onChange={(event) => setDraft({ ...draft, quantity: Number(event.target.value) })} /></label><label>Remaining<input type="number" min={0} max={draft.quantity} value={draft.pendingQuantity ?? draft.quantity} onChange={(event) => setDraft({ ...draft, pendingQuantity: Number(event.target.value) })} /></label></div>
-        <label>Stage<select value={draft.workflowStateId ?? ""} onChange={(event) => setDraft({ ...draft, workflowStateId: event.target.value })}>{planning.productOrderWorkflowStates.map((state) => <option key={state.id} value={state.id}>{state.name}</option>)}</select></label>
+        <label>Stage<select value={draft.workflowStateId ?? ""} onChange={(event) => setDraft({ ...draft, workflowStateId: event.target.value })}>{stages.map((state) => <option key={state.id} value={state.id}>{state.name}</option>)}</select>{!materialPurchaseOccurred && <small>Quality Control appears after Material Purchase has been used.</small>}</label>
         <label>Owner<input value={draft.responsiblePerson ?? ""} onChange={(event) => setDraft({ ...draft, responsiblePerson: event.target.value })} /></label>
         <label>Required date<input type="date" value={draft.lastDispatchDate || draft.requiredDate || ""} onChange={(event) => setDraft({ ...draft, lastDispatchDate: event.target.value, requiredDate: event.target.value })} /></label>
         <label>Material blocker<textarea rows={2} placeholder="Leave blank when material is available" value={draft.pendingMaterial ?? ""} onChange={(event) => setDraft({ ...draft, pendingMaterial: event.target.value })} /></label>

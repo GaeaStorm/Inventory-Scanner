@@ -113,6 +113,9 @@ contextBridge.exposeInMainWorld("desktop", {
     login: async (input: unknown) => rememberSession(remoteServerUrl
       ? await remoteRequest("/api/operations/auth/login", jsonBody(input))
       : await ipcRenderer.invoke("auth:login", input)),
+    updateEmail: (input: unknown) => remoteServerUrl
+      ? remoteRequest("/api/operations/auth/email", jsonBody(input))
+      : ipcRenderer.invoke("auth:update-email", sessionToken, input),
     forgotPassword: async (input: unknown) => {
       if (remoteServerUrl) {
         throw new Error("For security, forgotten credentials must be reset on the Production server computer or by an administrator.");

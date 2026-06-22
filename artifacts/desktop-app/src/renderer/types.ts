@@ -1,4 +1,4 @@
-export type AppTab = "tracker" | "operations" | "dashboard" | "qr" | "settings" | "tally";
+export type AppTab = "tracker" | "operations" | "dashboard" | "administration" | "qr" | "settings" | "tally";
 
 export interface DesktopInfo {
   appVersion: string;

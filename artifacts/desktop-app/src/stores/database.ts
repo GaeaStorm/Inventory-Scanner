@@ -1853,7 +1853,14 @@ export class StoresDatabase {
       const duplicate = this.movementByClientId(input.clientTransactionId);
       if (duplicate) return duplicate;
       const stockItemId = this.itemId(input.tallyItemGuid);
-      const destinationItemId = this.itemId(input.destinationTallyItemGuid);
+      const purpose = input.purpose ?? "PRODUCTION";
+      if (!["PRODUCTION", "SERVICING", "CUSTOMER_EXTRAS"].includes(purpose)) {
+        throw new Error("Choose Production, Servicing, or Customer Extras for Material Out.");
+      }
+      const destination = purpose === "PRODUCTION"
+        ? this.issueDestination(input.destinationTallyItemGuid, "Production")
+        : this.issueDestination(undefined, purpose === "SERVICING" ? "Servicing" : "Customer Extras");
+      const destinationItemId = destination.id;
       this.ensureBoxContains(input.boxId, stockItemId);
 
       const available = Number((this.db.prepare("SELECT COALESCE(SUM(quantity_remaining), 0) AS quantity FROM purchase_lots WHERE stock_item_id = ?").get(stockItemId) as Row).quantity);
@@ -1901,6 +1908,21 @@ export class StoresDatabase {
       `).run(`EXP-${randomUUID()}`, groupId, externalId, json([]), timestamp, timestamp);
       return this.getMovement(movementId)!;
     });
+  }
+
+  private issueDestination(tallyItemGuid: string | undefined, label: string): { id: number; tallyGuid: string } {
+    if (tallyItemGuid) return { id: this.itemId(tallyItemGuid), tallyGuid: tallyItemGuid };
+    if (label === "Production") throw new Error("Destination Product is required for Production Material Out.");
+    const guid = `SYSTEM:MATERIAL_OUT:${label.toLocaleUpperCase().replaceAll(" ", "_")}`;
+    const existing = this.db.prepare("SELECT id FROM tally_stock_items WHERE tally_guid = ?").get(guid) as Row | undefined;
+    if (existing) return { id: Number(existing.id), tallyGuid: guid };
+    const inserted = this.db.prepare(`
+      INSERT INTO tally_stock_items(
+        tally_guid, name, parent_name, has_bom, tally_closing_quantity,
+        active, synced_at, source, catalog_role_override, catalog_ignored
+      ) VALUES (?, ?, 'System destinations', 0, 0, 1, ?, 'LOCAL', 'OTHER', 1)
+    `).run(guid, label, nowIso());
+    return { id: Number(inserted.lastInsertRowid), tallyGuid: guid };
   }
 
   setOpeningQuantity(input: OpeningQuantityInput): StoresOpeningQuantityAdjustment {
@@ -2080,7 +2102,9 @@ export class StoresDatabase {
       if (duplicate) return duplicate;
 
       const stockItemId = this.itemId(input.tallyItemGuid);
-      const destinationItemId = this.itemId(input.destinationTallyItemGuid);
+      const destinationTallyItemGuid = text(input.destinationTallyItemGuid);
+      if (!destinationTallyItemGuid) throw new Error("Destination Product is required for adjustments to an existing Material Out.");
+      const destinationItemId = this.itemId(destinationTallyItemGuid);
       this.ensureBoxContains(input.boxId, stockItemId);
       const context = this.adjustmentContextByIds(stockItemId, destinationItemId, eventDate);
       if (!context) {
