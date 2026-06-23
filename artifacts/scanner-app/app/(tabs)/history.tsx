@@ -110,7 +110,7 @@ export default function QueueScreen() {
               <View key={entry.clientTransactionId} style={[styles.queueEntry, { backgroundColor: c.card, borderColor: c.border }]}>
                 <View style={styles.queueEntryText}>
                   <Text style={[styles.queueEntryTitle, { color: c.foreground }]}>
-                    {entry.type === "MATERIAL_OUT" ? "Material Out" : "Material In"}
+                    {entry.type === "MATERIAL_OUT" ? "Material Out" : "Return found stock"}
                   </Text>
                   <Text style={[styles.queueEntryMeta, { color: c.mutedForeground }]}>
                     {entry.type === "MATERIAL_OUT" && entry.payload.purpose

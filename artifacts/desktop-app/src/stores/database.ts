@@ -19,14 +19,19 @@ import type {
   BulkVendorReceiptInput,
   BulkVendorReceiptResult,
   ConfirmImportInput,
+  CreateCatalogGroupInput,
   CreateLocalStockItemInput,
+  CreateStockCategoryInput,
+  DeleteCatalogGroupInput,
+  DeleteStockCategoryInput,
+  DeleteStockItemInput,
   ExportBatchInput,
   MaterialOutInput,
   OpeningQuantityInput,
   RenameStockItemInput,
   ReviewDecisionInput,
   SaveBoxInput,
-  SetCatalogClassificationInput,
+  SetCatalogVisibilityInput,
   SetCatalogStatusInput,
   StoresBackupInfo,
   StoresBackupResult,
@@ -47,7 +52,7 @@ import type {
   VendorReceiptInput,
 } from "./types";
 
-const SCHEMA_VERSION = 10;
+const SCHEMA_VERSION = 11;
 const LEGACY_SUPPLIER_NAME = "Opening Legacy Stock";
 const LEGACY_SUPPLIER_GUID = "LOCAL:LEGACY_OPENING";
 
@@ -719,6 +724,33 @@ export class StoresDatabase {
         this.db.prepare("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)").run(10, nowIso());
       }, "adding primary and secondary Tally group hierarchy");
     }
+
+    if (current < 11) {
+      this.transaction(() => {
+        this.db.exec(`
+          ALTER TABLE tally_stock_groups
+            ADD COLUMN source TEXT NOT NULL DEFAULT 'TALLY'
+            CHECK (source IN ('TALLY','LOCAL'));
+          ALTER TABLE tally_stock_items
+            ADD COLUMN category_name TEXT NOT NULL DEFAULT '';
+          ALTER TABLE tally_stock_items
+            ADD COLUMN base_units TEXT NOT NULL DEFAULT 'Nos';
+          CREATE TABLE tally_stock_categories (
+            name TEXT PRIMARY KEY COLLATE NOCASE,
+            parent_name TEXT NOT NULL DEFAULT '',
+            tally_guid TEXT NOT NULL DEFAULT '',
+            alter_id TEXT NOT NULL DEFAULT '',
+            source TEXT NOT NULL DEFAULT 'TALLY'
+              CHECK (source IN ('TALLY','LOCAL')),
+            active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0,1)),
+            synced_at TEXT NOT NULL
+          ) STRICT;
+          CREATE INDEX idx_tally_stock_categories_parent
+            ON tally_stock_categories(parent_name COLLATE NOCASE, active, name COLLATE NOCASE);
+        `);
+        this.db.prepare("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)").run(11, nowIso());
+      }, "adding local-first Stock Group, Stock Category, and Stock Item masters");
+    }
   }
 
   transaction<T>(work: () => T, operation = "updating inventory"): T {
@@ -771,15 +803,25 @@ export class StoresDatabase {
 
   getDataMode(): StoresDataMode {
     const configured = this.getSetting<StoresDataMode>("data_mode");
-    if (configured === "demo" || configured === "tally" || configured === "empty") {
+    if (configured === "demo" || configured === "local" || configured === "tally" || configured === "empty") {
       return configured;
     }
-    const count = Number((this.db.prepare("SELECT COUNT(*) AS count FROM tally_stock_items WHERE active = 1").get() as Row).count);
-    return count > 0 ? "tally" : "empty";
+    const row = this.db.prepare(`
+      SELECT COUNT(*) AS count,
+        SUM(CASE WHEN source = 'TALLY' THEN 1 ELSE 0 END) AS tally_count
+      FROM tally_stock_items WHERE active = 1
+    `).get() as Row;
+    return Number(row.count) === 0 ? "empty" : Number(row.tally_count) > 0 ? "tally" : "local";
   }
 
   setDataMode(mode: StoresDataMode): void {
     this.setSetting("data_mode", mode);
+  }
+
+  rememberTallyCompany(snapshot: Pick<TallyStoresSnapshot, "company" | "companyGuid" | "syncedAt">): void {
+    this.setSetting("tally_company_guid", snapshot.companyGuid);
+    this.setSetting("tally_company_name", snapshot.company);
+    this.setSetting("last_tally_sync_at", snapshot.syncedAt);
   }
 
   resetDemoDataForTallySync(): StoresBackupResult | null {
@@ -827,6 +869,9 @@ export class StoresDatabase {
         DELETE FROM bom_components;
         DELETE FROM suppliers;
         DELETE FROM tally_stock_items;
+        DELETE FROM tally_stock_categories;
+        DELETE FROM tally_stock_groups;
+        DELETE FROM catalog_group_settings;
         DELETE FROM sync_history;
         DELETE FROM settings
         WHERE key NOT IN ('backup_folder', 'export_folder', 'material_out_xml_configured', 'application_database_host_id');
@@ -1016,26 +1061,28 @@ export class StoresDatabase {
       // identity later without changing any foreign-key relationships.
       this.db.prepare(`
         UPDATE tally_stock_items SET
-          tally_guid = ?, name = ?, parent_name = ?, has_bom = ?,
+          tally_guid = ?, name = ?, parent_name = ?, category_name = ?, has_bom = ?,
           tally_closing_quantity = ?, active = 1, source = 'TALLY',
           local_name_override = NULL, synced_at = ?
         WHERE id = ?
-      `).run(guid, item.name, item.parent, item.hasBom ? 1 : 0, closingQuantity, syncedAt, localByName.id);
+      `).run(guid, item.name, item.parent, item.category, item.hasBom ? 1 : 0, closingQuantity, syncedAt, localByName.id);
       return Number(localByName.id);
     }
     this.db.prepare(`
       INSERT INTO tally_stock_items(
-        tally_guid, name, parent_name, has_bom, tally_closing_quantity, active, synced_at, source
-      ) VALUES (?, ?, ?, ?, ?, 1, ?, 'TALLY')
+        tally_guid, name, parent_name, category_name, has_bom,
+        tally_closing_quantity, active, synced_at, source
+      ) VALUES (?, ?, ?, ?, ?, ?, 1, ?, 'TALLY')
       ON CONFLICT(tally_guid) DO UPDATE SET
         name = excluded.name,
         parent_name = excluded.parent_name,
+        category_name = excluded.category_name,
         has_bom = excluded.has_bom,
         tally_closing_quantity = excluded.tally_closing_quantity,
         active = 1,
         source = 'TALLY',
         synced_at = excluded.synced_at
-    `).run(guid, item.name, item.parent, item.hasBom ? 1 : 0, closingQuantity, syncedAt);
+    `).run(guid, item.name, item.parent, item.category, item.hasBom ? 1 : 0, closingQuantity, syncedAt);
     this.db.prepare(`
       UPDATE tally_stock_items
       SET local_name_override = NULL
@@ -1050,22 +1097,207 @@ export class StoresDatabase {
     const name = text(input.name);
     if (!name) throw new Error("Local Stock Item name is required.");
     const parentName = text(input.parentName) || "Local Components";
+    const categoryName = text(input.categoryName);
+    const baseUnits = text(input.baseUnits) || "Nos";
     return this.transaction(() => {
+      const parent = this.db.prepare(`
+        SELECT name FROM tally_stock_groups WHERE name = ? COLLATE NOCASE AND active = 1
+      `).get(parentName) as Row | undefined;
+      if (!parent) this.createCatalogGroup({ name: parentName });
+      if (categoryName) {
+        const category = this.db.prepare(`
+          SELECT name FROM tally_stock_categories WHERE name = ? COLLATE NOCASE AND active = 1
+        `).get(categoryName) as Row | undefined;
+        if (!category) throw new Error("Choose an existing Stock Category.");
+      }
       const existing = this.db.prepare(`
-        SELECT tally_guid FROM tally_stock_items WHERE name = ? COLLATE NOCASE
+        SELECT tally_guid, source FROM tally_stock_items WHERE name = ? COLLATE NOCASE
       `).get(name) as Row | undefined;
       if (!existing) {
         this.db.prepare(`
           INSERT INTO tally_stock_items(
             tally_guid, name, parent_name, has_bom, tally_closing_quantity,
-            active, synced_at, source
-          ) VALUES (?, ?, ?, 0, 0, 1, ?, 'LOCAL')
-        `).run(`LOCAL:${randomUUID()}`, name, parentName, nowIso());
+            active, synced_at, source, category_name, base_units
+          ) VALUES (?, ?, ?, 0, 0, 1, ?, 'LOCAL', ?, ?)
+        `).run(`LOCAL:${randomUUID()}`, name, parentName, nowIso(), categoryName, baseUnits);
       } else {
-        this.db.prepare("UPDATE tally_stock_items SET active = 1 WHERE tally_guid = ?").run(existing.tally_guid);
+        if (text(existing.source) !== "LOCAL") {
+          throw new Error("A Tally-synchronized Stock Item already uses that name.");
+        }
+        this.db.prepare(`
+          UPDATE tally_stock_items
+          SET active = 1, parent_name = ?, category_name = ?, base_units = ?
+          WHERE tally_guid = ?
+        `).run(parentName, categoryName, baseUnits, existing.tally_guid);
       }
+      if (this.getDataMode() === "empty") this.setDataMode("local");
       return this.getState().stockItems.find((item) => item.name.toLocaleLowerCase() === name.toLocaleLowerCase())!;
     }, "creating a local Stores Catalog item");
+  }
+
+  createCatalogGroup(input: CreateCatalogGroupInput): void {
+    const name = text(input.name);
+    const parentName = text(input.parentName) || "Primary";
+    if (!name) throw new Error("Stock Group name is required.");
+    if (name.toLocaleLowerCase() === "primary") throw new Error("Primary is reserved by Tally.");
+    if (name.toLocaleLowerCase() === parentName.toLocaleLowerCase()) {
+      throw new Error("A Stock Group cannot be its own parent.");
+    }
+    if (parentName.toLocaleLowerCase() !== "primary") {
+      const parent = this.db.prepare(`
+        SELECT name FROM tally_stock_groups WHERE name = ? COLLATE NOCASE AND active = 1
+      `).get(parentName) as Row | undefined;
+      if (!parent) throw new Error("Choose an existing parent Stock Group.");
+    }
+    const existing = this.db.prepare(`
+      SELECT source FROM tally_stock_groups WHERE name = ? COLLATE NOCASE
+    `).get(name) as Row | undefined;
+    if (existing && text(existing.source) !== "LOCAL") {
+      throw new Error("That Stock Group already comes from Tally and cannot be redefined locally.");
+    }
+    let ancestor = parentName;
+    const visited = new Set<string>();
+    while (ancestor && ancestor.toLocaleLowerCase() !== "primary") {
+      const key = ancestor.toLocaleLowerCase();
+      if (key === name.toLocaleLowerCase()) {
+        throw new Error("This parent would create a circular Stock Group hierarchy.");
+      }
+      if (visited.has(key)) throw new Error("The existing Stock Group hierarchy contains a cycle.");
+      visited.add(key);
+      const row = this.db.prepare(`
+        SELECT parent_name FROM tally_stock_groups WHERE name = ? COLLATE NOCASE
+      `).get(ancestor) as Row | undefined;
+      ancestor = text(row?.parent_name);
+    }
+    this.db.prepare(`
+      INSERT INTO tally_stock_groups(name, parent_name, active, synced_at, source)
+      VALUES (?, ?, 1, ?, 'LOCAL')
+      ON CONFLICT(name) DO UPDATE SET
+        parent_name = excluded.parent_name,
+        active = 1,
+        synced_at = excluded.synced_at
+    `).run(name, parentName, nowIso());
+    if (this.getDataMode() === "empty") this.setDataMode("local");
+  }
+
+  deleteCatalogGroup(input: DeleteCatalogGroupInput): void {
+    const name = text(input.name);
+    const group = this.db.prepare(`
+      SELECT name, source FROM tally_stock_groups WHERE name = ? COLLATE NOCASE AND active = 1
+    `).get(name) as Row | undefined;
+    if (!group) throw new Error("The selected Stock Group is no longer available.");
+    if (text(group.source) !== "LOCAL") {
+      throw new Error("A Tally-synchronized Stock Group cannot be deleted locally. Remove it in Tally or stop using it.");
+    }
+    const child = this.db.prepare(`
+      SELECT name FROM tally_stock_groups WHERE parent_name = ? COLLATE NOCASE AND active = 1 LIMIT 1
+    `).get(name) as Row | undefined;
+    if (child) throw new Error(`Move or delete child Stock Group ${text(child.name)} first.`);
+    const item = this.db.prepare(`
+      SELECT name FROM tally_stock_items WHERE parent_name = ? COLLATE NOCASE AND active = 1 LIMIT 1
+    `).get(name) as Row | undefined;
+    if (item) throw new Error(`Move or delete Stock Item ${text(item.name)} first.`);
+    this.db.prepare("DELETE FROM catalog_group_settings WHERE group_name = ? COLLATE NOCASE").run(name);
+    this.db.prepare("DELETE FROM tally_stock_groups WHERE name = ? COLLATE NOCASE").run(name);
+  }
+
+  createStockCategory(input: CreateStockCategoryInput): void {
+    const name = text(input.name);
+    const parentName = text(input.parentName) || "Primary";
+    if (!name) throw new Error("Stock Category name is required.");
+    if (name.toLocaleLowerCase() === "primary") throw new Error("Primary is reserved by Tally.");
+    if (name.toLocaleLowerCase() === parentName.toLocaleLowerCase()) {
+      throw new Error("A Stock Category cannot be its own parent.");
+    }
+    if (parentName.toLocaleLowerCase() !== "primary") {
+      const parent = this.db.prepare(`
+        SELECT name FROM tally_stock_categories WHERE name = ? COLLATE NOCASE AND active = 1
+      `).get(parentName) as Row | undefined;
+      if (!parent) throw new Error("Choose an existing parent Stock Category.");
+    }
+    const existing = this.db.prepare(`
+      SELECT source FROM tally_stock_categories WHERE name = ? COLLATE NOCASE
+    `).get(name) as Row | undefined;
+    if (existing && text(existing.source) !== "LOCAL") {
+      throw new Error("That Stock Category already comes from Tally and cannot be redefined locally.");
+    }
+    let ancestor = parentName;
+    const visited = new Set<string>();
+    while (ancestor && ancestor.toLocaleLowerCase() !== "primary") {
+      const key = ancestor.toLocaleLowerCase();
+      if (key === name.toLocaleLowerCase()) {
+        throw new Error("This parent would create a circular Stock Category hierarchy.");
+      }
+      if (visited.has(key)) throw new Error("The existing Stock Category hierarchy contains a cycle.");
+      visited.add(key);
+      const row = this.db.prepare(`
+        SELECT parent_name FROM tally_stock_categories WHERE name = ? COLLATE NOCASE
+      `).get(ancestor) as Row | undefined;
+      ancestor = text(row?.parent_name);
+    }
+    this.db.prepare(`
+      INSERT INTO tally_stock_categories(name, parent_name, active, synced_at, source)
+      VALUES (?, ?, 1, ?, 'LOCAL')
+      ON CONFLICT(name) DO UPDATE SET
+        parent_name = excluded.parent_name,
+        active = 1,
+        synced_at = excluded.synced_at
+    `).run(name, parentName, nowIso());
+    if (this.getDataMode() === "empty") this.setDataMode("local");
+  }
+
+  deleteStockCategory(input: DeleteStockCategoryInput): void {
+    const name = text(input.name);
+    const category = this.db.prepare(`
+      SELECT name, source FROM tally_stock_categories WHERE name = ? COLLATE NOCASE AND active = 1
+    `).get(name) as Row | undefined;
+    if (!category) throw new Error("The selected Stock Category is no longer available.");
+    if (text(category.source) !== "LOCAL") {
+      throw new Error("A Tally-synchronized Stock Category cannot be deleted locally. Remove it in Tally or stop using it.");
+    }
+    const child = this.db.prepare(`
+      SELECT name FROM tally_stock_categories WHERE parent_name = ? COLLATE NOCASE AND active = 1 LIMIT 1
+    `).get(name) as Row | undefined;
+    if (child) throw new Error(`Move or delete child Stock Category ${text(child.name)} first.`);
+    const item = this.db.prepare(`
+      SELECT name FROM tally_stock_items WHERE category_name = ? COLLATE NOCASE AND active = 1 LIMIT 1
+    `).get(name) as Row | undefined;
+    if (item) throw new Error(`Move or delete Stock Item ${text(item.name)} first.`);
+    this.db.prepare("DELETE FROM tally_stock_categories WHERE name = ? COLLATE NOCASE").run(name);
+  }
+
+  deleteStockItem(input: DeleteStockItemInput): void {
+    const guid = text(input.tallyItemGuid);
+    const item = this.db.prepare(`
+      SELECT id, name, source FROM tally_stock_items WHERE tally_guid = ? AND active = 1
+    `).get(guid) as Row | undefined;
+    if (!item) throw new Error("The selected Stock Item is no longer available.");
+    if (text(item.source) !== "LOCAL") {
+      throw new Error("A Tally-synchronized Stock Item cannot be deleted locally. Mark it obsolete instead.");
+    }
+    const tables = this.db.prepare(`
+      SELECT name FROM sqlite_master
+      WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+    `).all() as Row[];
+    let referenceCount = 0;
+    for (const table of tables) {
+      const tableName = text(table.name);
+      const safeTable = tableName.replaceAll('"', '""');
+      const foreignKeys = this.db.prepare(`PRAGMA foreign_key_list("${safeTable}")`).all() as Row[];
+      for (const foreignKey of foreignKeys) {
+        if (text(foreignKey.table) !== "tally_stock_items") continue;
+        const columnName = text(foreignKey.from);
+        const safeColumn = columnName.replaceAll('"', '""');
+        const row = this.db.prepare(`
+          SELECT COUNT(*) AS count FROM "${safeTable}" WHERE "${safeColumn}" = ?
+        `).get(item.id) as Row;
+        referenceCount += Number(row.count);
+      }
+    }
+    if (referenceCount > 0) {
+      throw new Error(`${text(item.name)} is already referenced by inventory or planning records and cannot be deleted. Mark it obsolete instead.`);
+    }
+    this.db.prepare("DELETE FROM tally_stock_items WHERE id = ?").run(item.id);
   }
 
   setCatalogStatus(input: SetCatalogStatusInput): void {
@@ -1127,32 +1359,21 @@ export class StoresDatabase {
     }, "updating the local Stock Item catalog");
   }
 
-  setCatalogClassification(input: SetCatalogClassificationInput): void {
-    const role = text(input.role);
-    if (!["FINISHED_PRODUCT", "COMPONENT", "ACCESSORY", "PACKAGING", "OTHER"].includes(role)) {
-      throw new Error("Choose a valid catalog role.");
-    }
-    if (input.scope === "GROUP") {
-      const groupName = text(input.groupName);
-      if (!groupName) throw new Error("Choose a Tally group to classify.");
-      this.db.prepare(`
-        INSERT INTO catalog_group_settings(group_name, catalog_role, ignored, updated_at)
-        VALUES (?, ?, ?, ?)
-        ON CONFLICT(group_name) DO UPDATE SET
-          catalog_role = excluded.catalog_role,
-          ignored = excluded.ignored,
-          updated_at = excluded.updated_at
-      `).run(groupName, role, input.ignored ? 1 : 0, nowIso());
-      return;
-    }
-    const tallyItemGuid = text(input.tallyItemGuid);
-    if (!tallyItemGuid) throw new Error("Choose a Stock Item to classify.");
-    const result = this.db.prepare(`
-      UPDATE tally_stock_items
-      SET catalog_role_override = ?, catalog_ignored = ?, catalog_updated_at = ?
-      WHERE tally_guid = ?
-    `).run(role, input.ignored ? 1 : 0, nowIso(), tallyItemGuid);
-    if (Number(result.changes) === 0) throw new Error("The selected Stock Item is no longer available.");
+  setCatalogVisibility(input: SetCatalogVisibilityInput): void {
+    const groupName = text(input.groupName);
+    if (!groupName) throw new Error("Choose a Stock Group.");
+    const group = this.db.prepare(`
+      SELECT name FROM tally_stock_groups WHERE name = ? COLLATE NOCASE AND active = 1
+    `).get(groupName) as Row | undefined;
+    if (!group) throw new Error("The selected Stock Group is no longer available.");
+    this.db.prepare(`
+      INSERT INTO catalog_group_settings(group_name, catalog_role, ignored, updated_at)
+      VALUES (?, 'OTHER', ?, ?)
+      ON CONFLICT(group_name) DO UPDATE SET
+        catalog_role = 'OTHER',
+        ignored = excluded.ignored,
+        updated_at = excluded.updated_at
+    `).run(groupName, input.ignored ? 1 : 0, nowIso());
   }
 
   renameStockItem(input: RenameStockItemInput): void {
@@ -1224,18 +1445,35 @@ export class StoresDatabase {
       const historyId = Number(historyInsert.lastInsertRowid);
 
       this.db.exec("UPDATE tally_stock_items SET active = 0 WHERE source = 'TALLY'");
-      this.db.exec("UPDATE tally_stock_groups SET active = 0");
+      this.db.exec("UPDATE tally_stock_groups SET active = 0 WHERE source = 'TALLY'");
       for (const group of snapshot.stockGroups) {
         this.db.prepare(`
-          INSERT INTO tally_stock_groups(name, parent_name, tally_guid, alter_id, active, synced_at)
-          VALUES (?, ?, ?, ?, 1, ?)
+          INSERT INTO tally_stock_groups(
+            name, parent_name, tally_guid, alter_id, active, synced_at, source
+          ) VALUES (?, ?, ?, ?, 1, ?, 'TALLY')
           ON CONFLICT(name) DO UPDATE SET
             parent_name = excluded.parent_name,
             tally_guid = excluded.tally_guid,
             alter_id = excluded.alter_id,
             active = 1,
+            source = 'TALLY',
             synced_at = excluded.synced_at
         `).run(group.name, group.parent, group.guid, group.alterId, snapshot.syncedAt);
+      }
+      this.db.exec("UPDATE tally_stock_categories SET active = 0 WHERE source = 'TALLY'");
+      for (const category of snapshot.stockCategories) {
+        this.db.prepare(`
+          INSERT INTO tally_stock_categories(
+            name, parent_name, tally_guid, alter_id, active, synced_at, source
+          ) VALUES (?, ?, ?, ?, 1, ?, 'TALLY')
+          ON CONFLICT(name) DO UPDATE SET
+            parent_name = excluded.parent_name,
+            tally_guid = excluded.tally_guid,
+            alter_id = excluded.alter_id,
+            active = 1,
+            source = 'TALLY',
+            synced_at = excluded.synced_at
+        `).run(category.name, category.parent, category.guid, category.alterId, snapshot.syncedAt);
       }
       const itemIdByGuid = new Map<string, number>();
       const itemIdByName = new Map<string, number>();
@@ -1919,8 +2157,8 @@ export class StoresDatabase {
     const inserted = this.db.prepare(`
       INSERT INTO tally_stock_items(
         tally_guid, name, parent_name, has_bom, tally_closing_quantity,
-        active, synced_at, source, catalog_role_override, catalog_ignored
-      ) VALUES (?, ?, 'System destinations', 0, 0, 1, ?, 'LOCAL', 'OTHER', 1)
+        active, synced_at, source, catalog_ignored
+      ) VALUES (?, ?, 'System destinations', 0, 0, 1, ?, 'LOCAL', 1)
     `).run(guid, label, nowIso());
     return { id: Number(inserted.lastInsertRowid), tallyGuid: guid };
   }
@@ -2439,34 +2677,45 @@ export class StoresDatabase {
 
   getState(): StoresState {
     const groupRows = this.db.prepare(`
-      SELECT name, parent_name FROM tally_stock_groups WHERE active = 1 ORDER BY name COLLATE NOCASE
+      SELECT name, parent_name, source
+      FROM tally_stock_groups WHERE active = 1 ORDER BY name COLLATE NOCASE
     `).all() as Row[];
     const groupParents = new Map(groupRows.map((row) => [text(row.name).toLocaleLowerCase(), {
       name: text(row.name),
       parentName: text(row.parent_name),
+      source: text(row.source) === "LOCAL" ? "LOCAL" as const : "TALLY" as const,
     }]));
     const groupSettings = new Map((this.db.prepare(`
-      SELECT group_name, catalog_role, ignored FROM catalog_group_settings
+      SELECT group_name, ignored FROM catalog_group_settings
     `).all() as Row[]).map((row) => [text(row.group_name).toLocaleLowerCase(), {
-      role: text(row.catalog_role) as StoresStockItem["catalogRole"],
       ignored: Number(row.ignored) === 1,
     }]));
-    const splitGroup = (directName: string) => {
+    const masterPath = (
+      directName: string,
+      parents: Map<string, { name: string; parentName: string }>,
+    ): string[] => {
       const direct = text(directName);
-      if (!direct) return { primaryGroupName: "", secondaryGroupName: "" };
+      if (!direct) return [];
+      const result: string[] = [];
       let current = direct;
       const visited = new Set<string>();
       for (;;) {
         const key = current.toLocaleLowerCase();
         if (visited.has(key)) break;
         visited.add(key);
-        const parent = groupParents.get(key)?.parentName ?? "";
+        result.unshift(parents.get(key)?.name ?? current);
+        const parent = parents.get(key)?.parentName ?? "";
         if (!parent || parent.toLocaleLowerCase() === "primary") break;
         current = parent;
       }
+      return result;
+    };
+    const splitGroup = (directName: string) => {
+      const path = masterPath(directName, groupParents);
       return {
-        primaryGroupName: current,
-        secondaryGroupName: current.toLocaleLowerCase() === direct.toLocaleLowerCase() ? "" : direct,
+        path,
+        primaryGroupName: path[0] ?? "",
+        secondaryGroupName: path[1] ?? "",
       };
     };
     const stockRows = this.db.prepare(`
@@ -2485,20 +2734,33 @@ export class StoresDatabase {
         OR EXISTS (SELECT 1 FROM ops_lot_balances balance JOIN ops_lots lot ON lot.id = balance.lot_id WHERE lot.stock_item_id = tsi.id AND balance.quantity > 0)
       ORDER BY COALESCE(NULLIF(tsi.local_name_override, ''), tsi.name)
     `).all() as Row[];
+    const planningTablesAvailable = Number((this.db.prepare(`
+      SELECT COUNT(*) AS count FROM sqlite_master
+      WHERE type = 'table' AND name IN ('planning_bom_versions', 'planning_product_orders')
+    `).get() as Row).count) === 2;
+    const productItemIds = new Set<number>(planningTablesAvailable
+      ? (this.db.prepare(`
+          SELECT product_item_id AS id FROM planning_bom_versions
+          UNION
+          SELECT product_item_id AS id FROM planning_product_orders
+        `).all() as Row[]).map((row) => Number(row.id))
+      : []);
     const stockItems: StoresStockItem[] = stockRows.map((row) => {
       const groups = splitGroup(text(row.parent_name));
-      const primarySettings = groupSettings.get(groups.primaryGroupName.toLocaleLowerCase());
-      const secondarySettings = groups.secondaryGroupName
-        ? groupSettings.get(groups.secondaryGroupName.toLocaleLowerCase())
-        : undefined;
+      const pathSettings = groups.path
+        .map((name) => groupSettings.get(name.toLocaleLowerCase()))
+        .filter((value) => value !== undefined);
       const itemIgnored = Number(row.catalog_ignored) === 1;
-      const groupIgnored = Boolean(primarySettings?.ignored || secondarySettings?.ignored);
+      const groupIgnored = pathSettings.some((settings) => settings?.ignored);
       return {
       id: Number(row.id),
       tallyGuid: text(row.tally_guid),
       tallyName: text(row.name),
       name: text(row.local_name_override) || text(row.name),
       parentName: text(row.parent_name),
+      groupPath: groups.path,
+      categoryName: text(row.category_name),
+      baseUnits: text(row.base_units) || "Nos",
       primaryGroupName: groups.primaryGroupName,
       secondaryGroupName: groups.secondaryGroupName,
       hasBom: Number(row.has_bom) === 1,
@@ -2514,8 +2776,7 @@ export class StoresDatabase {
       catalogStatus: ["DUPLICATE", "OBSOLETE"].includes(text(row.catalog_status))
         ? text(row.catalog_status) as StoresStockItem["catalogStatus"]
         : "ACTIVE",
-      catalogRole: (text(row.catalog_role_override) || secondarySettings?.role || primarySettings?.role || "OTHER") as StoresStockItem["catalogRole"],
-      itemRoleOverride: row.catalog_role_override == null ? null : text(row.catalog_role_override) as StoresStockItem["itemRoleOverride"],
+      isProduct: Number(row.has_bom) === 1 || productItemIds.has(Number(row.id)),
       itemIgnored,
       groupIgnored,
       ignored: itemIgnored || groupIgnored,
@@ -2532,22 +2793,44 @@ export class StoresDatabase {
     }
     const catalogGroups = [...knownGroupNames].map((name) => {
       const split = splitGroup(name);
-      const type = split.secondaryGroupName ? "SECONDARY" as const : "PRIMARY" as const;
       const settings = groupSettings.get(name.toLocaleLowerCase());
-      const primarySettings = type === "SECONDARY"
-        ? groupSettings.get(split.primaryGroupName.toLocaleLowerCase())
-        : undefined;
       return {
         name,
+        parentName: groupParents.get(name.toLocaleLowerCase())?.parentName ?? "",
         primaryName: split.primaryGroupName || name,
-        type,
-        role: settings?.role ?? primarySettings?.role ?? "OTHER",
-        ignored: Boolean(settings?.ignored || primarySettings?.ignored),
-        itemCount: stockItems.filter((item) => type === "PRIMARY"
-          ? item.primaryGroupName.toLocaleLowerCase() === name.toLocaleLowerCase()
-          : item.secondaryGroupName.toLocaleLowerCase() === name.toLocaleLowerCase()).length,
+        type: split.path.length <= 1 ? "PRIMARY" as const : "SECONDARY" as const,
+        level: Math.max(1, split.path.length),
+        path: split.path,
+        source: groupParents.get(name.toLocaleLowerCase())?.source ?? "TALLY",
+        ignored: Boolean(settings?.ignored || split.path.some((part) => groupSettings.get(part.toLocaleLowerCase())?.ignored)),
+        itemCount: stockItems.filter((item) =>
+          item.groupPath.some((part) => part.toLocaleLowerCase() === name.toLocaleLowerCase())
+        ).length,
       };
-    }).sort((left, right) => left.primaryName.localeCompare(right.primaryName) || left.type.localeCompare(right.type) || left.name.localeCompare(right.name));
+    }).sort((left, right) => left.path.join("\u0000").localeCompare(right.path.join("\u0000")));
+
+    const categoryRows = this.db.prepare(`
+      SELECT name, parent_name, source
+      FROM tally_stock_categories WHERE active = 1 ORDER BY name COLLATE NOCASE
+    `).all() as Row[];
+    const categoryParents = new Map(categoryRows.map((row) => [text(row.name).toLocaleLowerCase(), {
+      name: text(row.name),
+      parentName: text(row.parent_name),
+    }]));
+    const stockCategories = categoryRows.map((row) => {
+      const name = text(row.name);
+      const categoryPath = masterPath(name, categoryParents);
+      return {
+        name,
+        parentName: text(row.parent_name),
+        level: Math.max(1, categoryPath.length),
+        path: categoryPath,
+        source: text(row.source) === "LOCAL" ? "LOCAL" as const : "TALLY" as const,
+        itemCount: stockItems.filter((item) =>
+          item.categoryName.toLocaleLowerCase() === name.toLocaleLowerCase()
+        ).length,
+      };
+    }).sort((left, right) => left.path.join("\u0000").localeCompare(right.path.join("\u0000")));
 
     const purchaseOrders: StoresPurchaseOrder[] = (this.db.prepare(`
       SELECT po.*, supplier.name AS supplier_name FROM purchase_orders po
@@ -2712,6 +2995,7 @@ export class StoresDatabase {
       reviewEntries,
       openingQuantityAdjustments,
       catalogGroups,
+      stockCategories,
       exportSchemaVersion: "1.0",
       materialOutXmlConfigured: this.getSetting<boolean>("material_out_xml_configured") === true,
     };

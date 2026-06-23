@@ -47,7 +47,6 @@ export interface RestockPolicy {
   secondaryGroupName: string;
   catalogSource: "TALLY" | "LOCAL";
   catalogStatus: "ACTIVE" | "OBSOLETE";
-  catalogRole: import("../stores/types").CatalogRole;
   planningMethod: PlanningMethod;
   reorderPoint: number;
   targetStock: number;

@@ -96,6 +96,16 @@ Use Edit an Existing Box to load or delete an existing record. Add generated lab
 
 Tally is read for catalog, purchase, receipt, supplier, and BOM data. Generated files are reviewed before import into Tally.
 
+## Scanner security
+
+Phone scanners must be paired from **Settings → Phone connection**. Each pairing QR is single-use, expires after 10 minutes, and creates a separate audit identity for that handset. Administrators can revoke a lost or replaced scanner from the same screen.
+
+The Production server still listens on the selected company LAN so paired phones and LAN clients can reach it. Browser origins are restricted, scanner mutation requests are rate-limited, and the old unauthenticated workbook transaction routes are disabled in the desktop application.
+
+## Credential recovery email
+
+Credential recovery sends a six-digit code from `gtrswnt@gmail.com`. On the Production computer, set `INVENTORY_GMAIL_APP_PASSWORD` to a Gmail app password for that account before starting Inventory Scanner. Do not use or store the normal Gmail password.
+
 Review pending Material In/Out and manual Accounts items before generating an export batch.
 
 ## Settings

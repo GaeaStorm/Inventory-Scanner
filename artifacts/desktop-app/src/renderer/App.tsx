@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
+import QRCode from "qrcode";
 
 import BackupRestorePanel from "./BackupRestorePanel";
 import AdministrationDashboard from "./AdministrationDashboard";
@@ -14,7 +15,6 @@ import TallyTab from "./TallyTab";
 import UserManagementPanel from "./UserManagementPanel";
 import {
   getDashboard,
-  getScannerQrUrl,
   setApiBaseUrl,
 } from "./api";
 import type {
@@ -28,6 +28,7 @@ import type {
   Permission,
   PlanningState,
   StoresState,
+  ScannerDevice,
 } from "./types";
 
 const tabs: Array<{ id: AppTab; label: string; icon: string; permission?: Permission }> = [
@@ -76,6 +77,10 @@ export default function App() {
   const [planning, setPlanning] = useState<PlanningState | null>(null);
   const [operations, setOperations] = useState<OperationsState | null>(null);
   const [selectedScannerUrl, setSelectedScannerUrl] = useState("");
+  const [scannerLabel, setScannerLabel] = useState("Stores phone");
+  const [scannerQrUrl, setScannerQrUrl] = useState("");
+  const [scannerPairingExpiresAt, setScannerPairingExpiresAt] = useState("");
+  const [scannerDevices, setScannerDevices] = useState<ScannerDevice[]>([]);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState("");
@@ -192,10 +197,24 @@ export default function App() {
   const scannerUrls = dashboard?.scannerUrls.length
     ? dashboard.scannerUrls
     : desktopInfo?.scannerUrls ?? [];
-  const scannerQrUrl = useMemo(
-    () => (selectedScannerUrl ? getScannerQrUrl(selectedScannerUrl) : ""),
-    [selectedScannerUrl],
-  );
+  useEffect(() => {
+    if (activeTab !== "settings" || !session?.permissions.includes("SETTINGS_MANAGE")) return;
+    void window.desktop.scanners.list().then(setScannerDevices).catch(() => undefined);
+  }, [activeTab, session]);
+
+  async function createScannerPairing() {
+    if (!selectedScannerUrl) throw new Error("No LAN address is available for scanner pairing.");
+    const pairing = await window.desktop.scanners.createPairing(scannerLabel);
+    const payload = JSON.stringify({
+      type: "inventory-scanner/scanner-pairing",
+      version: 1,
+      url: selectedScannerUrl,
+      pairingToken: pairing.pairingToken,
+      deviceLabel: scannerLabel,
+    });
+    setScannerQrUrl(await QRCode.toDataURL(payload, { width: 760, margin: 2, errorCorrectionLevel: "M" }));
+    setScannerPairingExpiresAt(pairing.expiresAt);
+  }
 
   async function perform(action: () => Promise<void>, success?: string) {
     setBusy(true);
@@ -346,14 +365,24 @@ export default function App() {
                 </div>
               </article>
               <article className="panel">
-                <div className="panel__header"><div><p className="eyebrow">PHONE CONNECTION</p><h2>Connect the Expo scanner</h2></div></div>
+                <div className="panel__header"><div><p className="eyebrow">PHONE CONNECTION</p><h2>Pair a scanner</h2></div></div>
                 <div className="scanner-settings">
-                  <div className="scanner-qr-card">{scannerQrUrl ? <img src={scannerQrUrl} alt="Phone scanner connection QR" /> : <span>No LAN address detected</span>}</div>
-                  {/* <div className="scanner-address-controls">
+                  <div className="scanner-qr-card">{scannerQrUrl ? <img src={scannerQrUrl} alt="One-time phone scanner pairing QR" /> : <span>Create a one-time pairing QR</span>}</div>
+                  <div className="scanner-address-controls">
                     <label>Desktop API address<select value={selectedScannerUrl} onChange={(event) => setSelectedScannerUrl(event.target.value)}>{scannerUrls.map((url) => <option key={url}>{url}</option>)}</select></label>
-                    <button className="button button--secondary" type="button" onClick={() => void navigator.clipboard.writeText(selectedScannerUrl)} disabled={!selectedScannerUrl}>Copy address</button>
-                  </div> */}
+                    <label>Scanner name<input value={scannerLabel} onChange={(event) => setScannerLabel(event.target.value)} placeholder="e.g. Stores phone 1" /></label>
+                    <button className="button button--secondary" type="button" onClick={() => void perform(createScannerPairing)} disabled={!selectedScannerUrl || !scannerLabel.trim()}>Create pairing QR</button>
+                  </div>
                 </div>
+                <p className="table-footnote">{scannerPairingExpiresAt ? `This one-time QR expires ${formatDate(scannerPairingExpiresAt)}.` : "Each QR can pair one scanner and expires after 10 minutes. A paired scanner receives its own revocable audit identity."}</p>
+                <div className="table-scroll"><table><thead><tr><th>Scanner</th><th>Last seen</th><th>Status</th><th /></tr></thead><tbody>
+                  {scannerDevices.map((device) => <tr key={device.id}><td>{device.label}</td><td>{formatDate(device.lastSeenAt)}</td><td>{device.revokedAt ? "Revoked" : "Active"}</td><td>{!device.revokedAt && <button className="button button--ghost button--small" type="button" onClick={() => void perform(async () => {
+                    await window.desktop.scanners.revoke(device.id);
+                    setScannerDevices(await window.desktop.scanners.list());
+                  }, `${device.label} revoked.`)}>Revoke</button>}</td></tr>)}
+                  {scannerDevices.length === 0 && <tr><td colSpan={4} className="empty-table">No paired scanners yet.</td></tr>}
+                </tbody></table></div>
+                <div className="read-only-note"><strong>LAN boundary:</strong> the API listens on the selected company LAN, but scanner inventory routes require a paired device token. Browser origins are restricted; native paired scanners do not send browser-origin headers.</div>
               </article>
               <article className="panel settings-database-card">
                 <div className="panel__header"><div><p className="eyebrow">SQLITE</p><h2>Operational database</h2></div><span className="health-badge">{stores.database.integrity.toUpperCase()}</span></div>

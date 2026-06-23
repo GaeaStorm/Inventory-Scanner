@@ -13,7 +13,7 @@ export function createStoresRouter(service: StoresService, operations: Operation
   const router = Router();
   const actor = (request: Request, permission?: Parameters<OperationsService["requireActor"]>[1]) =>
     operations.requireActor(tokenFrom(request), permission);
-  const phoneActor = () => operations.sharedPhoneActor();
+  const phoneActor = (request: Request) => operations.scannerActor(request.header("x-scanner-token") ?? "");
 
   router.get("/state", (request, response) => {
     actor(request, "INVENTORY_VIEW");
@@ -23,13 +23,28 @@ export function createStoresRouter(service: StoresService, operations: Operation
   router.post("/catalog/local-items", (request, response) => {
     response.status(201).json(service.createLocalStockItem(request.body, actor(request, "CATALOG_MANAGE")));
   });
+  router.delete("/catalog/local-items/:tallyItemGuid", (request, response) => {
+    response.json(service.deleteStockItem({ tallyItemGuid: request.params.tallyItemGuid }, actor(request, "CATALOG_MANAGE")));
+  });
+  router.post("/catalog/groups", (request, response) => {
+    response.status(201).json(service.createCatalogGroup(request.body, actor(request, "CATALOG_MANAGE")));
+  });
+  router.delete("/catalog/groups/:name", (request, response) => {
+    response.json(service.deleteCatalogGroup({ name: request.params.name }, actor(request, "CATALOG_MANAGE")));
+  });
+  router.post("/catalog/categories", (request, response) => {
+    response.status(201).json(service.createStockCategory(request.body, actor(request, "CATALOG_MANAGE")));
+  });
+  router.delete("/catalog/categories/:name", (request, response) => {
+    response.json(service.deleteStockCategory({ name: request.params.name }, actor(request, "CATALOG_MANAGE")));
+  });
   router.post("/catalog/status", (request, response) => response.json(service.setCatalogStatus(request.body, actor(request, "CATALOG_MANAGE"))));
-  router.post("/catalog/classification", (request, response) => response.json(service.setCatalogClassification(request.body, actor(request, "CATALOG_MANAGE"))));
+  router.post("/catalog/visibility", (request, response) => response.json(service.setCatalogVisibility(request.body, actor(request, "CATALOG_MANAGE"))));
   router.post("/catalog/rename", (request, response) => response.json(service.renameStockItem(request.body, actor(request, "CATALOG_MANAGE"))));
-  router.post("/catalog/export-cleanup", (request, response) => response.json(service.exportCatalogCleanup(actor(request, "CATALOG_MANAGE"))));
+  router.post("/catalog/export-cleanup", (request, response) => response.json(service.exportCatalogCleanup(actor(request))));
 
   router.get("/catalog", (request, response) => {
-    phoneActor();
+    phoneActor(request);
     const state = service.getState();
     const selectable = state.stockItems.filter((item) =>
       !item.ignored
@@ -38,8 +53,8 @@ export function createStoresRouter(service: StoresService, operations: Operation
         || item.localAvailableQuantity + item.localPendingInspectionQuantity + item.localFaultyQuantity > 0)
     );
     response.json({
-      stockItems: selectable.filter((item) => item.catalogRole !== "FINISHED_PRODUCT"),
-      destinations: selectable.filter((item) => item.catalogRole === "FINISHED_PRODUCT").sort((left, right) => {
+      stockItems: selectable.filter((item) => !item.isProduct),
+      destinations: selectable.filter((item) => item.isProduct).sort((left, right) => {
         if (left.hasBom !== right.hasBom) return left.hasBom ? -1 : 1;
         return left.name.localeCompare(right.name);
       }),
@@ -48,7 +63,7 @@ export function createStoresRouter(service: StoresService, operations: Operation
   });
 
   router.get("/boxes/:boxId", (request, response) => {
-    phoneActor();
+    phoneActor(request);
     const box = service.getBox(request.params.boxId);
     if (!box) {
       response.status(404).json({ error: "Box not found in the Local Stores Database." });
@@ -65,11 +80,11 @@ export function createStoresRouter(service: StoresService, operations: Operation
   router.post("/vendor-receipts", (request, response) => response.status(201).json(service.vendorReceipt(request.body, actor(request, "RECEIVE_MATERIAL"))));
   router.post("/vendor-receipts/bulk", (request, response) => response.status(201).json(service.bulkVendorReceipt(request.body, actor(request, "RECEIVE_MATERIAL"))));
   router.post("/material-out", (request, response) => response.status(201).json(service.materialOut(request.body, actor(request, "MATERIAL_ISSUE"))));
-  router.post("/offline-batch", (request, response) => response.json(service.processOfflineBatch(request.body, phoneActor())));
+  router.post("/offline-batch", (request, response) => response.json(service.processOfflineBatch(request.body, phoneActor(request))));
   router.post("/opening-quantity", (request, response) => response.json(service.setOpeningQuantity(request.body, actor(request, "STOCK_ADJUST"))));
 
   router.get("/adjustment-context", (request, response) => {
-    phoneActor();
+    phoneActor(request);
     const context = service.adjustmentContext(
       String(request.query.tallyItemGuid ?? ""),
       String(request.query.destinationTallyItemGuid ?? ""),
@@ -96,7 +111,7 @@ export function createStoresRouter(service: StoresService, operations: Operation
       return;
     }
     const message = error instanceof Error ? error.message : String(error);
-    response.status(/sign in|permission/i.test(message) ? 401 : 400).json({ error: message, retryable: false });
+    response.status(/sign in|permission|not paired|revoked/i.test(message) ? 401 : 400).json({ error: message, retryable: false });
   });
 
   return router;

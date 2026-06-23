@@ -52,9 +52,17 @@ async function remoteChannel(channel: string, args: unknown[]) {
   const [first, second] = args;
   switch (channel) {
     case "stores:get-state": return remoteRequest("/api/stores/state");
+    case "scanners:create-pairing": return remoteRequest("/api/scanners/pairing", jsonBody({ label: first }));
+    case "scanners:list": return remoteRequest("/api/scanners");
+    case "scanners:revoke": return remoteRequest(`/api/scanners/${encodeURIComponent(String(first))}`, { method: "DELETE" });
     case "stores:create-local-stock-item": return remoteRequest("/api/stores/catalog/local-items", jsonBody(first));
+    case "stores:delete-local-stock-item": return remoteRequest(`/api/stores/catalog/local-items/${encodeURIComponent(String(first))}`, { method: "DELETE" });
+    case "stores:create-catalog-group": return remoteRequest("/api/stores/catalog/groups", jsonBody(first));
+    case "stores:delete-catalog-group": return remoteRequest(`/api/stores/catalog/groups/${encodeURIComponent(String(first))}`, { method: "DELETE" });
+    case "stores:create-stock-category": return remoteRequest("/api/stores/catalog/categories", jsonBody(first));
+    case "stores:delete-stock-category": return remoteRequest(`/api/stores/catalog/categories/${encodeURIComponent(String(first))}`, { method: "DELETE" });
     case "stores:set-catalog-status": return remoteRequest("/api/stores/catalog/status", jsonBody(first));
-    case "stores:set-catalog-classification": return remoteRequest("/api/stores/catalog/classification", jsonBody(first));
+    case "stores:set-catalog-visibility": return remoteRequest("/api/stores/catalog/visibility", jsonBody(first));
     case "stores:rename-stock-item": return remoteRequest("/api/stores/catalog/rename", jsonBody(first));
     case "stores:export-catalog-cleanup": return remoteRequest("/api/stores/catalog/export-cleanup", jsonBody({}));
     case "stores:save-box": return remoteRequest("/api/stores/boxes", jsonBody(first));
@@ -157,12 +165,17 @@ contextBridge.exposeInMainWorld("desktop", {
         ? remoteRequest("/api/operations/auth/email", jsonBody(input))
         : ipcRenderer.invoke("auth:update-email", sessionToken, input);
     },
-    forgotPassword: async (input: unknown) => {
+    requestRecovery: async (input: unknown) => {
       await ensureDeploymentLoaded();
-      if (remoteServerUrl) {
-        throw new Error("For security, forgotten credentials must be reset on the Production server computer or by an administrator.");
-      }
-      return ipcRenderer.invoke("auth:forgot-password", input);
+      return remoteServerUrl
+        ? remoteRequest("/api/operations/auth/recovery/request", jsonBody(input))
+        : ipcRenderer.invoke("auth:request-recovery", input);
+    },
+    confirmRecovery: async (input: unknown) => {
+      await ensureDeploymentLoaded();
+      return remoteServerUrl
+        ? remoteRequest("/api/operations/auth/recovery/confirm", jsonBody(input))
+        : ipcRenderer.invoke("auth:confirm-recovery", input);
     },
     resume: async (token: string) => {
       await ensureDeploymentLoaded();
@@ -192,8 +205,13 @@ contextBridge.exposeInMainWorld("desktop", {
   stores: {
     getState: () => authenticatedSession("stores:get-state"),
     createLocalStockItem: (input: unknown) => authenticatedSession("stores:create-local-stock-item", input),
+    deleteLocalStockItem: (tallyItemGuid: string) => authenticatedSession("stores:delete-local-stock-item", tallyItemGuid),
+    createCatalogGroup: (input: unknown) => authenticatedSession("stores:create-catalog-group", input),
+    deleteCatalogGroup: (name: string) => authenticatedSession("stores:delete-catalog-group", name),
+    createStockCategory: (input: unknown) => authenticatedSession("stores:create-stock-category", input),
+    deleteStockCategory: (name: string) => authenticatedSession("stores:delete-stock-category", name),
     setCatalogStatus: (input: unknown) => authenticatedSession("stores:set-catalog-status", input),
-    setCatalogClassification: (input: unknown) => authenticatedSession("stores:set-catalog-classification", input),
+    setCatalogVisibility: (input: unknown) => authenticatedSession("stores:set-catalog-visibility", input),
     renameStockItem: (input: unknown) => authenticatedSession("stores:rename-stock-item", input),
     exportCatalogCleanup: () => authenticatedSession("stores:export-catalog-cleanup"),
     saveBox: (input: unknown) => authenticatedSession("stores:save-box", input),
@@ -210,6 +228,11 @@ contextBridge.exposeInMainWorld("desktop", {
     openPath: (targetPath: string) => authenticatedSession("stores:open-path", targetPath),
     listGeneratedFiles: () => authenticatedSession("stores:list-generated-files"),
     downloadGeneratedFile: (sourcePath: string) => authenticatedSession("stores:download-generated-file", sourcePath),
+  },
+  scanners: {
+    createPairing: (label: string) => authenticatedSession("scanners:create-pairing", label),
+    list: () => authenticatedSession("scanners:list"),
+    revoke: (deviceId: string) => authenticatedSession("scanners:revoke", deviceId),
   },
   planning: {
     getState: () => authenticatedSession("planning:get-state"),

@@ -17,6 +17,8 @@ export default function AuthGate({ authState, onAuthenticated }: Props) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [recovering, setRecovering] = useState(false);
+  const [recoveryCodeSent, setRecoveryCodeSent] = useState(false);
+  const [recoveryCode, setRecoveryCode] = useState("");
   const [recoveryCredential, setRecoveryCredential] = useState("");
   const [recoveryType, setRecoveryType] = useState<"PASSWORD" | "PIN">("PASSWORD");
   const [notice, setNotice] = useState("");
@@ -43,15 +45,21 @@ export default function AuthGate({ authState, onAuthenticated }: Props) {
     setError("");
     setNotice("");
     try {
-      await window.desktop.auth.forgotPassword({
-        username,
-        email,
-        credential: recoveryCredential,
-        credentialType: recoveryType,
+      if (!recoveryCodeSent) {
+        await window.desktop.auth.requestRecovery({ username, email });
+        setRecoveryCodeSent(true);
+        setNotice("If the account details match, a six-digit code has been emailed. It expires in 15 minutes.");
+        return;
+      }
+      await window.desktop.auth.confirmRecovery({
+        username, email, code: recoveryCode,
+        credential: recoveryCredential, credentialType: recoveryType,
       });
       setCredential(recoveryCredential);
       setCredentialType(recoveryType);
       setRecoveryCredential("");
+      setRecoveryCode("");
+      setRecoveryCodeSent(false);
       setRecovering(false);
       setNotice("Credential reset. You can sign in with the new credential now.");
     } catch (reason) {
@@ -73,10 +81,11 @@ export default function AuthGate({ authState, onAuthenticated }: Props) {
         {authState.needsBootstrap && <label>Display name<input autoFocus value={displayName} onChange={(event) => setDisplayName(event.target.value)} required /></label>}
         <label>Username<input autoComplete="username" autoFocus={!authState.needsBootstrap} value={username} onChange={(event) => setUsername(event.target.value)} required /></label>
         {(authState.needsBootstrap || recovering) && <label>Recovery email<input type="email" autoComplete="email" value={email} onChange={(event) => setEmail(event.target.value)} required /></label>}
-        {(authState.needsBootstrap || recovering) && <label>Credential type<select value={recovering ? recoveryType : credentialType} onChange={(event) => recovering ? setRecoveryType(event.target.value as "PASSWORD" | "PIN") : setCredentialType(event.target.value as "PASSWORD" | "PIN")}><option value="PASSWORD">Password</option><option value="PIN">PIN</option></select></label>}
-        <label>{(recovering ? recoveryType : credentialType) === "PIN" ? "PIN" : recovering ? "New password" : "Password"}<PasswordInput inputMode={(recovering ? recoveryType : credentialType) === "PIN" ? "numeric" : undefined} autoComplete={authState.needsBootstrap || recovering ? "new-password" : "current-password"} value={recovering ? recoveryCredential : credential} onChange={(event) => recovering ? setRecoveryCredential(event.target.value) : setCredential(event.target.value)} required /></label>
-        <button className="button" disabled={busy} type="submit">{busy ? recovering ? "Resetting…" : "Signing in…" : authState.needsBootstrap ? "Create administrator" : recovering ? "Reset credential" : "Sign in"}</button>
-        {!authState.needsBootstrap && <button className="text-button" type="button" disabled={busy} onClick={() => { setRecovering((value) => !value); setError(""); setNotice(""); }}>{recovering ? "Back to sign in" : "Forgot password?"}</button>}
+        {recovering && recoveryCodeSent && <label>Six-digit email code<input inputMode="numeric" autoComplete="one-time-code" maxLength={6} value={recoveryCode} onChange={(event) => setRecoveryCode(event.target.value.replace(/\D/g, "").slice(0, 6))} required /></label>}
+        {(authState.needsBootstrap || (recovering && recoveryCodeSent)) && <label>Credential type<select value={recovering ? recoveryType : credentialType} onChange={(event) => recovering ? setRecoveryType(event.target.value as "PASSWORD" | "PIN") : setCredentialType(event.target.value as "PASSWORD" | "PIN")}><option value="PASSWORD">Password</option><option value="PIN">PIN</option></select></label>}
+        {(!recovering || recoveryCodeSent) && <label>{(recovering ? recoveryType : credentialType) === "PIN" ? "PIN" : recovering ? "New password" : "Password"}<PasswordInput inputMode={(recovering ? recoveryType : credentialType) === "PIN" ? "numeric" : undefined} autoComplete={authState.needsBootstrap || recovering ? "new-password" : "current-password"} value={recovering ? recoveryCredential : credential} onChange={(event) => recovering ? setRecoveryCredential(event.target.value) : setCredential(event.target.value)} required /></label>}
+        <button className="button" disabled={busy} type="submit">{busy ? recovering ? "Working…" : "Signing in…" : authState.needsBootstrap ? "Create administrator" : recovering ? recoveryCodeSent ? "Reset credential" : "Email recovery code" : "Sign in"}</button>
+        {!authState.needsBootstrap && <button className="text-button" type="button" disabled={busy} onClick={() => { setRecovering((value) => !value); setRecoveryCodeSent(false); setRecoveryCode(""); setError(""); setNotice(""); }}>{recovering ? "Back to sign in" : "Forgot password?"}</button>}
       </form>
     </main>
   );

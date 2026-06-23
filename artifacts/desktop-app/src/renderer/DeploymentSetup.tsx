@@ -124,7 +124,7 @@ export default function DeploymentSetup({ state, onCancel }: Props) {
           {onCancel && <button className="button button--secondary" type="button" disabled={busy} onClick={onCancel}>Cancel</button>}
           <button className="button" type="button" disabled={busy || testing} onClick={() => void save()}>{busy ? "Applying setup…" : "Save setup and restart"}</button>
         </div>
-        <p className="table-footnote">Use a stable computer name or reserved IP. Keep the Production computer awake while the company is using Inventory Scanner.</p>
+        <p className="table-footnote">Use a stable computer name or reserved IP. Keep the Production computer awake while the company is using Inventory Scanner. The server is reachable on the selected company LAN; phone inventory access requires a separately paired and revocable scanner identity.</p>
       </section>
     </main>
   );

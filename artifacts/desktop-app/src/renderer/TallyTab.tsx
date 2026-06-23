@@ -87,8 +87,8 @@ export default function TallyTab({ stores, operations, localFiles = true, onChan
       onChanged(result.state);
       setCompanies(result.snapshot.companies);
       setSettings((current) => ({ ...current, company: result.snapshot.company }));
-      setNotice(result.state.dataMode === "demo"
-        ? "Tally returned no Stock Items. The built-in demo catalog remains active."
+      setNotice(result.snapshot.stockItems.length === 0
+        ? "Tally returned no Stock Items. Your local Stock Groups, Categories, and Items were left unchanged and can be generated for import."
         : `Imported ${result.summary.stockItemsImported} Stock Items, ${result.summary.suppliersImported} suppliers, ${result.summary.openPurchaseOrdersImported} supplier POs, ${result.orderImport.imported} new Production Order line${result.orderImport.imported === 1 ? "" : "s"} from Tally Sales Orders, and ${result.summary.historicalGrnsImported} new historical GRNs. ${result.orderImport.skipped} existing order line${result.orderImport.skipped === 1 ? " was" : "s were"} left unchanged${result.orderImport.unmatched ? `; ${result.orderImport.unmatched} could not be matched to a product` : ""}.`);
     } catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)); }
     finally { setBusy(""); }
@@ -165,12 +165,15 @@ export default function TallyTab({ stores, operations, localFiles = true, onChan
   async function generateAllExports(): Promise<void> {
     setBusy("export"); setError(""); setNotice("");
     try {
-      const result = await window.desktop.stores.exportBatch({ reviewedBy: reviewer.trim(), includeCsv });
+      const result = await window.desktop.stores.exportBatch({
+        reviewedBy: reviewer.trim() || "Catalog generation",
+        includeCsv,
+      });
       const masters = await window.desktop.stores.exportCatalogCleanup();
       const next = await window.desktop.stores.getState();
       onChanged(next);
       await refreshGeneratedFiles();
-      setNotice(`Generated the complete Tally file set: Material In, Material Out, voucher review, master/catalog, products, active BOMs, reorder levels, suppliers, open Purchase Orders${result.csvPath ? ", CSV" : ""}, and XML.${[...result.warnings, ...masters.warnings].length ? ` ${[...result.warnings, ...masters.warnings].join(" ")}` : ""}`);
+      setNotice(`Generated the complete Tally file set, including ${masters.groupCount} local Stock Group${masters.groupCount === 1 ? "" : "s"}, ${masters.categoryCount} Stock Categor${masters.categoryCount === 1 ? "y" : "ies"}, and ${masters.itemCount} Stock Item${masters.itemCount === 1 ? "" : "s"}, plus Material In, Material Out, voucher review, BOMs, reorder levels, suppliers, open Purchase Orders${result.csvPath ? ", CSV" : ""}, and XML.${[...result.warnings, ...masters.warnings].length ? ` ${[...result.warnings, ...masters.warnings].join(" ")}` : ""}`);
     } catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)); }
     finally { setBusy(""); }
   }
@@ -193,7 +196,7 @@ export default function TallyTab({ stores, operations, localFiles = true, onChan
   return (
     <section className="tab-page">
       <div className="page-heading">
-        <div><p className="eyebrow">READ FROM TALLY · EXPORT EVERYTHING TALLY-READY</p><h1>Tally Syncer</h1><p>Catalog reads, voucher review, Material In/Out, Stock Items, name changes, duplicate review, products, and active BOM definitions are managed here. Files are generated for review and import; the app does not post directly into Tally.</p></div>
+        <div><p className="eyebrow">BUILD LOCALLY · IMPORT INTO TALLY · SYNC GOING FORWARD</p><h1>Tally Syncer</h1><p>Generate creates the complete master set—Stock Groups, nested subgroups, Stock Categories, Stock Items, products, and active BOM definitions—alongside reviewed inventory vouchers. Import the masters into a new Tally company, then use sync for ongoing reconciliation.</p></div>
         {localFiles && <button className="button button--secondary" type="button" onClick={() => void window.desktop.stores.openPath(stores.database.exportFolder)}>Open export folder</button>}
       </div>
       {error && <div className="alert alert--error">{error}</div>}
@@ -237,7 +240,7 @@ export default function TallyTab({ stores, operations, localFiles = true, onChan
           <div><p className="eyebrow">TALLY IMPORT FILES</p><h2>Generated file library</h2></div>
           <button className="button" type="button" disabled={Boolean(busy)} onClick={() => void generateAllExports()}>{busy === "export" ? "Generating…" : "Generate"}</button>
         </div>
-        <p className="table-footnote">Generate creates every available Tally-oriented workbook and XML file. Use the download icon to choose where to save a copy.</p>
+        <p className="table-footnote">Generate creates every available Tally-oriented workbook and XML file. The master workbook includes separate Stock Groups, Stock Categories, and Stock Items sheets; the companion master XML creates them in dependency order.</p>
         <div className="table-scroll"><table><thead><tr><th>File</th><th>Type</th><th>Generated</th><th>Size</th><th /></tr></thead><tbody>
           {generatedFiles.map((file) => <tr key={file.path}><td><strong>{file.name}</strong></td><td>{file.extension.toUpperCase()}</td><td>{formatDate(file.modifiedAt)}</td><td>{formatBytes(file.sizeBytes)}</td><td className="table-actions">{localFiles ? <button className="button button--ghost button--small" type="button" title={`Download ${file.name}`} aria-label={`Download ${file.name}`} onClick={() => void downloadFile(file)}>⇩</button> : <small>On Production</small>}</td></tr>)}
           {generatedFiles.length === 0 && <tr><td colSpan={5} className="empty-table">No generated files yet. Select Generate to create the complete Tally file set.</td></tr>}

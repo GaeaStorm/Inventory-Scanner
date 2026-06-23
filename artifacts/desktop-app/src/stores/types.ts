@@ -13,8 +13,6 @@ export type AdjustmentReason =
   | "DAMAGE_OR_LOSS"
   | "OTHER";
 
-export type CatalogRole = "FINISHED_PRODUCT" | "COMPONENT" | "ACCESSORY" | "PACKAGING" | "OTHER";
-
 export type ReviewStatus =
   | "PENDING"
   | "APPROVED"
@@ -30,6 +28,9 @@ export interface StoresStockItem {
   tallyName: string;
   name: string;
   parentName: string;
+  groupPath: string[];
+  categoryName: string;
+  baseUnits: string;
   primaryGroupName: string;
   secondaryGroupName: string;
   hasBom: boolean;
@@ -43,8 +44,7 @@ export interface StoresStockItem {
   active: boolean;
   source: "TALLY" | "LOCAL";
   catalogStatus: "ACTIVE" | "DUPLICATE" | "OBSOLETE";
-  catalogRole: CatalogRole;
-  itemRoleOverride: CatalogRole | null;
+  isProduct: boolean;
   ignored: boolean;
   itemIgnored: boolean;
   groupIgnored: boolean;
@@ -229,14 +229,26 @@ export interface StoresOpeningQuantityAdjustment {
   createdAt: string;
 }
 
-export type StoresDataMode = "empty" | "demo" | "tally";
+export type StoresDataMode = "empty" | "demo" | "local" | "tally";
 
 export interface StoresCatalogGroup {
   name: string;
+  parentName: string;
   primaryName: string;
   type: "PRIMARY" | "SECONDARY";
-  role: CatalogRole;
+  level: number;
+  path: string[];
+  source: "TALLY" | "LOCAL";
   ignored: boolean;
+  itemCount: number;
+}
+
+export interface StoresStockCategory {
+  name: string;
+  parentName: string;
+  level: number;
+  path: string[];
+  source: "TALLY" | "LOCAL";
   itemCount: number;
 }
 
@@ -255,6 +267,7 @@ export interface StoresState {
   reviewEntries: StoresReviewEntry[];
   openingQuantityAdjustments: StoresOpeningQuantityAdjustment[];
   catalogGroups: StoresCatalogGroup[];
+  stockCategories: StoresStockCategory[];
   exportSchemaVersion: string;
   materialOutXmlConfigured: boolean;
 }
@@ -262,6 +275,30 @@ export interface StoresState {
 export interface CreateLocalStockItemInput {
   name: string;
   parentName?: string;
+  categoryName?: string;
+  baseUnits?: string;
+}
+
+export interface CreateCatalogGroupInput {
+  name: string;
+  parentName?: string;
+}
+
+export interface DeleteCatalogGroupInput {
+  name: string;
+}
+
+export interface CreateStockCategoryInput {
+  name: string;
+  parentName?: string;
+}
+
+export interface DeleteStockCategoryInput {
+  name: string;
+}
+
+export interface DeleteStockItemInput {
+  tallyItemGuid: string;
 }
 
 export interface SetCatalogStatusInput {
@@ -270,11 +307,8 @@ export interface SetCatalogStatusInput {
   duplicateOfTallyGuid?: string | null;
 }
 
-export interface SetCatalogClassificationInput {
-  scope: "ITEM" | "GROUP";
-  tallyItemGuid?: string;
-  groupName?: string;
-  role: CatalogRole;
+export interface SetCatalogVisibilityInput {
+  groupName: string;
   ignored: boolean;
 }
 
@@ -294,6 +328,9 @@ export interface RenameStockItemInput {
 export interface CatalogCleanupExportResult {
   workbookPath: string;
   renameXmlPath: string | null;
+  groupCount: number;
+  categoryCount: number;
+  itemCount: number;
   renameCount: number;
   duplicateCount: number;
   obsoleteCount: number;

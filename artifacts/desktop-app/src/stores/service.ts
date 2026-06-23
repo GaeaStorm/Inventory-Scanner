@@ -3,7 +3,7 @@ import path from "node:path";
 import type { TallyStoresSnapshot } from "../tally/types";
 import type { OperationsService } from "../operations/service";
 import type { ActorContext, Permission } from "../operations/types";
-import { requirePermission } from "../operations/permissions";
+import { hasPermission, requirePermission } from "../operations/permissions";
 import { ApplicationDatabase, DatabaseBusyError } from "../database/application-database";
 import { createDemoStoresSnapshot } from "./demo-data";
 import { CatalogExporter } from "./catalog-exporter";
@@ -13,7 +13,12 @@ import type {
   AdjustmentInput,
   BulkVendorReceiptInput,
   ConfirmImportInput,
+  CreateCatalogGroupInput,
   CreateLocalStockItemInput,
+  CreateStockCategoryInput,
+  DeleteCatalogGroupInput,
+  DeleteStockCategoryInput,
+  DeleteStockItemInput,
   ExportBatchInput,
   MaterialOutInput,
   OpeningQuantityInput,
@@ -21,7 +26,7 @@ import type {
   ReviewDecisionInput,
   SaveBoxInput,
   SetCatalogStatusInput,
-  SetCatalogClassificationInput,
+  SetCatalogVisibilityInput,
   StoresOfflineBatchInput,
   StoresOfflineBatchResult,
   VendorReceiptInput,
@@ -77,12 +82,13 @@ export class StoresService {
   sync(snapshot: TallyStoresSnapshot, actor?: ActorContext) {
     if (actor) this.authorize(actor, "PURCHASING_MANAGE");
     if (snapshot.stockItems.length === 0) {
-      const demoState = this.ensureDemoData();
+      this.database.rememberTallyCompany(snapshot);
+      const currentState = this.database.getState();
       return {
-        ...demoState.sync,
+        ...currentState.sync,
         warnings: [
-          ...demoState.sync.warnings,
-          `Tally company ${snapshot.company || "(unnamed)"} returned no Stock Items, so the demo catalog was retained.`,
+          ...currentState.sync.warnings,
+          `Tally company ${snapshot.company || "(unnamed)"} returned no Stock Items. The local master catalog was left unchanged so it can be imported into this company.`,
         ],
       };
     }
@@ -105,15 +111,45 @@ export class StoresService {
     return this.getState();
   }
 
+  createCatalogGroup(input: CreateCatalogGroupInput, actor: ActorContext) {
+    this.authorize(actor, "CATALOG_MANAGE");
+    this.database.createCatalogGroup(input);
+    return this.getState();
+  }
+
+  deleteCatalogGroup(input: DeleteCatalogGroupInput, actor: ActorContext) {
+    this.authorize(actor, "CATALOG_MANAGE");
+    this.database.deleteCatalogGroup(input);
+    return this.getState();
+  }
+
+  createStockCategory(input: CreateStockCategoryInput, actor: ActorContext) {
+    this.authorize(actor, "CATALOG_MANAGE");
+    this.database.createStockCategory(input);
+    return this.getState();
+  }
+
+  deleteStockCategory(input: DeleteStockCategoryInput, actor: ActorContext) {
+    this.authorize(actor, "CATALOG_MANAGE");
+    this.database.deleteStockCategory(input);
+    return this.getState();
+  }
+
+  deleteStockItem(input: DeleteStockItemInput, actor: ActorContext) {
+    this.authorize(actor, "CATALOG_MANAGE");
+    this.database.deleteStockItem(input);
+    return this.getState();
+  }
+
   setCatalogStatus(input: SetCatalogStatusInput, actor: ActorContext) {
     this.authorize(actor, "CATALOG_MANAGE");
     this.database.setCatalogStatus(input);
     return this.getState();
   }
 
-  setCatalogClassification(input: SetCatalogClassificationInput, actor: ActorContext) {
+  setCatalogVisibility(input: SetCatalogVisibilityInput, actor: ActorContext) {
     this.authorize(actor, "CATALOG_MANAGE");
-    this.database.setCatalogClassification(input);
+    this.database.setCatalogVisibility(input);
     return this.getState();
   }
 
@@ -124,7 +160,9 @@ export class StoresService {
   }
 
   exportCatalogCleanup(actor: ActorContext) {
-    this.authorize(actor, "CATALOG_MANAGE");
+    if (!hasPermission(actor.role, "CATALOG_MANAGE") && !hasPermission(actor.role, "TALLY_REVIEW")) {
+      throw new Error(`${actor.role} does not have permission to generate Tally master files.`);
+    }
     return this.catalogExporter.generate();
   }
 
@@ -250,7 +288,7 @@ export class StoresService {
           const payload = operation.payload as MaterialOutInput | AdjustmentInput;
           const exception = this.operationsService().recordSyncException({
             clientTransactionId: stableId,
-            deviceId: String(input.deviceId ?? "UNKNOWN"),
+            deviceId: actor.userId,
             operator: actor.displayName,
             localTimestamp: String(input.localTimestamp ?? ""),
             operationType: operation.type,

@@ -1,6 +1,7 @@
 import {
   createHash,
   randomBytes,
+  randomInt,
   randomUUID,
   scryptSync,
   timingSafeEqual,
@@ -14,6 +15,7 @@ import type {
   AuthState,
   AuthUser,
   BootstrapAdminInput,
+  ConfirmCredentialRecoveryInput,
   ConditionBalance,
   ConditionTransitionInput,
   CreateCountSessionInput,
@@ -21,7 +23,6 @@ import type {
   CustomerReturnInput,
   FaultResolution,
   FinalizeCountInput,
-  ForgotCredentialInput,
   LoginInput,
   ManualTallyReview,
   MovementLotLine,
@@ -35,10 +36,13 @@ import type {
   ProductionReturnInput,
   ReceiveCustomerReturnInput,
   RecordCountEntryInput,
+  RequestCredentialRecoveryInput,
   ResetCredentialInput,
   ResolveFaultInput,
   ReverseMovementInput,
   SaveUserInput,
+  ScannerDevice,
+  ScannerPairing,
   ScrapInput,
   StockCondition,
   StockCountDetail,
@@ -585,6 +589,46 @@ const migrations: ApplicationDatabaseMigration[] = [
       `);
     },
   },
+  {
+    version: 5,
+    description: "Add emailed recovery challenges and individually paired scanner devices",
+    up(database: DatabaseSync) {
+      database.exec(`
+        CREATE TABLE ops_recovery_challenges (
+          id TEXT PRIMARY KEY,
+          user_id TEXT NOT NULL REFERENCES ops_users(id) ON DELETE CASCADE,
+          code_hash TEXT NOT NULL,
+          expires_at TEXT NOT NULL,
+          attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+          consumed_at TEXT,
+          created_at TEXT NOT NULL
+        ) STRICT;
+        CREATE INDEX idx_ops_recovery_user
+          ON ops_recovery_challenges(user_id, created_at);
+
+        CREATE TABLE ops_scanner_pairings (
+          token_hash TEXT PRIMARY KEY,
+          label TEXT NOT NULL,
+          expires_at TEXT NOT NULL,
+          claimed_at TEXT,
+          created_by_user_id TEXT NOT NULL REFERENCES ops_users(id),
+          created_at TEXT NOT NULL
+        ) STRICT;
+
+        CREATE TABLE ops_scanner_devices (
+          id TEXT PRIMARY KEY,
+          user_id TEXT NOT NULL UNIQUE REFERENCES ops_users(id) ON DELETE CASCADE,
+          label TEXT NOT NULL,
+          token_hash TEXT NOT NULL UNIQUE,
+          created_at TEXT NOT NULL,
+          last_seen_at TEXT,
+          revoked_at TEXT
+        ) STRICT;
+        CREATE INDEX idx_ops_scanner_active
+          ON ops_scanner_devices(revoked_at, last_seen_at);
+      `);
+    },
+  },
 ];
 
 export class OperationsDatabase {
@@ -658,7 +702,11 @@ export class OperationsDatabase {
   }
 
   listUsers(): AuthUser[] {
-    return (this.db.prepare("SELECT * FROM ops_users WHERE id <> ? ORDER BY active DESC, display_name COLLATE NOCASE").all(SHARED_PHONE_USER_ID) as Row[])
+    return (this.db.prepare(`
+      SELECT * FROM ops_users
+      WHERE id <> ? AND id NOT LIKE 'SCANNER:%'
+      ORDER BY active DESC, display_name COLLATE NOCASE
+    `).all(SHARED_PHONE_USER_ID) as Row[])
       .map((row) => this.mapUser(row));
   }
 
@@ -667,7 +715,10 @@ export class OperationsDatabase {
       ? this.listUsers().find((user) => user.userId === actor.userId) ?? null
       : null;
     return {
-      needsBootstrap: Number((this.db.prepare("SELECT COUNT(*) AS count FROM ops_users WHERE id <> ?").get(SHARED_PHONE_USER_ID) as Row).count) === 0,
+      needsBootstrap: Number((this.db.prepare(`
+        SELECT COUNT(*) AS count FROM ops_users
+        WHERE id <> ? AND id NOT LIKE 'SCANNER:%'
+      `).get(SHARED_PHONE_USER_ID) as Row).count) === 0,
       currentUser,
       permissions: currentUser ? permissionsForRole(currentUser.role) : [],
       users: currentUser?.role === "ADMIN" ? this.listUsers() : [],
@@ -725,22 +776,170 @@ export class OperationsDatabase {
     });
   }
 
-  forgotCredential(input: ForgotCredentialInput): void {
+  createRecoveryChallenge(input: RequestCredentialRecoveryInput): { email: string; code: string } | null {
     const username = text(input.username);
     const email = emailAddress(input.email);
-    const credentialType = input.credentialType === "PIN" ? "PIN" : "PASSWORD";
-    const hashed = hashCredential(String(input.credential ?? ""), credentialType);
-    this.transaction("resetting a forgotten credential", () => {
+    return this.transaction("creating a credential recovery challenge", () => {
       const row = this.db.prepare(
         "SELECT id FROM ops_users WHERE username = ? COLLATE NOCASE AND email = ? COLLATE NOCASE AND active = 1 AND id <> ?",
       ).get(username, email, SHARED_PHONE_USER_ID) as Row | undefined;
-      if (!row) throw new Error("The username and email address do not match an active account.");
+      if (!row) return null;
+      const code = String(randomInt(100000, 1000000));
+      const createdAt = nowIso();
+      this.db.prepare(`
+        UPDATE ops_recovery_challenges
+        SET consumed_at = ?
+        WHERE user_id = ? AND consumed_at IS NULL
+      `).run(createdAt, row.id);
+      this.db.prepare(`
+        INSERT INTO ops_recovery_challenges(
+          id, user_id, code_hash, expires_at, attempts, created_at
+        ) VALUES (?, ?, ?, ?, 0, ?)
+      `).run(
+        randomUUID(),
+        row.id,
+        hashToken(code),
+        new Date(Date.now() + 15 * 60 * 1000).toISOString(),
+        createdAt,
+      );
+      return { email, code };
+    });
+  }
+
+  confirmRecovery(input: ConfirmCredentialRecoveryInput): void {
+    const username = text(input.username);
+    const email = emailAddress(input.email);
+    const code = text(input.code);
+    if (!/^\d{6}$/.test(code)) throw new Error("Enter the six-digit recovery code.");
+    const credentialType = input.credentialType === "PIN" ? "PIN" : "PASSWORD";
+    const hashed = hashCredential(String(input.credential ?? ""), credentialType);
+    const confirmed = this.transaction("confirming credential recovery", () => {
+      const row = this.db.prepare(`
+        SELECT challenge.id AS challenge_id, challenge.user_id, challenge.code_hash,
+          challenge.expires_at, challenge.attempts
+        FROM ops_recovery_challenges challenge
+        JOIN ops_users user ON user.id = challenge.user_id
+        WHERE user.username = ? COLLATE NOCASE
+          AND user.email = ? COLLATE NOCASE
+          AND user.active = 1
+          AND challenge.consumed_at IS NULL
+        ORDER BY challenge.created_at DESC LIMIT 1
+      `).get(username, email) as Row | undefined;
+      if (!row || text(row.expires_at) <= nowIso() || Number(row.attempts) >= 5) {
+        return false;
+      }
+      if (hashToken(code) !== text(row.code_hash)) {
+        this.db.prepare(`
+          UPDATE ops_recovery_challenges SET attempts = attempts + 1 WHERE id = ?
+        `).run(row.challenge_id);
+        return false;
+      }
       this.db.prepare(`
         UPDATE ops_users SET credential_hash = ?, credential_salt = ?, credential_type = ?,
           must_reset_credential = 0, version = version + 1, updated_at = ? WHERE id = ?
-      `).run(hashed.hash, hashed.salt, credentialType, nowIso(), row.id);
-      this.db.prepare("DELETE FROM ops_sessions WHERE user_id = ?").run(row.id);
+      `).run(hashed.hash, hashed.salt, credentialType, nowIso(), row.user_id);
+      this.db.prepare(`
+        UPDATE ops_recovery_challenges SET consumed_at = ? WHERE id = ?
+      `).run(nowIso(), row.challenge_id);
+      this.db.prepare("DELETE FROM ops_sessions WHERE user_id = ?").run(row.user_id);
+      return true;
     });
+    if (!confirmed) throw new Error("The recovery code is invalid or expired. Request a new code.");
+  }
+
+  createScannerPairing(label: string, actor: ActorContext): ScannerPairing {
+    const cleanLabel = text(label) || "Phone scanner";
+    const pairingToken = randomBytes(32).toString("base64url");
+    const createdAt = nowIso();
+    const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString();
+    this.db.prepare(`
+      INSERT INTO ops_scanner_pairings(
+        token_hash, label, expires_at, created_by_user_id, created_at
+      ) VALUES (?, ?, ?, ?, ?)
+    `).run(hashToken(pairingToken), cleanLabel, expiresAt, actor.userId, createdAt);
+    this.audit(actor, "SCANNER_PAIRING_CREATED", "SCANNER", pairingToken.slice(0, 8), { label: cleanLabel, expiresAt });
+    return { pairingToken, expiresAt };
+  }
+
+  claimScannerPairing(pairingToken: string, deviceLabel?: string): { deviceToken: string; device: ScannerDevice } {
+    return this.transaction("pairing a phone scanner", () => {
+      const tokenHash = hashToken(text(pairingToken));
+      const pairing = this.db.prepare(`
+        SELECT * FROM ops_scanner_pairings
+        WHERE token_hash = ? AND claimed_at IS NULL AND expires_at > ?
+      `).get(tokenHash, nowIso()) as Row | undefined;
+      if (!pairing) throw new Error("This scanner pairing QR is invalid, expired, or already used.");
+      const id = `SCANNER:${randomUUID()}`;
+      const label = text(deviceLabel) || text(pairing.label) || "Phone scanner";
+      const username = `scanner_${id.slice(-12).replaceAll("-", "")}`;
+      const timestamp = nowIso();
+      const credential = hashCredential(randomBytes(32).toString("hex"), "PASSWORD");
+      this.db.prepare(`
+        INSERT INTO ops_users(
+          id, display_name, username, credential_hash, credential_salt, credential_type,
+          role, active, must_reset_credential, audit_identity, email, email_required,
+          created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, 'PASSWORD', 'STORE', 1, 0, ?, '', 0, ?, ?)
+      `).run(id, label, username, credential.hash, credential.salt, `PHONE:${id}`, timestamp, timestamp);
+      const deviceToken = randomBytes(32).toString("base64url");
+      this.db.prepare(`
+        INSERT INTO ops_scanner_devices(
+          id, user_id, label, token_hash, created_at, last_seen_at
+        ) VALUES (?, ?, ?, ?, ?, ?)
+      `).run(id, id, label, hashToken(deviceToken), timestamp, timestamp);
+      this.db.prepare(`
+        UPDATE ops_scanner_pairings SET claimed_at = ? WHERE token_hash = ?
+      `).run(timestamp, tokenHash);
+      return {
+        deviceToken,
+        device: { id, label, createdAt: timestamp, lastSeenAt: timestamp, revokedAt: null },
+      };
+    });
+  }
+
+  scannerActor(deviceToken: string): ActorContext | null {
+    const tokenHash = hashToken(text(deviceToken));
+    if (!deviceToken) return null;
+    const row = this.db.prepare(`
+      SELECT device.id, device.label, user.username, user.audit_identity
+      FROM ops_scanner_devices device
+      JOIN ops_users user ON user.id = device.user_id
+      WHERE device.token_hash = ? AND device.revoked_at IS NULL AND user.active = 1
+    `).get(tokenHash) as Row | undefined;
+    if (!row) return null;
+    this.db.prepare(`
+      UPDATE ops_scanner_devices SET last_seen_at = ? WHERE token_hash = ?
+    `).run(nowIso(), tokenHash);
+    return {
+      userId: text(row.id),
+      username: text(row.username),
+      displayName: text(row.label),
+      auditIdentity: text(row.audit_identity),
+      role: "STORE",
+    };
+  }
+
+  listScannerDevices(): ScannerDevice[] {
+    return (this.db.prepare(`
+      SELECT id, label, created_at, last_seen_at, revoked_at
+      FROM ops_scanner_devices ORDER BY created_at DESC
+    `).all() as Row[]).map((row) => ({
+      id: text(row.id),
+      label: text(row.label),
+      createdAt: text(row.created_at),
+      lastSeenAt: row.last_seen_at ? text(row.last_seen_at) : null,
+      revokedAt: row.revoked_at ? text(row.revoked_at) : null,
+    }));
+  }
+
+  revokeScannerDevice(deviceId: string, actor: ActorContext): void {
+    const timestamp = nowIso();
+    const result = this.db.prepare(`
+      UPDATE ops_scanner_devices SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL
+    `).run(timestamp, text(deviceId));
+    if (Number(result.changes) === 0) throw new Error("The scanner is unavailable or already revoked.");
+    this.db.prepare("UPDATE ops_users SET active = 0, updated_at = ? WHERE id = ?").run(timestamp, text(deviceId));
+    this.audit(actor, "SCANNER_REVOKED", "SCANNER", text(deviceId), {});
   }
 
   sharedPhoneActor(): ActorContext {

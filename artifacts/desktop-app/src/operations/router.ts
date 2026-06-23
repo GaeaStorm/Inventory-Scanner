@@ -16,6 +16,14 @@ export function createOperationsRouter(service: OperationsService): Router {
   router.get("/auth/state", (request, response) => response.json(service.authState(tokenFrom(request))));
   router.post("/auth/bootstrap", (request, response) => response.status(201).json(service.bootstrapAdmin(request.body)));
   router.post("/auth/login", (request, response) => response.json(service.login(request.body)));
+  router.post("/auth/recovery/request", async (request, response) => {
+    await service.requestCredentialRecovery(request.body);
+    response.status(204).end();
+  });
+  router.post("/auth/recovery/confirm", (request, response) => {
+    service.confirmCredentialRecovery(request.body);
+    response.status(204).end();
+  });
   router.post("/auth/email", (request, response) => response.json(service.updateOwnEmail(request.body, actor(request))));
   router.post("/auth/resume", (request, response) => response.json(service.resume(String(request.body?.token ?? tokenFrom(request)))));
   router.post("/auth/logout", (request, response) => {

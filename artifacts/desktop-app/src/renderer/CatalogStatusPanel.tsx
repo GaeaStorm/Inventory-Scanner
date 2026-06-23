@@ -1,16 +1,9 @@
 import { useMemo, useState } from "react";
 
 import InfoTip from "./InfoTip";
-import type { CatalogRole, StoresState } from "./types";
+import type { StoresState } from "./types";
 
-type CatalogAction = "DUPLICATE" | "OBSOLETE";
-const roleLabels: Record<CatalogRole, string> = {
-  FINISHED_PRODUCT: "Finished Product",
-  COMPONENT: "Component",
-  ACCESSORY: "Accessory",
-  PACKAGING: "Packaging",
-  OTHER: "Other",
-};
+type MasterKind = "GROUP" | "CATEGORY" | "ITEM";
 
 export default function CatalogStatusPanel(props: {
   stores: StoresState;
@@ -18,176 +11,110 @@ export default function CatalogStatusPanel(props: {
   onNotice: (message: string) => void;
   onError: (message: string) => void;
 }) {
-  const [itemGuid, setItemGuid] = useState("");
-  const [action, setAction] = useState<CatalogAction>("DUPLICATE");
-  const [primaryGuid, setPrimaryGuid] = useState("");
-  const [renameName, setRenameName] = useState("");
   const [busy, setBusy] = useState(false);
-  const [classificationScope, setClassificationScope] = useState<"ITEM" | "GROUP">("GROUP");
-  const [classificationItemGuid, setClassificationItemGuid] = useState("");
-  const [classificationGroup, setClassificationGroup] = useState("");
-  const [classificationPrimaryGroup, setClassificationPrimaryGroup] = useState("");
-  const [classificationRole, setClassificationRole] = useState<CatalogRole>("OTHER");
-  const [classificationIgnored, setClassificationIgnored] = useState(false);
+  const [masterKind, setMasterKind] = useState<MasterKind>("GROUP");
+  const [masterName, setMasterName] = useState("");
+  const [masterParent, setMasterParent] = useState("");
+  const [itemCategory, setItemCategory] = useState("");
+  const [itemGuid, setItemGuid] = useState("");
+  const [renameName, setRenameName] = useState("");
+  const [duplicateGuid, setDuplicateGuid] = useState("");
 
   const selected = props.stores.stockItems.find((item) => item.tallyGuid === itemGuid) ?? null;
-  const activeItems = useMemo(
+  const editableItems = useMemo(
     () => props.stores.stockItems.filter((item) => item.catalogStatus === "ACTIVE"),
     [props.stores.stockItems],
   );
-  const primaryItems = useMemo(
-    () => activeItems.filter((item) => item.tallyGuid !== itemGuid),
-    [activeItems, itemGuid],
-  );
-  const changedItems = useMemo(
-    () => props.stores.stockItems.filter((item) => item.catalogStatus !== "ACTIVE" || item.name !== item.tallyName || item.ignored || item.itemRoleOverride),
-    [props.stores.stockItems],
-  );
-  const primaryGroups = useMemo(
-    () => props.stores.catalogGroups.filter((group) => group.type === "PRIMARY"),
-    [props.stores.catalogGroups],
-  );
-  const secondaryGroups = useMemo(
-    () => props.stores.catalogGroups.filter((group) => group.type === "SECONDARY" && group.primaryName === classificationPrimaryGroup),
-    [classificationPrimaryGroup, props.stores.catalogGroups],
+  const duplicateTargets = editableItems.filter((item) => item.tallyGuid !== itemGuid);
+  const changedItems = props.stores.stockItems.filter((item) =>
+    item.catalogStatus === "DUPLICATE" || item.name !== item.tallyName
   );
 
-  function chooseClassificationGroup(name: string) {
-    const group = props.stores.catalogGroups.find((entry) => entry.name === name);
-    setClassificationGroup(name);
-    setClassificationRole(group?.role ?? "OTHER");
-    setClassificationIgnored(group?.ignored ?? false);
-  }
-
-  async function save(): Promise<void> {
-    if (!selected) {
-      props.onError("Choose a Stock Item to classify.");
-      return;
-    }
-    if (action === "DUPLICATE" && !primaryGuid) {
-      props.onError("Choose the primary Stock Item for this duplicate.");
-      return;
-    }
+  async function run(change: () => Promise<StoresState>, message: string): Promise<void> {
     setBusy(true);
     props.onError("");
     try {
-      const next = await window.desktop.stores.setCatalogStatus({
-        tallyItemGuid: selected.tallyGuid,
-        status: action,
-        duplicateOfTallyGuid: action === "DUPLICATE" ? primaryGuid : null,
-      });
-      props.onChanged(next);
-      props.onNotice(
-        action === "DUPLICATE"
-          ? `${selected.name} is now hidden as a duplicate.`
-          : `${selected.name} is marked obsolete and has been sent to Accounts for a restock decision.`,
+      props.onChanged(await change());
+      props.onNotice(message);
+    } catch (error) {
+      props.onError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function addMaster(): Promise<void> {
+    const name = masterName.trim();
+    if (!name) return;
+    if (masterKind === "GROUP") {
+      await run(
+        () => window.desktop.stores.createCatalogGroup({ name, parentName: masterParent || undefined }),
+        `Stock Group ${name} created.`,
       );
-      setItemGuid("");
-      setPrimaryGuid("");
-    } catch (error) {
-      props.onError(error instanceof Error ? error.message : String(error));
-    } finally {
-      setBusy(false);
+    } else if (masterKind === "CATEGORY") {
+      await run(
+        () => window.desktop.stores.createStockCategory({ name, parentName: masterParent || undefined }),
+        `Stock Category ${name} created.`,
+      );
+    } else {
+      if (!masterParent) {
+        props.onError("Choose a Stock Group for the new item.");
+        return;
+      }
+      await run(
+        () => window.desktop.stores.createLocalStockItem({
+          name,
+          parentName: masterParent,
+          categoryName: itemCategory || undefined,
+          baseUnits: "Nos",
+        }),
+        `Stock Item ${name} created.`,
+      );
     }
-  }
-
-  async function saveClassification(): Promise<void> {
-    if (classificationScope === "GROUP" && !classificationGroup) {
-      props.onError("Choose a Tally group to classify.");
-      return;
-    }
-    if (classificationScope === "ITEM" && !classificationItemGuid) {
-      props.onError("Choose a Stock Item to classify.");
-      return;
-    }
-    setBusy(true);
-    props.onError("");
-    try {
-      const next = await window.desktop.stores.setCatalogClassification({
-        scope: classificationScope,
-        groupName: classificationScope === "GROUP" ? classificationGroup : undefined,
-        tallyItemGuid: classificationScope === "ITEM" ? classificationItemGuid : undefined,
-        role: classificationRole,
-        ignored: classificationIgnored,
-      });
-      props.onChanged(next);
-      props.onNotice(`${classificationScope === "GROUP" ? classificationGroup : next.stockItems.find((item) => item.tallyGuid === classificationItemGuid)?.name} is classified as ${roleLabels[classificationRole]}${classificationIgnored ? " and ignored by operational screens" : ""}.`);
-    } catch (error) {
-      props.onError(error instanceof Error ? error.message : String(error));
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function restore(tallyItemGuid: string, name: string): Promise<void> {
-    setBusy(true);
-    props.onError("");
-    try {
-      const next = await window.desktop.stores.setCatalogStatus({
-        tallyItemGuid,
-        status: "ACTIVE",
-      });
-      props.onChanged(next);
-      props.onNotice(`${name} was restored to the active catalog.`);
-    } catch (error) {
-      props.onError(error instanceof Error ? error.message : String(error));
-    } finally {
-      setBusy(false);
-    }
+    setMasterName("");
+    setItemCategory("");
   }
 
   async function rename(): Promise<void> {
-    if (!selected) {
-      props.onError("Choose a Stock Item to rename.");
-      return;
-    }
-    setBusy(true);
-    props.onError("");
-    try {
-      const next = await window.desktop.stores.renameStockItem({
+    if (!selected || !renameName.trim()) return;
+    await run(
+      () => window.desktop.stores.renameStockItem({
         tallyItemGuid: selected.tallyGuid,
-        name: renameName,
-      });
-      props.onChanged(next);
-      props.onNotice(
-        renameName.trim().toLocaleLowerCase() === selected.tallyName.toLocaleLowerCase()
-          ? `${selected.tallyName} was restored as the local display name.`
-          : `${selected.tallyName} is now shown locally as ${renameName.trim()}.`,
-      );
-    } catch (error) {
-      props.onError(error instanceof Error ? error.message : String(error));
-    } finally {
-      setBusy(false);
-    }
+        name: renameName.trim(),
+      }),
+      `${selected.name} renamed to ${renameName.trim()}.`,
+    );
   }
 
-  async function restoreName(tallyItemGuid: string, tallyName: string): Promise<void> {
-    setBusy(true);
-    props.onError("");
-    try {
-      const next = await window.desktop.stores.renameStockItem({
-        tallyItemGuid,
-        name: tallyName,
-      });
-      props.onChanged(next);
-      if (tallyItemGuid === itemGuid) setRenameName(tallyName);
-      props.onNotice(`${tallyName} was restored as the local display name.`);
-    } catch (error) {
-      props.onError(error instanceof Error ? error.message : String(error));
-    } finally {
-      setBusy(false);
-    }
+  async function markDuplicate(): Promise<void> {
+    if (!selected || !duplicateGuid) return;
+    await run(
+      () => window.desktop.stores.setCatalogStatus({
+        tallyItemGuid: selected.tallyGuid,
+        status: "DUPLICATE",
+        duplicateOfTallyGuid: duplicateGuid,
+      }),
+      `${selected.name} is now hidden as a duplicate.`,
+    );
+    setItemGuid("");
+    setRenameName("");
+    setDuplicateGuid("");
   }
 
-  async function exportCleanup(): Promise<void> {
+  async function restoreDuplicate(tallyItemGuid: string, name: string): Promise<void> {
+    await run(
+      () => window.desktop.stores.setCatalogStatus({ tallyItemGuid, status: "ACTIVE" }),
+      `${name} restored to the active catalog.`,
+    );
+  }
+
+  async function exportMasters(): Promise<void> {
     setBusy(true);
     props.onError("");
     try {
       const result = await window.desktop.stores.exportCatalogCleanup();
       await window.desktop.stores.openPath(result.workbookPath);
-      props.onNotice(
-        `Created Tally cleanup workbook with ${result.renameCount} rename, ${result.duplicateCount} duplicate, and ${result.obsoleteCount} obsolete item${result.renameCount + result.duplicateCount + result.obsoleteCount === 1 ? "" : "s"}.${result.renameXmlPath ? " A companion Tally rename XML was also created." : ""}${result.warnings.length ? " Review the workbook instructions before changing Tally." : ""}`,
-      );
+      props.onNotice("Created the Tally master workbook and companion XML.");
     } catch (error) {
       props.onError(error instanceof Error ? error.message : String(error));
     } finally {
@@ -195,147 +122,88 @@ export default function CatalogStatusPanel(props: {
     }
   }
 
+  const parentChoices = masterKind === "CATEGORY"
+    ? props.stores.stockCategories
+    : props.stores.catalogGroups;
+
   return (
     <article className="panel catalog-status-panel">
       <div className="panel__header">
         <div className="heading-with-info">
-          <div><p className="eyebrow">CATALOG CLEANUP</p><h2>Visibility, roles, duplicates, and obsolete items</h2></div>
+          <div><p className="eyebrow">CATALOG EDITS</p><h2>Structure, visibility, names, and duplicates</h2></div>
           <InfoTip>
-            Group and item roles control where synchronized Tally Stock Items appear. Ignored groups and items remain synchronized for history but disappear from operational dropdowns.
+            Add local masters before importing them into Tally. Ignored Stock Groups remain synchronized for history but are hidden from operational screens.
           </InfoTip>
         </div>
+        <button className="button button--secondary" type="button" disabled={busy} onClick={() => void exportMasters()}>Export Tally masters</button>
       </div>
 
-      <div className="catalog-status-grid">
-        <label>Classify<select value={classificationScope} onChange={(event) => setClassificationScope(event.target.value as typeof classificationScope)}><option value="GROUP">A whole Tally group</option><option value="ITEM">An individual Stock Item</option></select></label>
-        {classificationScope === "GROUP" ? <>
-          <label>Primary group<select value={classificationPrimaryGroup} onChange={(event) => { setClassificationPrimaryGroup(event.target.value); chooseClassificationGroup(event.target.value); }}><option value="">Choose primary group…</option>{primaryGroups.map((entry) => <option key={entry.name} value={entry.name}>{entry.name} · {entry.itemCount} items</option>)}</select></label>
-          <label>Secondary group<select value={classificationGroup === classificationPrimaryGroup ? "" : classificationGroup} onChange={(event) => chooseClassificationGroup(event.target.value || classificationPrimaryGroup)} disabled={!classificationPrimaryGroup || secondaryGroups.length === 0}><option value="">Apply to the primary group</option>{secondaryGroups.map((entry) => <option key={entry.name} value={entry.name}>{entry.name} · {entry.itemCount} items</option>)}</select></label>
-        </>
-          : <label>Stock Item<select value={classificationItemGuid} onChange={(event) => {
-            const item = props.stores.stockItems.find((entry) => entry.tallyGuid === event.target.value);
-            setClassificationItemGuid(event.target.value);
-            setClassificationRole(item?.catalogRole ?? "OTHER");
-            setClassificationIgnored(item?.itemIgnored ?? false);
-          }}><option value="">Choose item…</option>{props.stores.stockItems.map((item) => <option key={item.tallyGuid} value={item.tallyGuid}>{item.name} · {[item.primaryGroupName, item.secondaryGroupName].filter(Boolean).join(" › ") || "Ungrouped"}</option>)}</select></label>}
-        <label>Catalog role<select value={classificationRole} onChange={(event) => setClassificationRole(event.target.value as CatalogRole)}>{Object.entries(roleLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>
-        <label className="bulk-receipt-exception"><input type="checkbox" checked={classificationIgnored} onChange={(event) => setClassificationIgnored(event.target.checked)} /> Ignored</label>
-      </div>
-      <div className="settings-actions"><button className="button" type="button" disabled={busy} onClick={() => void saveClassification()}>Save role and visibility</button></div>
+      <section className="catalog-edit-section">
+        <h3>Add to the catalog</h3>
+        <div className="catalog-edit-row">
+          <label>Type<select value={masterKind} onChange={(event) => { setMasterKind(event.target.value as MasterKind); setMasterParent(""); setItemCategory(""); }}><option value="GROUP">Stock Group</option><option value="CATEGORY">Stock Category</option><option value="ITEM">Stock Item</option></select></label>
+          <label>Name<input value={masterName} onChange={(event) => setMasterName(event.target.value)} placeholder={masterKind === "ITEM" ? "Stock Item name" : "New master name"} /></label>
+          <label>{masterKind === "ITEM" ? "Stock Group" : "Parent"}<select value={masterParent} onChange={(event) => setMasterParent(event.target.value)}><option value="">{masterKind === "ITEM" ? "Choose group…" : "Primary (top level)"}</option>{parentChoices.map((entry) => <option key={entry.name} value={entry.name}>{entry.path.join(" › ")}</option>)}</select></label>
+          {masterKind === "ITEM" && <label>Category<select value={itemCategory} onChange={(event) => setItemCategory(event.target.value)}><option value="">No category</option>{props.stores.stockCategories.map((entry) => <option key={entry.name} value={entry.name}>{entry.path.join(" › ")}</option>)}</select></label>}
+          <button className="button" type="button" disabled={busy || !masterName.trim() || (masterKind === "ITEM" && !masterParent)} onClick={() => void addMaster()}>Add</button>
+        </div>
+      </section>
 
-      <div className="table-scroll catalog-status-list">
-        <table><thead><tr><th>Primary group</th><th>Secondary group</th><th>Role</th><th>Items</th><th>Visibility</th></tr></thead><tbody>
-          {props.stores.catalogGroups.map((entry) => <tr key={entry.name}><td>{entry.primaryName}</td><td>{entry.type === "SECONDARY" ? entry.name : "—"}</td><td>{roleLabels[entry.role]}</td><td>{entry.itemCount}</td><td>{entry.ignored ? "Ignored" : "Tracked"}</td></tr>)}
-        </tbody></table>
-      </div>
-
-      <div className="catalog-status-grid">
-        <label>
-          Stock Item
-          <select value={itemGuid} onChange={(event) => {
-            const guid = event.target.value;
-            setItemGuid(guid);
-            setPrimaryGuid("");
-            setRenameName(props.stores.stockItems.find((item) => item.tallyGuid === guid)?.name ?? "");
-          }}>
-            <option value="">Select Stock Item…</option>
-            {activeItems.map((item) => (
-              <option key={item.tallyGuid} value={item.tallyGuid}>
-                {item.name} · local {item.localAvailableQuantity}
-              </option>
-            ))}
-          </select>
-        </label>
-        <label>
-          Mark as
-          <select value={action} onChange={(event) => { setAction(event.target.value as CatalogAction); setPrimaryGuid(""); }}>
-            <option value="DUPLICATE">Duplicate of another item</option>
-            <option value="OBSOLETE">Obsolete</option>
-          </select>
-        </label>
-        {action === "DUPLICATE" && (
-          <label>
-            Primary Stock Item
-            <select value={primaryGuid} onChange={(event) => setPrimaryGuid(event.target.value)}>
-              <option value="">Choose primary item…</option>
-              {primaryItems.map((item) => (
-                <option key={item.tallyGuid} value={item.tallyGuid}>{item.name}</option>
-              ))}
-            </select>
-          </label>
-        )}
-      </div>
-
-      {selected && (
-        <div className="catalog-rename-row">
-          <label>
-            Local display name
-            <input value={renameName} onChange={(event) => setRenameName(event.target.value)} />
-          </label>
-          <div>
-            <span>Tally currently: <strong>{selected.tallyName}</strong></span>
-            <button className="button button--secondary" type="button" disabled={busy || !renameName.trim() || renameName.trim() === selected.name} onClick={() => void rename()}>
-              Save local name
+      <section className="catalog-edit-section">
+        <h3>Stock Group visibility</h3>
+        <div className="catalog-group-chips">
+          {props.stores.catalogGroups.map((group) => (
+            <button
+              key={group.name}
+              className={`catalog-group-chip ${group.ignored ? "catalog-group-chip--ignored" : ""}`}
+              type="button"
+              disabled={busy}
+              onClick={() => void run(
+                () => window.desktop.stores.setCatalogVisibility({ groupName: group.name, ignored: !group.ignored }),
+                `${group.name} is now ${group.ignored ? "visible" : "ignored"}.`,
+              )}
+            >
+              <span>{group.path.join(" › ")}</span>
+              <strong>{group.ignored ? "Ignored" : "Visible"}</strong>
             </button>
-            {selected.name !== selected.tallyName && (
-              <button className="button button--ghost" type="button" disabled={busy} onClick={() => void restoreName(selected.tallyGuid, selected.tallyName)}>
-                Undo rename
-              </button>
-            )}
-          </div>
+          ))}
         </div>
-      )}
+      </section>
 
-      {selected && action === "DUPLICATE" && selected.localAvailableQuantity > 0 && (
-        <p className="catalog-status-warning">
-          This item has {selected.localAvailableQuantity} units. Bring its local count to zero before marking it as a duplicate.
-        </p>
-      )}
-
-      <div className="settings-actions">
-        <button
-          className="button"
-          type="button"
-          disabled={busy || !selected || (action === "DUPLICATE" && (!primaryGuid || selected.localAvailableQuantity > 0))}
-          onClick={() => void save()}
-        >
-          {busy ? "Saving…" : "Save catalog status"}
-        </button>
-        <button className="button button--secondary" type="button" disabled={busy} onClick={() => void exportCleanup()}>
-          Export Tally cleanup files
-        </button>
-      </div>
-
-      {changedItems.length > 0 && (
-        <div className="table-scroll catalog-status-list">
-          <table>
-            <thead><tr><th>Stock Item</th><th>Tally name</th><th>Role</th><th>Status</th><th>Primary item / stock rule</th><th /></tr></thead>
-            <tbody>
-              {changedItems.map((item) => (
-                <tr key={item.tallyGuid}>
-                  <td>{item.name}</td>
-                  <td>{item.tallyName}</td>
-                  <td>{roleLabels[item.catalogRole]}{item.ignored ? " · Ignored" : ""}</td>
-                  <td><span className={`review-status review-status--${item.catalogStatus === "ACTIVE" ? "renamed" : item.catalogStatus.toLocaleLowerCase()}`}>{item.catalogStatus === "ACTIVE" ? "RENAMED" : item.catalogStatus}</span></td>
-                  <td>
-                    {item.catalogStatus === "ACTIVE"
-                      ? "Local display name differs from Tally"
-                      : item.catalogStatus === "DUPLICATE"
-                      ? `Duplicate of ${item.duplicateOfName ?? "unknown item"}`
-                      : item.localAvailableQuantity > 0
-                        ? `${item.localAvailableQuantity} units remain · still selectable`
-                        : "No stock · hidden from selectors"}
-                  </td>
-                  <td className="table-actions">
-                    {item.catalogStatus !== "ACTIVE" && <button className="button button--ghost button--small" type="button" disabled={busy} onClick={() => void restore(item.tallyGuid, item.name)}>Undo status</button>}
-                    {item.name !== item.tallyName && <button className="button button--ghost button--small" type="button" disabled={busy} onClick={() => void restoreName(item.tallyGuid, item.tallyName)}>Undo rename</button>}
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
+      <section className="catalog-edit-section">
+        <h3>Rename or merge a duplicate</h3>
+        <div className="catalog-edit-row">
+          <label>Stock Item<select value={itemGuid} onChange={(event) => {
+            const guid = event.target.value;
+            const item = props.stores.stockItems.find((entry) => entry.tallyGuid === guid);
+            setItemGuid(guid);
+            setRenameName(item?.name ?? "");
+            setDuplicateGuid("");
+          }}><option value="">Choose item…</option>{editableItems.map((item) => <option key={item.tallyGuid} value={item.tallyGuid}>{item.name}</option>)}</select></label>
+          <label>New display name<input value={renameName} onChange={(event) => setRenameName(event.target.value)} disabled={!selected} /></label>
+          <button className="button button--secondary" type="button" disabled={busy || !selected || !renameName.trim() || renameName.trim() === selected.name} onClick={() => void rename()}>Rename</button>
+          <label>Duplicate of<select value={duplicateGuid} onChange={(event) => setDuplicateGuid(event.target.value)} disabled={!selected}><option value="">Choose primary item…</option>{duplicateTargets.map((item) => <option key={item.tallyGuid} value={item.tallyGuid}>{item.name}</option>)}</select></label>
+          <button className="button" type="button" disabled={busy || !selected || !duplicateGuid || selected.localAvailableQuantity > 0} onClick={() => void markDuplicate()}>Mark duplicate</button>
         </div>
-      )}
+        {selected && selected.localAvailableQuantity > 0 && duplicateGuid && <p className="catalog-status-warning">This item still has {selected.localAvailableQuantity} units and cannot be hidden as a duplicate.</p>}
+      </section>
+
+      {changedItems.length > 0 && <div className="table-scroll catalog-status-list">
+        <table><thead><tr><th>Edited item</th><th>Change</th><th /></tr></thead><tbody>
+          {changedItems.map((item) => <tr key={item.tallyGuid}><td><strong>{item.name}</strong><small className="table-subtext">{item.tallyName}</small></td><td>{item.catalogStatus === "DUPLICATE" ? `Duplicate of ${item.duplicateOfName ?? "unknown item"}` : "Local rename"}</td><td className="table-actions">
+            {item.catalogStatus === "DUPLICATE" && <button className="button button--ghost button--small" type="button" disabled={busy} onClick={() => void restoreDuplicate(item.tallyGuid, item.name)}>Restore</button>}
+            {item.name !== item.tallyName && <button className="button button--ghost button--small" type="button" disabled={busy} onClick={() => void run(() => window.desktop.stores.renameStockItem({ tallyItemGuid: item.tallyGuid, name: item.tallyName }), `${item.tallyName} restored.`)}>Undo rename</button>}
+          </td></tr>)}
+        </tbody></table>
+      </div>}
+
+      {(props.stores.catalogGroups.some((entry) => entry.source === "LOCAL") || props.stores.stockCategories.some((entry) => entry.source === "LOCAL")) && <details className="catalog-local-masters">
+        <summary>Manage locally created groups and categories</summary>
+        <div className="table-scroll"><table><thead><tr><th>Master</th><th>Path</th><th /></tr></thead><tbody>
+          {props.stores.catalogGroups.filter((entry) => entry.source === "LOCAL").map((entry) => <tr key={`group:${entry.name}`}><td>Stock Group</td><td>{entry.path.join(" › ")}</td><td><button className="button button--ghost button--small" type="button" disabled={busy} onClick={() => void run(() => window.desktop.stores.deleteCatalogGroup(entry.name), `${entry.name} deleted.`)}>Delete</button></td></tr>)}
+          {props.stores.stockCategories.filter((entry) => entry.source === "LOCAL").map((entry) => <tr key={`category:${entry.name}`}><td>Stock Category</td><td>{entry.path.join(" › ")}</td><td><button className="button button--ghost button--small" type="button" disabled={busy} onClick={() => void run(() => window.desktop.stores.deleteStockCategory(entry.name), `${entry.name} deleted.`)}>Delete</button></td></tr>)}
+        </tbody></table></div>
+      </details>}
     </article>
   );
 }

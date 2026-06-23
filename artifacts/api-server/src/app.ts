@@ -33,7 +33,21 @@ app.use(
   }),
 );
 
-app.use(cors());
+const allowedOrigins = new Set(
+  String(process.env.ALLOWED_WEB_ORIGINS ?? "")
+    .split(",")
+    .map((value) => value.trim())
+    .filter(Boolean),
+);
+app.use(cors({
+  origin(origin, callback) {
+    if (!origin || allowedOrigins.has(origin) || /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i.test(origin)) {
+      callback(null, true);
+      return;
+    }
+    callback(new Error("This browser origin is not allowed."));
+  },
+}));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 

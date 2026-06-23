@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -13,6 +13,7 @@ import { PlanningDatabase, warrantyStatusForSerial } from "../src/planning/datab
 import { traceabilityColumns } from "../src/renderer/traceability";
 import { parseBomWorkbook } from "../src/renderer/bom-import";
 import { retainedBackupPaths, StoresDatabase } from "../src/stores/database";
+import { CatalogExporter } from "../src/stores/catalog-exporter";
 import type { BulkVendorReceiptInput } from "../src/stores/types";
 
 interface Context {
@@ -43,6 +44,7 @@ function createContext(): Context {
   assert.ok(actor);
   const component = stores.createLocalStockItem({ name: "Test Component", parentName: "COMPONENTS" });
   const product = stores.createLocalStockItem({ name: "Test Product", parentName: "MANUFACTURED PRODUCTS" });
+  host.db.prepare("UPDATE tally_stock_items SET has_bom = 1 WHERE tally_guid = ?").run(product.tallyGuid);
   const supplierId = Number(host.db.prepare(
     "INSERT INTO suppliers(tally_guid, name, synced_at) VALUES (?, ?, ?)",
   ).run("SUPPLIER:TEST", "Test Supplier", new Date().toISOString()).lastInsertRowid);
@@ -143,43 +145,28 @@ test("production BOM parser detects product/version and uses component type for 
   assert.equal(parsed.rows[1].componentGuid, "CORD");
 });
 
-test("catalog group roles and item ignore overrides drive planning visibility", () => {
+test("catalog group visibility drives planning while products are derived from BOM evidence", () => {
   const context = createContext();
   try {
-    const timestamp = new Date().toISOString();
-    context.host.db.prepare(
-      "INSERT INTO tally_stock_groups(name, parent_name, active, synced_at) VALUES (?, ?, 1, ?)",
-    ).run("COMPONENTS", "Primary", timestamp);
-    context.host.db.prepare(
-      "INSERT INTO tally_stock_groups(name, parent_name, active, synced_at) VALUES (?, ?, 1, ?)",
-    ).run("RESISTORS", "COMPONENTS", timestamp);
+    context.stores.createCatalogGroup({ name: "COMPONENTS" });
+    context.stores.createCatalogGroup({ name: "RESISTORS", parentName: "COMPONENTS" });
     context.host.db.prepare(
       "UPDATE tally_stock_items SET parent_name = 'RESISTORS' WHERE tally_guid = ?",
     ).run(context.componentGuid);
-    context.stores.setCatalogClassification({
-      scope: "GROUP",
-      groupName: "MANUFACTURED PRODUCTS",
-      role: "FINISHED_PRODUCT",
-      ignored: false,
-    });
-    context.stores.setCatalogClassification({
-      scope: "GROUP",
+    context.stores.setCatalogVisibility({
       groupName: "COMPONENTS",
-      role: "COMPONENT",
       ignored: false,
     });
     let state = context.stores.getState();
-    assert.equal(state.stockItems.find((item) => item.tallyGuid === context.productGuid)?.catalogRole, "FINISHED_PRODUCT");
-    assert.equal(state.stockItems.find((item) => item.tallyGuid === context.componentGuid)?.catalogRole, "COMPONENT");
+    assert.equal(state.stockItems.find((item) => item.tallyGuid === context.productGuid)?.isProduct, true);
+    assert.equal(state.stockItems.find((item) => item.tallyGuid === context.componentGuid)?.isProduct, false);
     assert.equal(state.stockItems.find((item) => item.tallyGuid === context.componentGuid)?.primaryGroupName, "COMPONENTS");
     assert.equal(state.stockItems.find((item) => item.tallyGuid === context.componentGuid)?.secondaryGroupName, "RESISTORS");
     assert.ok(state.catalogGroups.some((group) => group.name === "COMPONENTS" && group.type === "PRIMARY"));
     assert.ok(state.catalogGroups.some((group) => group.name === "RESISTORS" && group.type === "SECONDARY" && group.primaryName === "COMPONENTS"));
 
-    context.stores.setCatalogClassification({
-      scope: "ITEM",
-      tallyItemGuid: context.componentGuid,
-      role: "ACCESSORY",
+    context.stores.setCatalogVisibility({
+      groupName: "COMPONENTS",
       ignored: true,
     });
     state = context.stores.getState();
@@ -190,18 +177,92 @@ test("catalog group roles and item ignore overrides drive planning visibility", 
   }
 });
 
-test("forgotten credentials can be reset and phones use a shared hidden audit identity", () => {
+test("local-first catalog builds nested groups and categories and exports complete Tally masters", () => {
   const context = createContext();
   try {
-    assert.throws(() => context.operations.forgotCredential({
+    context.stores.createCatalogGroup({ name: "Raw Material" });
+    context.stores.createCatalogGroup({ name: "ICs", parentName: "Raw Material" });
+    context.stores.createCatalogGroup({ name: "Import", parentName: "ICs" });
+    context.stores.createStockCategory({ name: "SMD" });
+    context.stores.createStockCategory({ name: "Fine Pitch", parentName: "SMD" });
+    const item = context.stores.createLocalStockItem({
+      name: "Test Imported IC",
+      parentName: "Import",
+      categoryName: "Fine Pitch",
+      baseUnits: "Nos",
+    });
+
+    let state = context.stores.getState();
+    const saved = state.stockItems.find((entry) => entry.tallyGuid === item.tallyGuid);
+    assert.deepEqual(saved?.groupPath, ["Raw Material", "ICs", "Import"]);
+    assert.equal(saved?.primaryGroupName, "Raw Material");
+    assert.equal(saved?.secondaryGroupName, "ICs");
+    assert.equal(saved?.categoryName, "Fine Pitch");
+    assert.equal(state.dataMode, "local");
+    assert.deepEqual(
+      state.stockCategories.find((entry) => entry.name === "Fine Pitch")?.path,
+      ["SMD", "Fine Pitch"],
+    );
+
+    context.stores.rememberTallyCompany({
+      company: "Fresh Inventory Company",
+      companyGuid: "COMPANY:FRESH",
+      syncedAt: new Date().toISOString(),
+    });
+    const result = new CatalogExporter(context.stores, path.join(context.directory, "exports")).generate();
+    const workbook = XLSX.readFile(result.workbookPath);
+    assert.ok(workbook.SheetNames.includes("Stock Groups"));
+    assert.ok(workbook.SheetNames.includes("Stock Categories"));
+    assert.ok(workbook.SheetNames.includes("Stock Items"));
+    assert.ok(result.renameXmlPath);
+    const masterXml = readFileSync(result.renameXmlPath, "utf8");
+    assert.match(masterXml, /<SVCURRENTCOMPANY>Fresh Inventory Company<\/SVCURRENTCOMPANY>/);
+    assert.ok(masterXml.indexOf('STOCKGROUP NAME="Raw Material"') < masterXml.indexOf('STOCKGROUP NAME="ICs"'));
+    assert.ok(masterXml.indexOf('STOCKGROUP NAME="ICs"') < masterXml.indexOf('STOCKGROUP NAME="Import"'));
+    assert.ok(masterXml.indexOf('STOCKCATEGORY NAME="Fine Pitch"') < masterXml.indexOf('STOCKITEM NAME="Test Imported IC"'));
+    assert.match(masterXml, /<CATEGORY>Fine Pitch<\/CATEGORY>/);
+
+    assert.throws(
+      () => context.stores.deleteCatalogGroup({ name: "Import" }),
+      /Move or delete Stock Item/,
+    );
+    context.stores.deleteStockItem({ tallyItemGuid: item.tallyGuid });
+    context.stores.deleteCatalogGroup({ name: "Import" });
+    context.stores.deleteStockCategory({ name: "Fine Pitch" });
+    state = context.stores.getState();
+    assert.equal(state.stockItems.some((entry) => entry.tallyGuid === item.tallyGuid), false);
+    assert.equal(state.catalogGroups.some((entry) => entry.name === "Import"), false);
+  } finally {
+    closeContext(context);
+  }
+});
+
+test("credential recovery uses one-time codes and paired phones have revocable identities", () => {
+  const context = createContext();
+  try {
+    assert.equal(context.operations.createRecoveryChallenge({
       username: "administrator",
       email: "wrong@example.com",
-      credential: "replacement-password",
-      credentialType: "PASSWORD",
-    }), /do not match/);
-    context.operations.forgotCredential({
+    }), null);
+    const challenge = context.operations.createRecoveryChallenge({
       username: "administrator",
       email: "administrator@example.com",
+    });
+    assert.ok(challenge);
+    assert.throws(() => context.operations.confirmRecovery({
+      username: "administrator",
+      email: "administrator@example.com",
+      code: "000000",
+      credential: "replacement-password",
+      credentialType: "PASSWORD",
+    }), /invalid or expired/);
+    assert.equal(Number((context.host.db.prepare(
+      "SELECT attempts FROM ops_recovery_challenges WHERE consumed_at IS NULL",
+    ).get() as { attempts: number }).attempts), 1);
+    context.operations.confirmRecovery({
+      username: "administrator",
+      email: "administrator@example.com",
+      code: challenge.code,
       credential: "replacement-password",
       credentialType: "PASSWORD",
     });
@@ -212,10 +273,14 @@ test("forgotten credentials can be reset and phones use a shared hidden audit id
     });
     assert.equal(session.user.username, "administrator");
     assert.equal(session.user.email, "administrator@example.com");
-    const phone = context.operations.sharedPhoneActor();
-    assert.equal(phone.displayName, "Phone scanner");
-    assert.equal(phone.role, "STORE");
-    assert.equal(context.operations.listUsers().some((user) => user.userId === phone.userId), false);
+    const pairing = context.operations.createScannerPairing("Stores phone 1", context.actor);
+    const claimed = context.operations.claimScannerPairing(pairing.pairingToken, "Stores phone 1");
+    const phone = context.operations.scannerActor(claimed.deviceToken);
+    assert.equal(phone?.displayName, "Stores phone 1");
+    assert.equal(phone?.role, "STORE");
+    assert.equal(context.operations.listUsers().some((user) => user.userId === phone?.userId), false);
+    context.operations.revokeScannerDevice(claimed.device.id, context.actor);
+    assert.equal(context.operations.scannerActor(claimed.deviceToken), null);
   } finally {
     closeContext(context);
   }
@@ -224,7 +289,7 @@ test("forgotten credentials can be reset and phones use a shared hidden audit id
 test("production-order tracker persists canonical stages, stage history, spreadsheet fields, and custom fields", () => {
   const context = createContext();
   try {
-    const product = context.stores.getState().stockItems.find((item) => item.catalogRole === "FINISHED_PRODUCT")
+    const product = context.stores.getState().stockItems.find((item) => item.isProduct)
       ?? context.stores.getState().stockItems[0];
     assert.ok(product);
     const field = context.planning.saveProductOrderFieldDefinition({ label: "Customer contact", type: "TEXT" });
@@ -410,7 +475,7 @@ test("migrations are additive and receipt splits keep only AVAILABLE in the lega
       faultySerialNumbers: ["F-1", "F-2"],
       faultReason: "Damaged on arrival",
     });
-    assert.equal(context.operations.moduleVersion, 4);
+    assert.equal(context.operations.moduleVersion, 5);
     assert.equal(balance(context, "AVAILABLE").quantity, 5);
     assert.equal(balance(context, "PENDING_INSPECTION").quantity, 3);
     assert.equal(balance(context, "FAULTY").quantity, 2);
@@ -433,13 +498,13 @@ test("migrations are additive and receipt splits keep only AVAILABLE in the lega
     const migrationRows = context.host.db.prepare(
       "SELECT version FROM application_module_migrations WHERE module_name = 'operations' ORDER BY version",
     ).all() as Array<{ version: number }>;
-    assert.deepEqual(migrationRows.map((row) => Number(row.version)), [1, 2, 3, 4]);
+    assert.deepEqual(migrationRows.map((row) => Number(row.version)), [1, 2, 3, 4, 5]);
   } finally {
     closeContext(context);
   }
 });
 
-test("phone Material In needs no product and non-production Material Out needs no destination", () => {
+test("Return found stock needs no product and non-production Material Out needs no destination", () => {
   const context = createContext();
   try {
     const materialIn = context.stores.recordMaterialInCorrection({

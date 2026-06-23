@@ -2,6 +2,8 @@ import AsyncStorage from "@react-native-async-storage/async-storage";
 
 const QUEUE_KEY = "inventory-scanner:stores-offline-queue:v1";
 const DEVICE_KEY = "inventory-scanner:stores-device-id:v1";
+const DEVICE_TOKEN_KEY = "inventory-scanner:stores-device-token:v1";
+const DEVICE_LABEL_KEY = "inventory-scanner:stores-device-label:v1";
 const CATALOG_PREFIX = "inventory-scanner:stores-catalog:v1:";
 const BOX_PREFIX = "inventory-scanner:stores-box:v1:";
 const MAX_QUEUE_ENTRIES = 2500;
@@ -26,6 +28,11 @@ export interface OfflineQueueSummary {
   total: number;
 }
 
+export interface OfflineQueueState {
+  queue: QueuedStoresOperation[];
+  summary: OfflineQueueSummary;
+}
+
 interface OfflineBatchResponse {
   results: Array<{
     clientTransactionId: string;
@@ -35,7 +42,7 @@ interface OfflineBatchResponse {
 }
 
 let storageChain: Promise<unknown> = Promise.resolve();
-let syncInFlight: Promise<OfflineQueueSummary> | null = null;
+let syncInFlight: Promise<OfflineQueueState> | null = null;
 
 function serialized<T>(work: () => Promise<T>): Promise<T> {
   const next = storageChain.then(work, work);
@@ -82,6 +89,25 @@ export async function storesDeviceId(): Promise<string> {
   return created;
 }
 
+export async function scannerDeviceToken(): Promise<string> {
+  return (await AsyncStorage.getItem(DEVICE_TOKEN_KEY)) ?? "";
+}
+
+export async function saveScannerPairing(deviceToken: string, deviceLabel: string): Promise<void> {
+  await AsyncStorage.multiSet([
+    [DEVICE_TOKEN_KEY, deviceToken],
+    [DEVICE_LABEL_KEY, deviceLabel],
+  ]);
+}
+
+export async function clearScannerPairing(): Promise<void> {
+  await AsyncStorage.multiRemove([DEVICE_TOKEN_KEY, DEVICE_LABEL_KEY]);
+}
+
+export async function scannerDeviceLabel(): Promise<string> {
+  return (await AsyncStorage.getItem(DEVICE_LABEL_KEY)) ?? "Phone scanner";
+}
+
 export async function createStoresClientTransactionId(): Promise<string> {
   const deviceId = await storesDeviceId();
   return `${deviceId}-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
@@ -124,17 +150,24 @@ export async function getStoresQueue(): Promise<QueuedStoresOperation[]> {
   return readQueue();
 }
 
-export async function removeStoresOperation(clientTransactionId: string): Promise<OfflineQueueSummary> {
+export async function getStoresQueueState(): Promise<OfflineQueueState> {
+  return serialized(async () => {
+    const queue = await readQueue();
+    return { queue, summary: summarize(queue) };
+  });
+}
+
+export async function removeStoresOperation(clientTransactionId: string): Promise<OfflineQueueState> {
   return serialized(async () => {
     const queue = await readQueue();
     const next = queue.filter((entry) => entry.clientTransactionId !== clientTransactionId);
     await writeQueue(next);
-    return summarize(next);
+    return { queue: next, summary: summarize(next) };
   });
 }
 
-export async function synchronizeStoresQueue(serverUrl: string): Promise<OfflineQueueSummary> {
-  if (!serverUrl) return getStoresQueueSummary();
+export async function synchronizeStoresQueue(serverUrl: string): Promise<OfflineQueueState> {
+  if (!serverUrl) return getStoresQueueState();
   if (syncInFlight) return syncInFlight;
 
   syncInFlight = serialized(async () => {
@@ -145,7 +178,10 @@ export async function synchronizeStoresQueue(serverUrl: string): Promise<Offline
 
       const response = await fetch(`${normalizedServerUrl(serverUrl)}/api/stores/offline-batch`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          "X-Scanner-Token": await scannerDeviceToken(),
+        },
         body: JSON.stringify({
           deviceId: await storesDeviceId(),
           operations: pending.map((entry) => ({
@@ -182,7 +218,7 @@ export async function synchronizeStoresQueue(serverUrl: string): Promise<Offline
       await writeQueue(queue);
       if (retryRequested) break;
     }
-    return summarize(queue);
+    return { queue, summary: summarize(queue) };
   }).finally(() => {
     syncInFlight = null;
   });

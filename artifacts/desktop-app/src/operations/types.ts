@@ -133,11 +133,30 @@ export interface LoginInput {
   deviceLabel?: string;
 }
 
-export interface ForgotCredentialInput {
+export interface RequestCredentialRecoveryInput {
   username: string;
   email: string;
+}
+
+export interface ConfirmCredentialRecoveryInput {
+  username: string;
+  email: string;
+  code: string;
   credential: string;
   credentialType?: "PASSWORD" | "PIN";
+}
+
+export interface ScannerDevice {
+  id: string;
+  label: string;
+  createdAt: string;
+  lastSeenAt: string | null;
+  revokedAt: string | null;
+}
+
+export interface ScannerPairing {
+  pairingToken: string;
+  expiresAt: string;
 }
 
 export interface SaveUserInput {

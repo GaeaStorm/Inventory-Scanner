@@ -3,6 +3,8 @@ import type {
   BulkVendorReceiptResult,
   ConfirmImportInput,
   CreateLocalStockItemInput,
+  CreateCatalogGroupInput,
+  CreateStockCategoryInput,
   DesktopInfo,
   DeploymentState,
   SaveDeploymentInput,
@@ -14,7 +16,7 @@ import type {
   ReviewDecisionInput,
   SaveBoxInput,
   SetCatalogStatusInput,
-  SetCatalogClassificationInput,
+  SetCatalogVisibilityInput,
   GeneratedExportFile,
   StoresBackupResult,
   StoresRestoreResult,
@@ -45,7 +47,8 @@ import type {
   CreateCountSessionInput,
   RecordCountEntryInput,
   FinalizeCountInput,
-  ForgotCredentialInput,
+  ConfirmCredentialRecoveryInput,
+  RequestCredentialRecoveryInput,
   ProductionReturnInput,
   SupplierReturnInput,
   CustomerReturnInput,
@@ -55,6 +58,8 @@ import type {
   ProductionCompletionInput,
   ResolveSyncExceptionInput,
   ReverseMovementInput,
+  ScannerDevice,
+  ScannerPairing,
 } from "./types";
 
 export {};
@@ -73,7 +78,8 @@ declare global {
         bootstrap: (input: BootstrapAdminInput) => Promise<AuthSession>;
         login: (input: LoginInput) => Promise<AuthSession>;
         updateEmail: (input: { email: string }) => Promise<import("../operations/types").AuthUser>;
-        forgotPassword: (input: ForgotCredentialInput) => Promise<void>;
+        requestRecovery: (input: RequestCredentialRecoveryInput) => Promise<void>;
+        confirmRecovery: (input: ConfirmCredentialRecoveryInput) => Promise<void>;
         resume: (token: string) => Promise<AuthSession>;
         logout: () => Promise<void>;
         token: () => string;
@@ -96,8 +102,13 @@ declare global {
       stores: {
         getState: () => Promise<StoresState>;
         createLocalStockItem: (input: CreateLocalStockItemInput) => Promise<StoresState>;
+        deleteLocalStockItem: (tallyItemGuid: string) => Promise<StoresState>;
+        createCatalogGroup: (input: CreateCatalogGroupInput) => Promise<StoresState>;
+        deleteCatalogGroup: (name: string) => Promise<StoresState>;
+        createStockCategory: (input: CreateStockCategoryInput) => Promise<StoresState>;
+        deleteStockCategory: (name: string) => Promise<StoresState>;
         setCatalogStatus: (input: SetCatalogStatusInput) => Promise<StoresState>;
-        setCatalogClassification: (input: SetCatalogClassificationInput) => Promise<StoresState>;
+        setCatalogVisibility: (input: SetCatalogVisibilityInput) => Promise<StoresState>;
         renameStockItem: (input: RenameStockItemInput) => Promise<StoresState>;
         exportCatalogCleanup: () => Promise<CatalogCleanupExportResult>;
         saveBox: (input: SaveBoxInput) => Promise<StoresBox>;
@@ -114,6 +125,11 @@ declare global {
         openPath: (targetPath: string) => Promise<string>;
         listGeneratedFiles: () => Promise<GeneratedExportFile[]>;
         downloadGeneratedFile: (sourcePath: string) => Promise<string | null>;
+      };
+      scanners: {
+        createPairing: (label: string) => Promise<ScannerPairing>;
+        list: () => Promise<ScannerDevice[]>;
+        revoke: (deviceId: string) => Promise<void>;
       };
       planning: {
         getState: () => Promise<PlanningState>;

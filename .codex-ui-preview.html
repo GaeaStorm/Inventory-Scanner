@@ -1,0 +1,37 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <link rel="stylesheet" href="/artifacts/desktop-app/src/renderer/styles.css">
+  <style>body{padding:24px;background:#f4f6fa}.preview{max-width:1180px;margin:auto;display:grid;gap:24px}</style>
+</head>
+<body>
+<main class="preview">
+  <article class="panel">
+    <div class="panel__header"><div><p class="eyebrow">PHONE CONNECTION</p><h2>Pair a scanner</h2></div></div>
+    <div class="scanner-settings">
+      <div class="scanner-qr-card"><div style="width:230px;height:230px;background:repeating-linear-gradient(45deg,#111 0 8px,#fff 8px 16px)"></div></div>
+      <div class="scanner-address-controls">
+        <label>Desktop API address<select><option>http://192.168.1.20:5000</option></select></label>
+        <label>Scanner name<input value="Stores phone 1"></label>
+        <button class="button button--secondary">Create pairing QR</button>
+      </div>
+    </div>
+  </article>
+  <article class="panel catalog-status-panel">
+    <div class="panel__header"><div><p class="eyebrow">CATALOG EDITS</p><h2>Structure, visibility, names, and duplicates</h2></div><button class="button button--secondary">Export Tally masters</button></div>
+    <section class="catalog-edit-section"><h3>Add to the catalog</h3><div class="catalog-edit-row">
+      <label>Type<select><option>Stock Group</option></select></label><label>Name<input placeholder="New master name"></label><label>Parent<select><option>Primary (top level)</option></select></label><button class="button">Add</button>
+    </div></section>
+    <section class="catalog-edit-section"><h3>Stock Group visibility</h3><div class="catalog-group-chips">
+      <button class="catalog-group-chip"><span>Raw Material › ICs</span><strong>Visible</strong></button>
+      <button class="catalog-group-chip catalog-group-chip--ignored"><span>Old Components</span><strong>Ignored</strong></button>
+      <button class="catalog-group-chip"><span>Finished Goods</span><strong>Visible</strong></button>
+    </div></section>
+    <section class="catalog-edit-section"><h3>Rename or merge a duplicate</h3><div class="catalog-edit-row">
+      <label>Stock Item<select><option>LM358</option></select></label><label>New display name<input value="LM358"></label><button class="button button--secondary">Rename</button><label>Duplicate of<select><option>Choose primary item…</option></select></label><button class="button">Mark duplicate</button>
+    </div></section>
+  </article>
+</main>
+</body>
+</html>

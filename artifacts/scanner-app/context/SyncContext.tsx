@@ -9,9 +9,12 @@ import React, {
 } from "react";
 
 import {
-  getStoresQueueSummary,
-  getStoresQueue,
+  getStoresQueueState,
+  clearScannerPairing,
   removeStoresOperation,
+  saveScannerPairing,
+  scannerDeviceLabel,
+  scannerDeviceToken,
   synchronizeStoresQueue,
   type OfflineQueueSummary,
   type QueuedStoresOperation,
@@ -63,10 +66,13 @@ async function canReachServer(url: string): Promise<boolean> {
 
 interface SyncContextType {
   serverUrl: string;
+  deviceLabel: string;
+  paired: boolean;
   queueSummary: OfflineQueueSummary;
   queue: QueuedStoresOperation[];
   pendingCount: number;
   setServerUrl: (url: string) => Promise<void>;
+  pairScanner: (input: { url: string; pairingToken: string; deviceLabel?: string }) => Promise<void>;
   syncPending: () => Promise<OfflineQueueSummary>;
   refreshQueue: () => Promise<OfflineQueueSummary>;
   removeQueuedTransaction: (clientTransactionId: string) => Promise<OfflineQueueSummary>;
@@ -77,30 +83,34 @@ const SyncContext = createContext<SyncContextType | null>(null);
 
 export function SyncProvider({ children }: { children: React.ReactNode }) {
   const [serverUrl, setServerUrlState] = useState("");
+  const [deviceLabel, setDeviceLabel] = useState("");
+  const [paired, setPaired] = useState(false);
   const [queueSummary, setQueueSummary] = useState<OfflineQueueSummary>(EMPTY_QUEUE);
   const [queue, setQueue] = useState<QueuedStoresOperation[]>([]);
 
   const refreshQueue = useCallback(async () => {
-    const summary = await getStoresQueueSummary();
-    setQueue(await getStoresQueue());
-    setQueueSummary(summary);
-    setQueue(await getStoresQueue());
-    return summary;
+    const state = await getStoresQueueState();
+    setQueue(state.queue);
+    setQueueSummary(state.summary);
+    return state.summary;
   }, []);
 
   const syncPending = useCallback(async () => {
-    const summary = serverUrl
+    const state = serverUrl
       ? await synchronizeStoresQueue(serverUrl)
-      : await getStoresQueueSummary();
-    setQueueSummary(summary);
-    return summary;
+      : await getStoresQueueState();
+    setQueue(state.queue);
+    setQueueSummary(state.summary);
+    return state.summary;
   }, [serverUrl]);
 
   useEffect(() => {
     let cancelled = false;
     void (async () => {
-      const [storedUrl] = await Promise.all([
+      const [storedUrl, storedToken, storedLabel] = await Promise.all([
         AsyncStorage.getItem(SERVER_URL_KEY),
+        scannerDeviceToken(),
+        scannerDeviceLabel(),
         AsyncStorage.removeItem(LEGACY_TRANSACTIONS_KEY),
       ]);
       let resolvedUrl = storedUrl;
@@ -113,8 +123,11 @@ export function SyncProvider({ children }: { children: React.ReactNode }) {
       }
       if (cancelled) return;
       if (resolvedUrl) setServerUrlState(resolvedUrl);
-      setQueueSummary(await getStoresQueueSummary());
-      setQueue(await getStoresQueue());
+      setPaired(Boolean(storedToken));
+      setDeviceLabel(storedLabel);
+      const state = await getStoresQueueState();
+      setQueueSummary(state.summary);
+      setQueue(state.queue);
     })();
     return () => {
       cancelled = true;
@@ -131,7 +144,38 @@ export function SyncProvider({ children }: { children: React.ReactNode }) {
   const setServerUrl = useCallback(async (url: string) => {
     const normalizedUrl = normalizeServerUrl(url);
     setServerUrlState(normalizedUrl);
-    await AsyncStorage.setItem(SERVER_URL_KEY, normalizedUrl);
+    setPaired(false);
+    setDeviceLabel("");
+    await Promise.all([
+      AsyncStorage.setItem(SERVER_URL_KEY, normalizedUrl),
+      clearScannerPairing(),
+    ]);
+  }, []);
+
+  const pairScanner = useCallback(async (input: { url: string; pairingToken: string; deviceLabel?: string }) => {
+    const normalizedUrl = normalizeServerUrl(input.url);
+    const label = input.deviceLabel?.trim() || await scannerDeviceLabel();
+    const response = await fetch(`${normalizedUrl}/api/scanners/claim`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ pairingToken: input.pairingToken, deviceLabel: label }),
+    });
+    const body = await response.json().catch(() => ({})) as {
+      deviceToken?: string;
+      device?: { label?: string };
+      error?: string;
+    };
+    if (!response.ok || !body.deviceToken) {
+      throw new Error(body.error || "The scanner pairing request was rejected.");
+    }
+    const savedLabel = body.device?.label || label;
+    await Promise.all([
+      AsyncStorage.setItem(SERVER_URL_KEY, normalizedUrl),
+      saveScannerPairing(body.deviceToken, savedLabel),
+    ]);
+    setServerUrlState(normalizedUrl);
+    setDeviceLabel(savedLabel);
+    setPaired(true);
   }, []);
 
   const testConnection = useCallback(
@@ -140,20 +184,23 @@ export function SyncProvider({ children }: { children: React.ReactNode }) {
   );
 
   const removeQueuedTransaction = useCallback(async (clientTransactionId: string) => {
-    const summary = await removeStoresOperation(clientTransactionId);
-    setQueueSummary(summary);
-    setQueue(await getStoresQueue());
-    return summary;
+    const state = await removeStoresOperation(clientTransactionId);
+    setQueueSummary(state.summary);
+    setQueue(state.queue);
+    return state.summary;
   }, []);
 
   return (
     <SyncContext.Provider
       value={{
         serverUrl,
+        deviceLabel,
+        paired,
         queueSummary,
         queue,
         pendingCount: queueSummary.pending,
         setServerUrl,
+        pairScanner,
         syncPending,
         refreshQueue,
         removeQueuedTransaction,

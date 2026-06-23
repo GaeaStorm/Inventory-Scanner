@@ -27,6 +27,7 @@ import {
   enqueueStoresOperation,
   loadCachedStoresBox,
   loadCachedStoresCatalog,
+  scannerDeviceToken,
 } from "@/lib/storesOfflineQueue";
 
 const DEBOUNCE_MS = 2000;
@@ -34,8 +35,6 @@ const MAX_BOX_ITEMS = 5;
 
 type Workflow = "MATERIAL_OUT" | "ADJUSTMENT";
 type MaterialOutPurpose = "PRODUCTION" | "SERVICING" | "CUSTOMER_EXTRAS";
-type AdjustmentDirection = "RETURN_TO_STOCK" | "ADDITIONAL_OUT";
-type AdjustmentReason = "UNUSED_MATERIAL" | "MISCOUNT" | "DATA_ENTRY_ERROR" | "DAMAGE_OR_LOSS" | "OTHER";
 
 interface CatalogItem {
   id: number;
@@ -63,33 +62,6 @@ interface CatalogResponse {
   stockItems: CatalogItem[];
   destinations: CatalogItem[];
 }
-
-interface AdjustmentContext {
-  materialOutVoucherId: string;
-  eventDate: string;
-  issuedItemName: string;
-  destinationName: string;
-  pendingQuantity: number;
-  latestMovementId: string;
-  latestMovementQuantity: number;
-  latestMovementCreatedAt: string;
-  status: string;
-  tallyVoucherNumber: string;
-}
-
-interface AdjustmentReasonOption {
-  id: AdjustmentReason;
-  name: string;
-  detail: string;
-}
-
-const ADJUSTMENT_REASONS: AdjustmentReasonOption[] = [
-  { id: "UNUSED_MATERIAL", name: "Unused material", detail: "Material was issued but not consumed." },
-  { id: "MISCOUNT", name: "Miscount", detail: "The physical count was entered or observed incorrectly." },
-  { id: "DATA_ENTRY_ERROR", name: "Data-entry error", detail: "The earlier issued quantity was entered incorrectly." },
-  { id: "DAMAGE_OR_LOSS", name: "Damage or loss", detail: "Stock is unavailable because it was damaged or lost." },
-  { id: "OTHER", name: "Other", detail: "A different reason; notes are required." },
-];
 
 function text(value: unknown): string {
   return String(value ?? "").trim();
@@ -149,9 +121,11 @@ class ApiRequestError extends Error {
 
 async function apiRequest<T>(serverUrl: string, path: string, init?: RequestInit): Promise<T> {
   if (!serverUrl) throw new Error("No desktop server is configured. Scan the connection QR in Settings first.");
+  const deviceToken = await scannerDeviceToken();
+  if (!deviceToken) throw new Error("This phone is not paired. Scan a new pairing QR in Settings.");
   const response = await fetch(`${normalizedServerUrl(serverUrl)}${path}`, {
     ...init,
-    headers: { "Content-Type": "application/json", ...init?.headers },
+    headers: { "Content-Type": "application/json", "X-Scanner-Token": deviceToken, ...init?.headers },
   });
   const body = await response.json().catch(() => ({})) as { error?: string };
   if (!response.ok) {
@@ -211,13 +185,6 @@ export default function BoxScannerScreen() {
   const [materialOutPurpose, setMaterialOutPurpose] = useState<MaterialOutPurpose>("PRODUCTION");
   const [quantity, setQuantity] = useState("1");
   const [destination, setDestination] = useState<CatalogItem | null>(null);
-  const [adjustmentDirection, setAdjustmentDirection] = useState<AdjustmentDirection>("RETURN_TO_STOCK");
-  const [adjustmentReason, setAdjustmentReason] = useState<AdjustmentReasonOption>(ADJUSTMENT_REASONS[0]);
-  const [adjustmentNote, setAdjustmentNote] = useState("");
-  const [adjustmentConfirmed, setAdjustmentConfirmed] = useState(false);
-  const [adjustmentContext, setAdjustmentContext] = useState<AdjustmentContext | null>(null);
-  const [adjustmentContextError, setAdjustmentContextError] = useState("");
-  const [loadingAdjustmentContext, setLoadingAdjustmentContext] = useState(false);
   const [warning, setWarning] = useState("");
   const [error, setError] = useState("");
   const [success, setSuccess] = useState("");
@@ -231,49 +198,6 @@ export default function BoxScannerScreen() {
       candidate.tallyGuid === item.tallyItemGuid || candidate.name.toLocaleLowerCase() === item.itemName.toLocaleLowerCase(),
     )).filter((value): value is CatalogItem => Boolean(value));
   }, [box, catalog]);
-
-  useEffect(() => {
-    if (workflow !== "ADJUSTMENT" || !selectedItem || !destination || !serverUrl) {
-      setAdjustmentContext(null);
-      setAdjustmentContextError("");
-      setLoadingAdjustmentContext(false);
-      return;
-    }
-
-    let cancelled = false;
-    setLoadingAdjustmentContext(true);
-    setAdjustmentContext(null);
-    setAdjustmentContextError("");
-    const query = [
-      `tallyItemGuid=${encodeURIComponent(selectedItem.tallyGuid)}`,
-      `destinationTallyItemGuid=${encodeURIComponent(destination.tallyGuid)}`,
-      `eventDate=${encodeURIComponent(today())}`,
-    ].join("&");
-    void apiRequest<AdjustmentContext>(
-      serverUrl,
-      `/api/stores/adjustment-context?${query}`,
-    ).then((context) => {
-      if (!cancelled) setAdjustmentContext(context);
-    }).catch((reason: unknown) => {
-      if (!cancelled) {
-        if (reason instanceof ApiRequestError) {
-          setConnectionState("online");
-          setAdjustmentContextError(reason.message);
-        } else {
-          setConnectionState("offline");
-          setAdjustmentContextError(
-            `Desktop unavailable. This adjustment can still be queued and will be validated against the latest matching issue when synchronization resumes. ${reason instanceof Error ? reason.message : String(reason)}`,
-          );
-        }
-      }
-    }).finally(() => {
-      if (!cancelled) setLoadingAdjustmentContext(false);
-    });
-
-    return () => {
-      cancelled = true;
-    };
-  }, [workflow, selectedItem, destination, serverUrl]);
 
   const handleBarcodeScanned = useCallback(async ({ data }: { data: string }) => {
     const now = Date.now();
@@ -289,12 +213,6 @@ export default function BoxScannerScreen() {
     setSelectedItem(null); setDestination(null);
     setWorkflow("MATERIAL_OUT"); setQuantity("1");
     setMaterialOutPurpose("PRODUCTION");
-    setAdjustmentDirection("RETURN_TO_STOCK");
-    setAdjustmentReason(ADJUSTMENT_REASONS[0]);
-    setAdjustmentNote("");
-    setAdjustmentConfirmed(false);
-    setAdjustmentContext(null);
-    setAdjustmentContextError("");
 
     try {
       const scannedBox = parseQr(data);
@@ -400,10 +318,6 @@ export default function BoxScannerScreen() {
     setError("");
     setSuccess("");
     try {
-      if (workflow === "ADJUSTMENT") {
-        setAdjustmentDirection("RETURN_TO_STOCK");
-      }
-
       const clientTransactionId = await createStoresClientTransactionId();
       const payload = workflow === "MATERIAL_OUT"
         ? {
@@ -422,7 +336,7 @@ export default function BoxScannerScreen() {
             quantity: qty,
             direction: "RETURN_TO_STOCK" as const,
             reason: "OTHER" as const,
-            note: "New Material In entry",
+            note: "Return found stock recorded by paired Stores scanner.",
             eventDate: today(),
           };
 
@@ -441,7 +355,7 @@ export default function BoxScannerScreen() {
           ? `Saved safely on this phone. ${synchronized.pending} transaction${synchronized.pending === 1 ? "" : "s"} still waiting to synchronize.`
           : workflow === "MATERIAL_OUT"
             ? "Material Out synchronized with supplier-aware FIFO."
-            : "Adjustment synchronized and validated by the desktop.");
+            : "Return found stock synchronized with the desktop.");
       } catch {
         setConnectionState("offline");
         await refreshQueue();
@@ -491,14 +405,14 @@ export default function BoxScannerScreen() {
               {usingCachedData ? <Text style={styles.offlineNotice}>Offline mode · cached box/catalog · {queueSummary.pending} waiting to sync</Text> : null}
               {queueSummary.rejected > 0 ? <Text style={styles.error}>{queueSummary.rejected} queued transaction{queueSummary.rejected === 1 ? "" : "s"} need review after the desktop rejected them.</Text> : null}
               {error ? <Text style={styles.error}>{error}</Text> : null}
-              {catalog && <Dropdown label="ITEM IN BOX" value={selectedItem} values={boxCatalogItems} display={(item) => item.name} detail={(item) => `Available ${item.localAvailableQuantity}`} onChange={(item) => { setSelectedItem(item); setAdjustmentConfirmed(false); }} colors={c} required />}
+              {catalog && <Dropdown label="ITEM IN BOX" value={selectedItem} values={boxCatalogItems} display={(item) => item.name} detail={(item) => `Available ${item.localAvailableQuantity}`} onChange={setSelectedItem} colors={c} required />}
 
               <View style={styles.section}>
                 <Text style={[styles.label, { color: c.mutedForeground }]}>STORE WORKFLOW</Text>
                 <View style={styles.workflowWrap}>{([
                   ["MATERIAL_OUT", "Material Out", "upload"],
-                  ["ADJUSTMENT", "Material In", "download"],
-                ] as const).map(([value, label, icon]) => <TouchableOpacity key={value} style={[styles.workflowButton, { borderColor: workflow === value ? colors.light.primary : c.border, backgroundColor: workflow === value ? colors.light.primary : c.background }]} onPress={() => { setWorkflow(value); setError(""); setAdjustmentConfirmed(false); if (value === "ADJUSTMENT") setDestination(null); }}><Feather name={icon} size={15} color={workflow === value ? "#fff" : c.foreground} /><Text style={[styles.workflowText, { color: workflow === value ? "#fff" : c.foreground }]}>{label}</Text></TouchableOpacity>)}</View>
+                  ["ADJUSTMENT", "Return found stock", "download"],
+                ] as const).map(([value, label, icon]) => <TouchableOpacity key={value} style={[styles.workflowButton, { borderColor: workflow === value ? colors.light.primary : c.border, backgroundColor: workflow === value ? colors.light.primary : c.background }]} onPress={() => { setWorkflow(value); setError(""); if (value === "ADJUSTMENT") setDestination(null); }}><Feather name={icon} size={15} color={workflow === value ? "#fff" : c.foreground} /><Text style={[styles.workflowText, { color: workflow === value ? "#fff" : c.foreground }]}>{label}</Text></TouchableOpacity>)}</View>
               </View>
 
               {workflow === "MATERIAL_OUT" && <View style={styles.section}>
@@ -510,9 +424,9 @@ export default function BoxScannerScreen() {
                 ] as const).map(([value, label]) => <TouchableOpacity key={value} style={[styles.workflowButton, { borderColor: materialOutPurpose === value ? colors.light.primary : c.border, backgroundColor: materialOutPurpose === value ? colors.light.primary : c.background }]} onPress={() => { setMaterialOutPurpose(value); setError(""); if (value !== "PRODUCTION") setDestination(null); }}><Text style={[styles.workflowText, { color: materialOutPurpose === value ? "#fff" : c.foreground }]}>{label}</Text></TouchableOpacity>)}</View>
               </View>}
 
-              {workflow === "MATERIAL_OUT" && materialOutPurpose === "PRODUCTION" && catalog && <Dropdown label="DESTINATION PRODUCT" value={destination} values={catalog.destinations} display={(item) => item.name} detail={(item) => item.hasBom ? "Has BOM" : item.parentName} onChange={(item) => { setDestination(item); setAdjustmentConfirmed(false); }} colors={c} required />}
+              {workflow === "MATERIAL_OUT" && materialOutPurpose === "PRODUCTION" && catalog && <Dropdown label="DESTINATION PRODUCT" value={destination} values={catalog.destinations} display={(item) => item.name} detail={(item) => item.hasBom ? "Has BOM" : item.parentName} onChange={setDestination} colors={c} required />}
 
-              {workflow === "ADJUSTMENT" && <Text style={styles.offlineNotice}>Use Material In only when extra stock was previously taken out and has now been found. No product is associated with this entry.</Text>}
+              {workflow === "ADJUSTMENT" && <Text style={styles.offlineNotice}>Use this only for physical stock that has been found and must be returned to available inventory. It records a fixed “Return found stock” audit note and is not matched to a product or earlier issue.</Text>}
 
               <View style={styles.section}><Text style={[styles.label, { color: c.mutedForeground }]}>QUANTITY (WHOLE COUNT) *</Text><View style={styles.stepper}><TouchableOpacity style={[styles.stepButton, { backgroundColor: c.muted }]} onPress={() => setQuantity(String(Math.max(1, Number(quantity || 1) - 1)))}><Feather name="minus" size={20} color={c.foreground} /></TouchableOpacity><TextInput value={quantity} onChangeText={(value) => /^\d*$/.test(value) && setQuantity(value)} keyboardType="number-pad" selectTextOnFocus style={[styles.quantityInput, { color: c.foreground, borderColor: c.border, backgroundColor: c.background }]} /><TouchableOpacity style={[styles.stepButton, { backgroundColor: c.muted }]} onPress={() => setQuantity(String(Number(quantity || 0) + 1))}><Feather name="plus" size={20} color={c.foreground} /></TouchableOpacity></View></View>
 

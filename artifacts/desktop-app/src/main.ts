@@ -1,4 +1,5 @@
 import { copyFileSync, existsSync, readdirSync, statSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import type { Server } from "node:http";
 import type { AddressInfo } from "node:net";
@@ -118,16 +119,34 @@ async function startApi(): Promise<DesktopInfo> {
   // module reads its initial location when it is loaded.
   process.env.EXCEL_PATH = excelPath;
 
-  const { default: inventoryApi } = await import("../../api-server/src/app");
+  const { default: dashboardRouter } = await import("../../api-server/src/routes/dashboard");
   const desktopApi = express();
 
   desktopApi.use(express.json({ limit: "2mb" }));
   desktopApi.use(express.urlencoded({ extended: true }));
-  desktopApi.use((_request, response, next) => {
-    response.setHeader("Access-Control-Allow-Origin", "*");
-    response.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Inventory-Session");
+  desktopApi.use((request, response, next) => {
+    const origin = request.header("origin");
+    if (origin) {
+      let allowed = false;
+      try {
+        const parsed = new URL(origin);
+        const requestHost = String(request.header("host") ?? "").split(":")[0];
+        allowed = parsed.hostname === requestHost
+          || ["127.0.0.1", "localhost"].includes(parsed.hostname)
+          || process.env.INVENTORY_ALLOWED_WEB_ORIGINS?.split(",").map((value) => value.trim()).includes(origin) === true;
+      } catch {
+        allowed = false;
+      }
+      if (!allowed) {
+        response.status(403).json({ error: "This browser origin is not allowed to access Inventory Scanner." });
+        return;
+      }
+      response.setHeader("Access-Control-Allow-Origin", origin);
+      response.setHeader("Vary", "Origin");
+    }
+    response.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Inventory-Session, X-Scanner-Token");
     response.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS");
-    if (_request.method === "OPTIONS") {
+    if (request.method === "OPTIONS") {
       response.sendStatus(204);
       return;
     }
@@ -135,6 +154,33 @@ async function startApi(): Promise<DesktopInfo> {
   });
 
   if (!storesService || !operationsService) throw new Error("The Local Stores Database is unavailable.");
+  const sensitiveRateWindows = new Map<string, { startedAt: number; count: number }>();
+  desktopApi.use((request, response, next) => {
+    const sensitive = request.method === "POST" && [
+      "/api/scanners/claim",
+      "/api/operations/auth/login",
+      "/api/operations/auth/recovery/request",
+      "/api/operations/auth/recovery/confirm",
+    ].includes(request.path);
+    if (!sensitive) {
+      next();
+      return;
+    }
+    const key = `${request.ip}:${request.path}`;
+    const now = Date.now();
+    const current = sensitiveRateWindows.get(key);
+    const window = !current || now - current.startedAt >= 15 * 60_000
+      ? { startedAt: now, count: 0 }
+      : current;
+    window.count += 1;
+    sensitiveRateWindows.set(key, window);
+    if (window.count > 10) {
+      response.setHeader("Retry-After", "900");
+      response.status(429).json({ error: "Too many authentication attempts. Wait 15 minutes and retry." });
+      return;
+    }
+    next();
+  });
   const requireHttpPermission = (permission: Permission) => (request: Request, _response: Response, next: NextFunction) => {
     try {
       const token = String(request.header("x-inventory-session") ?? request.header("authorization") ?? "")
@@ -148,7 +194,60 @@ async function startApi(): Promise<DesktopInfo> {
   };
   desktopApi.use("/api/dashboard", requireHttpPermission("INVENTORY_VIEW"));
   desktopApi.use("/api/workbook", requireHttpPermission("SETTINGS_MANAGE"));
+  desktopApi.get("/api/healthz", (_request, response) => response.json({ status: "ok" }));
+  desktopApi.get("/api/connect/qr.svg", (_request, response) => {
+    response.status(410).json({ error: "URL-only scanner setup is disabled. Create a one-time pairing QR in Desktop Settings." });
+  });
+  desktopApi.post("/api/scanners/claim", (request, response) => {
+    response.status(201).json(operationsService!.claimScannerPairing(
+      String(request.body?.pairingToken ?? ""),
+      String(request.body?.deviceLabel ?? ""),
+    ));
+  });
+  desktopApi.post("/api/scanners/pairing", requireHttpPermission("SETTINGS_MANAGE"), (request, response) => {
+    response.status(201).json(operationsService!.createScannerPairing(
+      String(request.body?.label ?? ""),
+      operationsService!.requireActor(
+        String(request.header("x-inventory-session") ?? "").trim(),
+        "SETTINGS_MANAGE",
+      ),
+    ));
+  });
+  desktopApi.get("/api/scanners", requireHttpPermission("SETTINGS_MANAGE"), (request, response) => {
+    response.json(operationsService!.listScannerDevices(operationsService!.requireActor(
+      String(request.header("x-inventory-session") ?? "").trim(),
+      "SETTINGS_MANAGE",
+    )));
+  });
+  desktopApi.delete("/api/scanners/:deviceId", requireHttpPermission("SETTINGS_MANAGE"), (request, response) => {
+    operationsService!.revokeScannerDevice(String(request.params.deviceId ?? ""), operationsService!.requireActor(
+      String(request.header("x-inventory-session") ?? "").trim(),
+      "SETTINGS_MANAGE",
+    ));
+    response.status(204).end();
+  });
   desktopApi.use("/api/operations", createOperationsRouter(operationsService));
+  const scannerRateWindows = new Map<string, { startedAt: number; count: number }>();
+  desktopApi.use("/api/stores", (request, response, next) => {
+    if (!["POST", "PUT", "PATCH", "DELETE"].includes(request.method) || !request.header("x-scanner-token")) {
+      next();
+      return;
+    }
+    const key = createHash("sha256").update(request.header("x-scanner-token") ?? "").digest("hex");
+    const now = Date.now();
+    const current = scannerRateWindows.get(key);
+    const window = !current || now - current.startedAt >= 60_000
+      ? { startedAt: now, count: 0 }
+      : current;
+    window.count += 1;
+    scannerRateWindows.set(key, window);
+    if (window.count > 120) {
+      response.setHeader("Retry-After", "60");
+      response.status(429).json({ error: "This scanner sent too many changes. Wait one minute and retry." });
+      return;
+    }
+    next();
+  });
   desktopApi.use("/api/stores", createStoresRouter(storesService, operationsService));
   if (!planningService) throw new Error("The Planning service is unavailable.");
   desktopApi.use("/api/planning", createPlanningRouter(planningService, operationsService));
@@ -228,10 +327,10 @@ async function startApi(): Promise<DesktopInfo> {
       unit: "count",
     })));
   });
-  desktopApi.use(inventoryApi);
+  desktopApi.use(dashboardRouter);
   desktopApi.use((error: unknown, _request: Request, response: Response, _next: NextFunction) => {
     const message = error instanceof Error ? error.message : String(error);
-    response.status(/sign in|permission/i.test(message) ? 401 : 400).json({ error: message });
+    response.status(/sign in|permission|not paired|revoked/i.test(message) ? 401 : 400).json({ error: message });
   });
 
   const requestedPort = preferredPort();
@@ -356,9 +455,13 @@ function registerIpcHandlers(): void {
     if (!operationsService) throw new Error("The inventory operations service is unavailable.");
     return operationsService.updateOwnEmail(input as never, requireActor(token));
   });
-  ipcMain.handle("auth:forgot-password", (_event, input: unknown) => {
+  ipcMain.handle("auth:request-recovery", async (_event, input: unknown) => {
     if (!operationsService) throw new Error("The inventory operations service is unavailable.");
-    return operationsService.forgotCredential(input as never);
+    return operationsService.requestCredentialRecovery(input as never);
+  });
+  ipcMain.handle("auth:confirm-recovery", (_event, input: unknown) => {
+    if (!operationsService) throw new Error("The inventory operations service is unavailable.");
+    return operationsService.confirmCredentialRecovery(input as never);
   });
   ipcMain.handle("auth:resume", (_event, token: unknown) => {
     if (!operationsService) throw new Error("The inventory operations service is unavailable.");
@@ -367,6 +470,18 @@ function registerIpcHandlers(): void {
   ipcMain.handle("auth:logout", (_event, token: unknown) => {
     if (!operationsService) throw new Error("The inventory operations service is unavailable.");
     operationsService.logout(String(token ?? ""));
+  });
+  ipcMain.handle("scanners:create-pairing", (_event, token: unknown, label: unknown) => {
+    if (!operationsService) throw new Error("Scanner pairing is unavailable.");
+    return operationsService.createScannerPairing(String(label ?? ""), requireActor(token, "SETTINGS_MANAGE"));
+  });
+  ipcMain.handle("scanners:list", (_event, token: unknown) => {
+    if (!operationsService) throw new Error("Scanner pairing is unavailable.");
+    return operationsService.listScannerDevices(requireActor(token, "SETTINGS_MANAGE"));
+  });
+  ipcMain.handle("scanners:revoke", (_event, token: unknown, deviceId: unknown) => {
+    if (!operationsService) throw new Error("Scanner pairing is unavailable.");
+    operationsService.revokeScannerDevice(String(deviceId ?? ""), requireActor(token, "SETTINGS_MANAGE"));
   });
 
   ipcMain.handle("desktop:print-html", async (_event, token: unknown, html: unknown) => {
@@ -441,13 +556,33 @@ function registerIpcHandlers(): void {
     if (!storesService) throw new Error("The Local Stores Database is unavailable.");
     return storesService.createLocalStockItem(input as never, requireActor(token, "CATALOG_MANAGE"));
   });
+  ipcMain.handle("stores:delete-local-stock-item", (_event, token: unknown, tallyItemGuid: unknown) => {
+    if (!storesService) throw new Error("The Local Stores Database is unavailable.");
+    return storesService.deleteStockItem({ tallyItemGuid: String(tallyItemGuid ?? "") }, requireActor(token, "CATALOG_MANAGE"));
+  });
+  ipcMain.handle("stores:create-catalog-group", (_event, token: unknown, input: unknown) => {
+    if (!storesService) throw new Error("The Local Stores Database is unavailable.");
+    return storesService.createCatalogGroup(input as never, requireActor(token, "CATALOG_MANAGE"));
+  });
+  ipcMain.handle("stores:delete-catalog-group", (_event, token: unknown, name: unknown) => {
+    if (!storesService) throw new Error("The Local Stores Database is unavailable.");
+    return storesService.deleteCatalogGroup({ name: String(name ?? "") }, requireActor(token, "CATALOG_MANAGE"));
+  });
+  ipcMain.handle("stores:create-stock-category", (_event, token: unknown, input: unknown) => {
+    if (!storesService) throw new Error("The Local Stores Database is unavailable.");
+    return storesService.createStockCategory(input as never, requireActor(token, "CATALOG_MANAGE"));
+  });
+  ipcMain.handle("stores:delete-stock-category", (_event, token: unknown, name: unknown) => {
+    if (!storesService) throw new Error("The Local Stores Database is unavailable.");
+    return storesService.deleteStockCategory({ name: String(name ?? "") }, requireActor(token, "CATALOG_MANAGE"));
+  });
   ipcMain.handle("stores:set-catalog-status", (_event, token: unknown, input: unknown) => {
     if (!storesService) throw new Error("The Local Stores Database is unavailable.");
     return storesService.setCatalogStatus(input as never, requireActor(token, "CATALOG_MANAGE"));
   });
-  ipcMain.handle("stores:set-catalog-classification", (_event, token: unknown, input: unknown) => {
+  ipcMain.handle("stores:set-catalog-visibility", (_event, token: unknown, input: unknown) => {
     if (!storesService) throw new Error("The Local Stores Database is unavailable.");
-    return storesService.setCatalogClassification(input as never, requireActor(token, "CATALOG_MANAGE"));
+    return storesService.setCatalogVisibility(input as never, requireActor(token, "CATALOG_MANAGE"));
   });
   ipcMain.handle("stores:rename-stock-item", (_event, token: unknown, input: unknown) => {
     if (!storesService) throw new Error("The Local Stores Database is unavailable.");
@@ -455,7 +590,7 @@ function registerIpcHandlers(): void {
   });
   ipcMain.handle("stores:export-catalog-cleanup", (_event, token: unknown) => {
     if (!storesService) throw new Error("The Local Stores Database is unavailable.");
-    return storesService.exportCatalogCleanup(requireActor(token, "CATALOG_MANAGE"));
+    return storesService.exportCatalogCleanup(requireActor(token));
   });
   ipcMain.handle("stores:save-box", (_event, token: unknown, input: unknown) => {
     if (!storesService) throw new Error("The Local Stores Database is unavailable.");
@@ -796,7 +931,6 @@ async function bootstrap(): Promise<void> {
   storesService = new StoresService(app.getPath("userData"), applicationDatabase);
   operationsService = new OperationsService(applicationDatabase, storesService);
   storesService.bindOperations(operationsService);
-  storesService.ensureDemoData();
   operationsService.database.reconcileLegacyLots();
   planningService = new PlanningService(applicationDatabase, storesService);
   operationsService.bindPlanning(planningService);

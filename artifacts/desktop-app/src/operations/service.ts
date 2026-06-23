@@ -4,12 +4,12 @@ import type { PlanningService } from "../planning/service";
 import type {
   ActorContext,
   BootstrapAdminInput,
+  ConfirmCredentialRecoveryInput,
   ConditionTransitionInput,
   CreateCountSessionInput,
   CreateFaultInput,
   CustomerReturnInput,
   FinalizeCountInput,
-  ForgotCredentialInput,
   LoginInput,
   Permission,
   ProductionCompletionInput,
@@ -17,6 +17,7 @@ import type {
   ProductionReturnInput,
   ReceiveCustomerReturnInput,
   RecordCountEntryInput,
+  RequestCredentialRecoveryInput,
   ResetCredentialInput,
   ResolveFaultInput,
   ResolveSyncExceptionInput,
@@ -28,6 +29,7 @@ import type {
 } from "./types";
 import { requirePermission } from "./permissions";
 import { OperationsDatabase } from "./database";
+import { recoveryEmailConfigured, sendRecoveryCode } from "./mailer";
 
 export class OperationsService {
   readonly database: OperationsDatabase;
@@ -62,8 +64,18 @@ export class OperationsService {
     return this.database.login(input);
   }
 
-  forgotCredential(input: ForgotCredentialInput) {
-    return this.database.forgotCredential(input);
+  async requestCredentialRecovery(input: RequestCredentialRecoveryInput): Promise<void> {
+    if (!recoveryEmailConfigured()) {
+      throw new Error(
+        "Credential recovery email is not configured on the Production computer. Ask an administrator to set the Gmail app password.",
+      );
+    }
+    const challenge = this.database.createRecoveryChallenge(input);
+    if (challenge) await sendRecoveryCode(challenge.email, challenge.code);
+  }
+
+  confirmCredentialRecovery(input: ConfirmCredentialRecoveryInput): void {
+    this.database.confirmRecovery(input);
   }
 
   updateOwnEmail(input: { email: string }, actor: ActorContext) {
@@ -72,6 +84,12 @@ export class OperationsService {
 
   sharedPhoneActor() {
     return this.database.sharedPhoneActor();
+  }
+
+  scannerActor(deviceToken: string) {
+    const actor = this.database.scannerActor(deviceToken);
+    if (!actor) throw new Error("This scanner is not paired or has been revoked.");
+    return actor;
   }
 
   resume(token: string) {
@@ -92,6 +110,25 @@ export class OperationsService {
 
   resetCredential(input: ResetCredentialInput, actor: ActorContext) {
     return this.database.resetCredential(input, actor);
+  }
+
+  createScannerPairing(label: string, actor: ActorContext) {
+    requirePermission(actor, "SETTINGS_MANAGE");
+    return this.database.createScannerPairing(label, actor);
+  }
+
+  claimScannerPairing(pairingToken: string, deviceLabel?: string) {
+    return this.database.claimScannerPairing(pairingToken, deviceLabel);
+  }
+
+  listScannerDevices(actor: ActorContext) {
+    requirePermission(actor, "SETTINGS_MANAGE");
+    return this.database.listScannerDevices();
+  }
+
+  revokeScannerDevice(deviceId: string, actor: ActorContext) {
+    requirePermission(actor, "SETTINGS_MANAGE");
+    this.database.revokeScannerDevice(deviceId, actor);
   }
 
   getState(actor: ActorContext) {

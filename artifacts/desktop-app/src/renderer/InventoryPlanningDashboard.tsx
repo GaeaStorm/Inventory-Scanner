@@ -62,6 +62,7 @@ export default function InventoryPlanningDashboard({
           planning={planning}
           stores={stores}
           onChanged={onPlanningChanged}
+          onStoresChanged={onStoresChanged}
           onNavigate={setSection}
           onNotice={onNotice}
           onError={onError}

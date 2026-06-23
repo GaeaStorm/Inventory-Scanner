@@ -80,7 +80,31 @@ function obsoleteRows(items: StoresStockItem[]): Row[] {
     }));
 }
 
-function buildMasterXml(companyName: string, renameEntries: Row[], localItems: StoresStockItem[]): string {
+function buildMasterXml(
+  companyName: string,
+  renameEntries: Row[],
+  localGroups: ReturnType<StoresDatabase["getState"]>["catalogGroups"],
+  localCategories: ReturnType<StoresDatabase["getState"]>["stockCategories"],
+  localItems: StoresStockItem[],
+): string {
+  const groupMessages = localGroups
+    .sort((left, right) => left.level - right.level || left.name.localeCompare(right.name))
+    .map((group) => `
+        <TALLYMESSAGE xmlns:UDF="TallyUDF">
+          <STOCKGROUP NAME="${xml(group.name)}" ACTION="Create">
+            <NAME>${xml(group.name)}</NAME>
+            <PARENT>${xml(group.parentName || "Primary")}</PARENT>
+          </STOCKGROUP>
+        </TALLYMESSAGE>`).join("");
+  const categoryMessages = localCategories
+    .sort((left, right) => left.level - right.level || left.name.localeCompare(right.name))
+    .map((category) => `
+        <TALLYMESSAGE xmlns:UDF="TallyUDF">
+          <STOCKCATEGORY NAME="${xml(category.name)}" ACTION="Create">
+            <NAME>${xml(category.name)}</NAME>
+            <PARENT>${xml(category.parentName || "Primary")}</PARENT>
+          </STOCKCATEGORY>
+        </TALLYMESSAGE>`).join("");
   const renameMessages = renameEntries.map((row) => `
         <TALLYMESSAGE xmlns:UDF="TallyUDF">
           <STOCKITEM NAME="${xml(row["Tally Current Name"])}" ACTION="Alter">
@@ -96,7 +120,8 @@ function buildMasterXml(companyName: string, renameEntries: Row[], localItems: S
           <STOCKITEM NAME="${xml(item.name)}" ACTION="Create">
             <NAME>${xml(item.name)}</NAME>
             <PARENT>${xml(item.parentName)}</PARENT>
-            <BASEUNITS>Nos</BASEUNITS>
+            ${item.categoryName ? `<CATEGORY>${xml(item.categoryName)}</CATEGORY>` : ""}
+            <BASEUNITS>${xml(item.baseUnits || "Nos")}</BASEUNITS>
           </STOCKITEM>
         </TALLYMESSAGE>`).join("");
   return `<?xml version="1.0" encoding="utf-8"?>
@@ -113,7 +138,7 @@ function buildMasterXml(companyName: string, renameEntries: Row[], localItems: S
         <REPORTNAME>All Masters</REPORTNAME>
         <STATICVARIABLES><SVCURRENTCOMPANY>${xml(companyName)}</SVCURRENTCOMPANY></STATICVARIABLES>
       </REQUESTDESC>
-      <REQUESTDATA>${createMessages}${renameMessages}
+      <REQUESTDATA>${groupMessages}${categoryMessages}${createMessages}${renameMessages}
       </REQUESTDATA>
     </IMPORTDATA>
   </BODY>
@@ -134,14 +159,18 @@ export class CatalogExporter {
     const duplicates = duplicateRows(state.stockItems);
     const obsolete = obsoleteRows(state.stockItems);
     const localItems = state.stockItems.filter((item) => item.source === "LOCAL" && item.catalogStatus === "ACTIVE");
+    const localGroups = state.catalogGroups.filter((group) => group.source === "LOCAL");
+    const localCategories = state.stockCategories.filter((category) => category.source === "LOCAL");
     const stockItemRows: Row[] = state.stockItems.map((item) => ({
       "Stock Item Name": item.name,
       "Current Tally Name": item.tallyName,
       "Tally GUID": item.tallyGuid,
       Group: item.parentName,
+      "Group Path": item.groupPath.join(" > "),
+      "Stock Category": item.categoryName,
+      "Base Units": item.baseUnits,
       Source: item.source,
       Status: item.catalogStatus,
-      "Catalog Role": item.catalogRole,
       Ignored: item.ignored ? "Yes" : "No",
       Active: item.active ? "Yes" : "No",
       "Has BOM": item.hasBom ? "Yes" : "No",
@@ -186,32 +215,47 @@ export class CatalogExporter {
     const exportFolder = this.database.getExportFolder(this.defaultExportFolder);
     mkdirSync(exportFolder, { recursive: true });
     const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-    const base = `inventory-scanner-catalog-cleanup-${stamp}`;
+    const base = `inventory-scanner-tally-masters-${stamp}`;
     const workbookPath = path.join(exportFolder, `${base}.xlsx`);
-    const renameXmlPath = importableRenames.length + localItems.length > 0 ? path.join(exportFolder, `${base}-masters.xml`) : null;
+    const renameXmlPath = importableRenames.length + localItems.length + localGroups.length + localCategories.length > 0
+      ? path.join(exportFolder, `${base}-masters.xml`)
+      : null;
 
     const workbook = XLSX.utils.book_new();
     workbook.Props = {
-      Title: "Inventory Scanner - Tally Catalog Cleanup",
-      Subject: "Complete Tally master sync: Stock Items, renames, duplicates, obsolete items, and BOMs",
+      Title: "Inventory Scanner - Tally Inventory Masters",
+      Subject: "Complete Tally master sync: Stock Groups, Stock Categories, Stock Items, renames, and BOMs",
       Author: "Inventory Scanner",
       CreatedDate: new Date(),
     };
     appendSheet(workbook, "Instructions", [
       { Step: 1, Action: "Back up the Tally company.", Source: XML_IMPORT_HELP },
-      { Step: 2, Action: "Review Stock Items, Renames, and Active BOMs. Local Stock Items and Tally-backed renames are included in the companion XML.", Source: XML_SCHEMA_HELP },
+      { Step: 2, Action: "Review Stock Groups, Stock Categories, Stock Items, Renames, and Active BOMs. Local masters and Tally-backed renames are included in the companion XML.", Source: XML_SCHEMA_HELP },
       { Step: 3, Action: "Use Alt+O > Import > Masters. Select the XML and choose Modify with new data.", Source: XML_IMPORT_HELP },
       { Step: 4, Action: "Import or map Active BOMs from the workbook after their Stock Items exist in Tally. Review duplicates with Accounts.", Source: STOCK_ITEM_HELP },
       { Step: 5, Action: "Review Obsolete items manually because historic masters may still be referenced.", Source: STOCK_ITEM_HELP },
       { Step: 6, Action: "After Tally changes, run Tally Sync in Inventory Scanner.", Source: EXCEL_IMPORT_HELP },
     ], [8, 78, 55]);
-    appendSheet(workbook, "Stock Items", stockItemRows, [34, 34, 42, 28, 14, 16, 22, 12, 12, 12, 24]);
-    appendSheet(workbook, "Group Roles", state.catalogGroups.map((group) => ({
-      "Tally Group": group.name,
-      "Catalog Role": group.role,
+    appendSheet(workbook, "Stock Groups", state.catalogGroups.map((group) => ({
+      "Stock Group": group.name,
+      Parent: group.parentName || "Primary",
+      "Full Path": group.path.join(" > "),
+      Level: group.level,
+      Source: group.source,
       Ignored: group.ignored ? "Yes" : "No",
       "Stock Item Count": group.itemCount,
-    })), [36, 24, 12, 20]);
+      "Included in Master XML": group.source === "LOCAL" ? "Yes" : "Already in Tally",
+    })), [34, 34, 54, 10, 14, 12, 20, 24]);
+    appendSheet(workbook, "Stock Categories", state.stockCategories.map((category) => ({
+      "Stock Category": category.name,
+      Parent: category.parentName || "Primary",
+      "Full Path": category.path.join(" > "),
+      Level: category.level,
+      Source: category.source,
+      "Stock Item Count": category.itemCount,
+      "Included in Master XML": category.source === "LOCAL" ? "Yes" : "Already in Tally",
+    })), [34, 34, 54, 10, 14, 20, 24]);
+    appendSheet(workbook, "Stock Items", stockItemRows, [34, 34, 42, 28, 54, 28, 14, 14, 16, 22, 12, 12, 12, 24]);
     appendSheet(workbook, "Active BOMs", bomRows.map((row) => ({
       Product: row.product_name,
       "Product Tally GUID": row.product_guid,
@@ -277,7 +321,11 @@ export class CatalogExporter {
     XLSX.writeFile(workbook, workbookPath, { bookType: "xlsx", compression: true });
 
     if (renameXmlPath) {
-      writeFileSync(renameXmlPath, buildMasterXml(state.companyName, importableRenames, localItems), "utf8");
+      writeFileSync(
+        renameXmlPath,
+        buildMasterXml(state.companyName, importableRenames, localGroups, localCategories, localItems),
+        "utf8",
+      );
     }
 
     const warnings: string[] = [];
@@ -296,6 +344,9 @@ export class CatalogExporter {
     return {
       workbookPath,
       renameXmlPath,
+      groupCount: localGroups.length,
+      categoryCount: localCategories.length,
+      itemCount: localItems.length,
       renameCount: renames.length,
       duplicateCount: duplicates.length,
       obsoleteCount: obsolete.length,

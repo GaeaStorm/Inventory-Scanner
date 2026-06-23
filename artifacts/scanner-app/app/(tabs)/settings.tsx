@@ -79,7 +79,10 @@ export default function SettingsScreen() {
   const insets = useSafeAreaInsets();
   const {
     serverUrl,
+    deviceLabel,
+    paired,
     setServerUrl,
+    pairScanner,
     pendingCount,
     queueSummary,
     syncPending,
@@ -122,13 +125,13 @@ export default function SettingsScreen() {
     }
   };
 
-  const handleQrServerUrl = async (url: string) => {
-    setUrlDraft(url);
+  const handleQrPairing = async (input: { url: string; pairingToken: string; deviceLabel?: string }) => {
+    setUrlDraft(input.url);
     setTestResult(null);
     setIsSaving(true);
 
-    await setServerUrl(url);
-    const ok = await testConnection(url);
+    await pairScanner(input);
+    const ok = await testConnection(input.url);
 
     setTestResult(ok ? "ok" : "fail");
     setIsSaving(false);
@@ -141,8 +144,8 @@ export default function SettingsScreen() {
     Alert.alert(
       ok ? "Connected" : "Address saved",
       ok
-        ? `Inventory Scanner is connected to ${url}.`
-        : `The address ${url} was saved, but the server could not be reached. Check that both devices are on the same network.`,
+        ? `Inventory Scanner paired this phone as ${input.deviceLabel || "Phone scanner"}.`
+        : `Pairing was saved, but ${input.url} could not be reached. Check that both devices are on the same network.`,
     );
   };
 
@@ -173,11 +176,12 @@ export default function SettingsScreen() {
       <ServerQrScanner
         visible={isQrScannerOpen}
         onCancel={() => setIsQrScannerOpen(false)}
-        onServerUrl={handleQrServerUrl}
+        onPairing={handleQrPairing}
       />
 
       {/* Server URL */}
       <Section title="SERVER CONNECTION">
+        <Row icon={paired ? "shield" : "alert-triangle"} label="Scanner identity" value={paired ? deviceLabel : "Not paired"} accent={paired ? colors.light.stockIn : colors.light.stockOut} />
         <View style={styles.urlInputWrapper}>
           <Feather
             name="server"
@@ -326,7 +330,7 @@ export default function SettingsScreen() {
             },
             {
               icon: "info",
-              text: "Scan the setup QR shown in the laptop dashboard",
+              text: "Scan a one-time pairing QR from Desktop Settings",
             },
             {
               icon: "file-text",

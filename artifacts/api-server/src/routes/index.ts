@@ -8,6 +8,8 @@ const router: IRouter = Router();
 
 router.use(healthRouter);
 router.use(productsRouter);
-router.use(transactionsRouter);
+if (process.env.ENABLE_LEGACY_TRANSACTIONS === "true") {
+  router.use(transactionsRouter);
+}
 
 export default router;

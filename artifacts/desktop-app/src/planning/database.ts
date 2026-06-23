@@ -1338,32 +1338,33 @@ export class PlanningDatabase {
       "SELECT name, parent_name FROM tally_stock_groups WHERE active = 1",
     ).all() as Row[]).map((row) => [text(row.name).toLocaleLowerCase(), text(row.parent_name)]));
     const groupSettings = new Map((this.db.prepare(
-      "SELECT group_name, catalog_role, ignored FROM catalog_group_settings",
+      "SELECT group_name, ignored FROM catalog_group_settings",
     ).all() as Row[]).map((row) => [text(row.group_name).toLocaleLowerCase(), {
-      role: text(row.catalog_role),
       ignored: Number(row.ignored) === 1,
     }]));
     const splitGroup = (directName: string) => {
+      const path: string[] = [];
       let current = directName;
       const visited = new Set<string>();
       for (;;) {
         const key = current.toLocaleLowerCase();
         if (visited.has(key)) break;
         visited.add(key);
+        path.unshift(current);
         const parent = groupParents.get(key) ?? "";
         if (!parent || parent.toLocaleLowerCase() === "primary") break;
         current = parent;
       }
       return {
-        primaryGroupName: current,
-        secondaryGroupName: current.toLocaleLowerCase() === directName.toLocaleLowerCase() ? "" : directName,
+        path,
+        primaryGroupName: path[0] ?? "",
+        secondaryGroupName: path[1] ?? "",
       };
     };
     const rows = this.db.prepare(`
       SELECT item.id, item.tally_guid,
         COALESCE(NULLIF(item.local_name_override, ''), item.name) AS name,
         item.parent_name, item.source, item.catalog_status,
-        item.catalog_role_override,
         policy.planning_method, policy.reorder_point, policy.target_stock,
         policy.service_reserve, policy.preferred_supplier_id,
         supplier.name AS preferred_supplier_name, policy.lead_time_days,
@@ -1389,11 +1390,10 @@ export class PlanningDatabase {
     `).all() as Row[];
     return rows.map((row) => {
       const groups = splitGroup(text(row.parent_name));
-      const primarySettings = groupSettings.get(groups.primaryGroupName.toLocaleLowerCase());
-      const secondarySettings = groups.secondaryGroupName
-        ? groupSettings.get(groups.secondaryGroupName.toLocaleLowerCase())
-        : undefined;
-      if (primarySettings?.ignored || secondarySettings?.ignored) return null;
+      const pathSettings = groups.path
+        .map((name) => groupSettings.get(name.toLocaleLowerCase()))
+        .filter((value) => value !== undefined);
+      if (pathSettings.some((settings) => settings?.ignored)) return null;
       const configured = row.planning_method != null;
       const lookbackDays = Number(row.usage_lookback_days ?? 90);
       const averageDailyUsage = this.usageForItem(Number(row.id), lookbackDays);
@@ -1447,7 +1447,6 @@ export class PlanningDatabase {
         secondaryGroupName: groups.secondaryGroupName,
         catalogSource: row.source === "LOCAL" ? "LOCAL" : "TALLY",
         catalogStatus: obsolete ? "OBSOLETE" : "ACTIVE",
-        catalogRole: (text(row.catalog_role_override) || secondarySettings?.role || primarySettings?.role || "OTHER") as RestockPlanningItem["catalogRole"],
         planningMethod: row.planning_method ?? "MANUAL",
         reorderPoint,
         targetStock,

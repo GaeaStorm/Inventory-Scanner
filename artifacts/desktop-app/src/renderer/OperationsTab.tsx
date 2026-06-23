@@ -76,7 +76,7 @@ function ItemPicker({ stores, value, onChange, labelText = "Stock item", include
 }) {
   const [search, setSearch] = useState("");
   const items = stores.stockItems.filter((item) => !item.ignored && (includeInactive || item.active))
-    .filter((item) => role === "FINISHED_PRODUCT" ? item.catalogRole === "FINISHED_PRODUCT" : role === "MATERIAL" ? item.catalogRole !== "FINISHED_PRODUCT" : true)
+    .filter((item) => role === "FINISHED_PRODUCT" ? item.isProduct : role === "MATERIAL" ? !item.isProduct : true)
     .filter((item) =>
     !search.trim() || `${item.name} ${item.primaryGroupName} ${item.secondaryGroupName}`.toLocaleLowerCase().includes(search.trim().toLocaleLowerCase()));
   return <div className="search-picker"><label>{labelText}<input placeholder="Filter items…" value={search} onChange={(event) => setSearch(event.target.value)} /></label><select aria-label={labelText} value={value} onChange={(event) => onChange(event.target.value)}><option value="">Select…</option>{items.map((item) => <option key={item.tallyGuid} value={item.tallyGuid}>{item.name} · {[item.primaryGroupName, item.secondaryGroupName].filter(Boolean).join(" › ") || "Ungrouped"}</option>)}</select></div>;

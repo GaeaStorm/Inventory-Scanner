@@ -13,6 +13,7 @@ interface Props {
   planning: PlanningState;
   stores: StoresState;
   onChanged: (state: PlanningState) => void;
+  onStoresChanged: (state: StoresState) => void;
   onNavigate: (section: "boms" | "orders") => void;
   onNotice: (message: string) => void;
   onError: (message: string) => void;
@@ -41,13 +42,14 @@ export default function RestockActionCenter({
   planning,
   stores,
   onChanged,
+  onStoresChanged,
   onNavigate,
   onNotice,
   onError,
 }: Props) {
   const [search, setSearch] = useState("");
   const finishedProducts = useMemo(
-    () => stores.stockItems.filter((item) => !item.ignored && item.catalogRole === "FINISHED_PRODUCT" && item.catalogStatus !== "DUPLICATE"),
+    () => stores.stockItems.filter((item) => !item.ignored && item.isProduct && item.catalogStatus !== "DUPLICATE"),
     [stores.stockItems],
   );
   const [productGuid, setProductGuid] = useState("");
@@ -141,6 +143,26 @@ export default function RestockActionCenter({
     await perform(() => window.desktop.planning.saveRestockPolicy(draft), "Restock policy saved locally.");
   }
 
+  async function setObsolete(obsolete: boolean) {
+    if (!selected) return;
+    setBusy(true);
+    onError("");
+    try {
+      const next = await window.desktop.stores.setCatalogStatus({
+        tallyItemGuid: selected.tallyItemGuid,
+        status: obsolete ? "OBSOLETE" : "ACTIVE",
+      });
+      onStoresChanged(next);
+      onNotice(obsolete
+        ? `${selected.itemName} is now obsolete. Set its long-term target stock below.`
+        : `${selected.itemName} was restored to the active catalog.`);
+    } catch (error) {
+      onError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   const obsoleteNeedsRestock = planning.items.filter((item) => item.catalogStatus === "OBSOLETE" && item.targetStock === 0).length;
   return (
     <div className="planning-section-stack">
@@ -226,6 +248,9 @@ export default function RestockActionCenter({
           </div>
           <div className="policy-footer">
             <button className="button" disabled={busy} type="button" onClick={() => void savePolicy()}>Save policy</button>
+            <button className="button button--secondary" disabled={busy} type="button" onClick={() => void setObsolete(selected.catalogStatus !== "OBSOLETE")}>
+              {selected.catalogStatus === "OBSOLETE" ? "Restore active item" : "Mark Stock Item obsolete"}
+            </button>
             {selected.catalogStatus === "OBSOLETE" && <div className="recommendation-actions"><span>{selected.yearsOfStock == null ? "No usage history available for a years-of-stock estimate." : `Current stock covers about ${selected.yearsOfStock.toFixed(1)} years.`}</span><button className="button button--secondary" type="button" onClick={() => setDraft({ ...draft, targetStock: selected.suggestedObsoleteTarget })}>Use 3.5-year target ({selected.suggestedObsoleteTarget})</button></div>}
           </div>
         </article>

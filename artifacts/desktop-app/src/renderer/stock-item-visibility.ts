@@ -11,9 +11,9 @@ export function operationalStockItems(items: StoresStockItem[]): StoresStockItem
 }
 
 export function finishedProductItems(items: StoresStockItem[]): StoresStockItem[] {
-  return operationalStockItems(items).filter((item) => item.catalogRole === "FINISHED_PRODUCT");
+  return operationalStockItems(items).filter((item) => item.isProduct);
 }
 
 export function materialStockItems(items: StoresStockItem[]): StoresStockItem[] {
-  return operationalStockItems(items).filter((item) => item.catalogRole !== "FINISHED_PRODUCT");
+  return operationalStockItems(items).filter((item) => !item.isProduct);
 }
