@@ -89,7 +89,7 @@ export default function TallyTab({ stores, operations, localFiles = true, onChan
       setSettings((current) => ({ ...current, company: result.snapshot.company }));
       setNotice(result.state.dataMode === "demo"
         ? "Tally returned no Stock Items. The built-in demo catalog remains active."
-        : `Imported ${result.summary.stockItemsImported} Stock Items, ${result.summary.suppliersImported} suppliers, ${result.summary.openPurchaseOrdersImported} open POs, and ${result.summary.historicalGrnsImported} new historical GRNs after scanning ${result.summary.historicalVouchersScanned} vouchers.`);
+        : `Imported ${result.summary.stockItemsImported} Stock Items, ${result.summary.suppliersImported} suppliers, ${result.summary.openPurchaseOrdersImported} supplier POs, ${result.orderImport.imported} new Production Order line${result.orderImport.imported === 1 ? "" : "s"} from Tally Sales Orders, and ${result.summary.historicalGrnsImported} new historical GRNs. ${result.orderImport.skipped} existing order line${result.orderImport.skipped === 1 ? " was" : "s were"} left unchanged${result.orderImport.unmatched ? `; ${result.orderImport.unmatched} could not be matched to a product` : ""}.`);
     } catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)); }
     finally { setBusy(""); }
   }
@@ -212,7 +212,7 @@ export default function TallyTab({ stores, operations, localFiles = true, onChan
           </div>
           <div className="settings-actions"><button className="button button--secondary" disabled={Boolean(busy)} type="button" onClick={() => void testConnection()}>{busy === "test" ? "Testing…" : "Test connection"}</button><button className="button" disabled={Boolean(busy) || !settings.company} type="button" onClick={() => void sync()}>{busy === "sync" ? "Reading complete history…" : "Sync Stores Catalog and history"}</button></div>
           <div className="read-only-note"><strong>Company deployment:</strong> this app and its database run on the Production computer. Tally remains open on the Accounts computer and exposes its XML server on this address and port.</div>
-          <div className="read-only-note"><strong>Cutover behavior:</strong> the first successful historical sync reconstructs current supplier lots from GRNs and assigns any unmatched current quantity to Opening Legacy Stock. The complete scan reads historical vouchers transiently, but only Stock Items, suppliers, POs, Receipt Notes/GRNs, BOMs, and rate-supporting Purchase records are persisted.</div>
+          <div className="read-only-note"><strong>Cutover behavior:</strong> the first successful historical sync reconstructs current supplier lots from GRNs and assigns any unmatched current quantity to Opening Legacy Stock. New Tally Sales Orders are added as Production Orders only when their product can be matched; existing local orders, stages, owners, and notes are never overwritten.</div>
         </article>
 
         <article className="panel tally-status-panel">

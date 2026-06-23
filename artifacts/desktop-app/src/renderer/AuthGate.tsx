@@ -1,5 +1,6 @@
 import { useState, type FormEvent } from "react";
 
+import PasswordInput from "./PasswordInput";
 import type { AuthSession, AuthState } from "./types";
 
 interface Props {
@@ -73,7 +74,7 @@ export default function AuthGate({ authState, onAuthenticated }: Props) {
         <label>Username<input autoComplete="username" autoFocus={!authState.needsBootstrap} value={username} onChange={(event) => setUsername(event.target.value)} required /></label>
         {(authState.needsBootstrap || recovering) && <label>Recovery email<input type="email" autoComplete="email" value={email} onChange={(event) => setEmail(event.target.value)} required /></label>}
         {(authState.needsBootstrap || recovering) && <label>Credential type<select value={recovering ? recoveryType : credentialType} onChange={(event) => recovering ? setRecoveryType(event.target.value as "PASSWORD" | "PIN") : setCredentialType(event.target.value as "PASSWORD" | "PIN")}><option value="PASSWORD">Password</option><option value="PIN">PIN</option></select></label>}
-        <label>{(recovering ? recoveryType : credentialType) === "PIN" ? "PIN" : recovering ? "New password" : "Password"}<input type="password" inputMode={(recovering ? recoveryType : credentialType) === "PIN" ? "numeric" : undefined} autoComplete={authState.needsBootstrap || recovering ? "new-password" : "current-password"} value={recovering ? recoveryCredential : credential} onChange={(event) => recovering ? setRecoveryCredential(event.target.value) : setCredential(event.target.value)} required /></label>
+        <label>{(recovering ? recoveryType : credentialType) === "PIN" ? "PIN" : recovering ? "New password" : "Password"}<PasswordInput inputMode={(recovering ? recoveryType : credentialType) === "PIN" ? "numeric" : undefined} autoComplete={authState.needsBootstrap || recovering ? "new-password" : "current-password"} value={recovering ? recoveryCredential : credential} onChange={(event) => recovering ? setRecoveryCredential(event.target.value) : setCredential(event.target.value)} required /></label>
         <button className="button" disabled={busy} type="submit">{busy ? recovering ? "Resetting…" : "Signing in…" : authState.needsBootstrap ? "Create administrator" : recovering ? "Reset credential" : "Sign in"}</button>
         {!authState.needsBootstrap && <button className="text-button" type="button" disabled={busy} onClick={() => { setRecovering((value) => !value); setError(""); setNotice(""); }}>{recovering ? "Back to sign in" : "Forgot password?"}</button>}
       </form>

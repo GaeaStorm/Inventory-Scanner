@@ -1,5 +1,20 @@
 # Desktop app user guide
 
+## First-time company setup
+
+The installer opens a Company LAN Setup screen before creating any database.
+
+- Choose **Production server** on the one authoritative Production computer.
+- Choose **Company LAN client** on Accounts and all other company computers.
+- On a client, enter the Production computer name or fixed IP and test the
+  connection before saving.
+- On the Accounts computer, select the TallyPrime option so Windows can permit
+  Tally access from Production.
+
+On Windows, firewall setup uses the normal Administrator approval prompt. No
+PowerShell scripts or GitHub checkout are required. Change the saved role or
+addresses later from Settings → Company LAN.
+
 ## Signing in
 
 Sign in with your username and password or PIN. Every account has a recovery email. Older accounts without one are prompted to add it immediately after their next successful login.
@@ -96,7 +111,9 @@ The old Excel-audit path is no longer part of Settings.
 
 ## Users
 
-Administrators create and edit local users. A user requires:
+Administrators create and edit users from Settings → Company Access. The role
+checklist shows whether Production, Accounts, Store, and Sales access has been
+created. A user requires:
 
 - Display name
 - Username

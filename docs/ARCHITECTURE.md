@@ -36,6 +36,11 @@ Accounts/Tally computer ──┘
 
 The Production desktop owns writes, migrations, backups, authentication, and synchronization. LAN clients do not maintain an independent company database.
 
+Before services start, Electron reads `deployment.json` from its application
+data folder. A first-run setup screen creates this file. Existing databases and
+older environment-variable deployments are detected and migrated automatically.
+An unconfigured installation does not create the SQLite company database.
+
 ## Desktop layers
 
 ### Renderer
@@ -55,6 +60,11 @@ The preload bridge exposes a typed `window.desktop` API. On the Production compu
 `artifacts/desktop-app/src/main.ts`
 
 The main process starts Electron, the local API, IPC handlers, printing, and the database-backed services.
+
+`artifacts/desktop-app/src/deployment.ts` owns deployment configuration,
+Production connectivity tests, and optional elevated Windows firewall setup.
+Configuration changes relaunch the app so the main process and preload bridge
+both enter the selected role cleanly.
 
 Routers live beside their domain:
 

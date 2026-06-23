@@ -25,12 +25,22 @@ import { PlanningService } from "./planning/service";
 import { createOperationsRouter } from "./operations/router";
 import { OperationsService } from "./operations/service";
 import type { Permission } from "./operations/types";
+import {
+  configureWindowsFirewall,
+  normalizeSaveDeploymentInput,
+  productionServerUrl,
+  readDeploymentConfig,
+  saveDeploymentConfig,
+  testProductionServer,
+  type DeploymentConfig,
+  type DeploymentRole,
+} from "./deployment";
 
 interface DesktopInfo {
   appVersion: string;
   apiBaseUrl: string;
   computerName: string;
-  deploymentRole: "PRODUCTION_SERVER" | "LAN_CLIENT";
+  deploymentRole: DeploymentRole;
   tallyComputerHost: string;
   dataDirectory: string;
   excelPath: string;
@@ -42,7 +52,7 @@ interface DesktopInfo {
 const DEFAULT_PORT = 5000;
 const AUTOMATIC_BACKUP_INTERVAL_MS = 2 * 60 * 60 * 1000;
 const developmentRendererUrl = process.env.ELECTRON_RENDERER_URL;
-const remoteServerUrl = (process.env.INVENTORY_SCANNER_REMOTE_URL ?? "").trim().replace(/\/+$/, "");
+let deploymentConfig: DeploymentConfig | null = null;
 
 function applicationIconPath(): string {
   return app.isPackaged
@@ -61,7 +71,7 @@ let applicationDatabase: ApplicationDatabase | null = null;
 let automaticBackupTimer: NodeJS.Timeout | null = null;
 
 function preferredPort(): number {
-  const configured = Number(process.env.INVENTORY_SCANNER_PORT ?? DEFAULT_PORT);
+  const configured = Number(deploymentConfig?.inventoryPort ?? process.env.INVENTORY_SCANNER_PORT ?? DEFAULT_PORT);
   return Number.isInteger(configured) && configured > 0 && configured <= 65_535
     ? configured
     : DEFAULT_PORT;
@@ -152,13 +162,18 @@ async function startApi(): Promise<DesktopInfo> {
   });
   desktopApi.post("/api/tally/sync", requireHttpPermission("PURCHASING_MANAGE"), async (request, response) => {
     if (!tallyService || !storesService) throw new Error("The Tally or Stores service is unavailable.");
+    const actor = operationsService!.requireActor(
+      String(request.header("x-inventory-session") ?? "").trim(),
+      "PURCHASING_MANAGE",
+    );
     const snapshot = await tallyService.syncStores(request.body);
     if (snapshot.stockItems.length > 0 && storesService.getState().dataMode === "demo") {
       planningService?.resetForCatalogReplacement();
     }
     const summary = storesService.sync(snapshot);
+    const orderImport = planningService!.importTallySalesOrders(snapshot.salesOrders ?? [], actor);
     operationsService?.database.reconcileLegacyLots();
-    response.json({ snapshot, summary, state: storesService.getState() });
+    response.json({ snapshot, summary, orderImport, state: storesService.getState() });
   });
   desktopApi.post("/api/stores/review", requireHttpPermission("TALLY_REVIEW"), (request, response) => {
     response.json(storesService!.review(request.body, operationsService!.requireActor(
@@ -235,7 +250,7 @@ async function startApi(): Promise<DesktopInfo> {
     apiBaseUrl: `http://127.0.0.1:${port}`,
     computerName: os.hostname(),
     deploymentRole: "PRODUCTION_SERVER",
-    tallyComputerHost: process.env.INVENTORY_TALLY_HOST?.trim() || "accounts",
+    tallyComputerHost: deploymentConfig?.tallyHost || process.env.INVENTORY_TALLY_HOST?.trim() || "accounts",
     dataDirectory,
     excelPath,
     databasePath: storesService.database.databasePath,
@@ -411,8 +426,10 @@ function registerIpcHandlers(): void {
       planningService?.resetForCatalogReplacement(actor);
     }
     const summary = storesService.sync(snapshot, actor);
+    const orderImport = planningService?.importTallySalesOrders(snapshot.salesOrders ?? [], actor)
+      ?? { imported: 0, skipped: 0, unmatched: 0 };
     operationsService?.database.reconcileLegacyLots();
-    return { snapshot, summary, state: storesService.getState() };
+    return { snapshot, summary, orderImport, state: storesService.getState() };
   });
 
   ipcMain.handle("stores:get-state", (_event, token: unknown) => {
@@ -583,6 +600,10 @@ function registerIpcHandlers(): void {
     if (!planningService) throw new Error("The Planning service is unavailable.");
     return planningService.updateProductOrderWorkflowState(String(orderId ?? ""), String(workflowStateId ?? ""), requireActor(token, "PRODUCT_ORDER_MANAGE"));
   });
+  ipcMain.handle("planning:bulk-update-product-orders", (_event, token: unknown, input: unknown) => {
+    if (!planningService) throw new Error("The Planning service is unavailable.");
+    return planningService.bulkUpdateProductOrders(input as never, requireActor(token, "PRODUCT_ORDER_MANAGE"));
+  });
   ipcMain.handle("planning:save-product-order-workflow-state", (_event, token: unknown, input: unknown) => {
     if (!planningService) throw new Error("The Planning service is unavailable.");
     return planningService.saveProductOrderWorkflowState(input as never, requireActor(token, "PRODUCT_ORDER_MANAGE"));
@@ -641,6 +662,26 @@ function registerRemoteClientIpcHandlers(): void {
   });
   ipcMain.handle("desktop:print-html", async (_event, _token: unknown, html: unknown) =>
     printHtmlDocument(printableHtml(html)));
+}
+
+function registerDeploymentIpcHandlers(): void {
+  ipcMain.handle("deployment:get-state", () => {
+    if (!deploymentConfig) throw new Error("LAN setup is unavailable.");
+    return {
+      ...deploymentConfig,
+      platform: process.platform,
+      productionUrl: deploymentConfig.role === "UNCONFIGURED" ? "" : productionServerUrl(deploymentConfig),
+    };
+  });
+  ipcMain.handle("deployment:test-production", (_event, input: unknown) => testProductionServer(input));
+  ipcMain.handle("deployment:save", async (_event, value: unknown) => {
+    const input = normalizeSaveDeploymentInput(value);
+    if (input.configureWindowsFirewall) await configureWindowsFirewall(input);
+    deploymentConfig = await saveDeploymentConfig(app.getPath("userData"), input);
+    app.relaunch();
+    app.exit(0);
+    return deploymentConfig;
+  });
 }
 
 async function createWindow(): Promise<void> {
@@ -705,18 +746,44 @@ function startAutomaticBackups(): void {
 
 async function bootstrap(): Promise<void> {
   Menu.setApplicationMenu(null);
-  if (remoteServerUrl) {
-    const parsed = new URL(remoteServerUrl);
+  deploymentConfig = readDeploymentConfig(app.getPath("userData"));
+  if (deploymentConfig.role !== "UNCONFIGURED") {
+    const configuredRole = deploymentConfig.role;
+    deploymentConfig = await saveDeploymentConfig(app.getPath("userData"), {
+      ...deploymentConfig,
+      role: configuredRole,
+    });
+  }
+  registerDeploymentIpcHandlers();
+  if (deploymentConfig.role === "UNCONFIGURED") {
+    desktopInfo = {
+      appVersion: app.getVersion(),
+      apiBaseUrl: "",
+      computerName: os.hostname(),
+      deploymentRole: "UNCONFIGURED",
+      tallyComputerHost: deploymentConfig.tallyHost,
+      dataDirectory: "",
+      excelPath: "",
+      databasePath: "",
+      port: deploymentConfig.inventoryPort,
+      scannerUrls: [],
+    };
+    registerRemoteClientIpcHandlers();
+    await createWindow();
+    return;
+  }
+  if (deploymentConfig.role === "LAN_CLIENT") {
+    const remoteServerUrl = productionServerUrl(deploymentConfig);
     desktopInfo = {
       appVersion: app.getVersion(),
       apiBaseUrl: remoteServerUrl,
       computerName: os.hostname(),
       deploymentRole: "LAN_CLIENT",
-      tallyComputerHost: "accounts",
+      tallyComputerHost: deploymentConfig.tallyHost,
       dataDirectory: "",
       excelPath: "",
       databasePath: "",
-      port: Number(parsed.port || 80),
+      port: deploymentConfig.inventoryPort,
       scannerUrls: [remoteServerUrl],
     };
     registerRemoteClientIpcHandlers();

@@ -27,9 +27,13 @@ await build({
   platform: "node",
   format: "cjs",
   target: "node24",
+  minify: true,
   sourcemap: false,
   external: ["electron"],
-  plugins: [pinoPlugin({ transports: ["pino-pretty"] })],
+  define: {
+    "process.stdout.isTTY": "false",
+  },
+  plugins: [pinoPlugin({ transports: [] })],
   logLevel: "info",
 });
 
@@ -47,6 +51,7 @@ await build({
   platform: "node",
   format: "cjs",
   target: "node24",
+  minify: true,
   sourcemap: false,
   external: ["electron"],
   logLevel: "info",

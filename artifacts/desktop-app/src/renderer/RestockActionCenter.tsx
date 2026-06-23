@@ -52,6 +52,7 @@ export default function RestockActionCenter({
   );
   const [productGuid, setProductGuid] = useState("");
   const [health, setHealth] = useState("");
+  const [obsoleteOnly, setObsoleteOnly] = useState(false);
   const [primaryGroup, setPrimaryGroup] = useState("");
   const [secondaryGroup, setSecondaryGroup] = useState("");
   const [selectedGuid, setSelectedGuid] = useState(planning.items[0]?.tallyItemGuid ?? "");
@@ -92,6 +93,7 @@ export default function RestockActionCenter({
       if (productGuid && !requiredGuids.has(item.tallyItemGuid)) return false;
       if (needle && !`${item.itemName} ${item.primaryGroupName} ${item.secondaryGroupName} ${item.preferredSupplierName}`.toLocaleLowerCase().includes(needle)) return false;
       if (health && item.health !== health) return false;
+      if (obsoleteOnly && !(item.catalogStatus === "OBSOLETE" && item.targetStock === 0)) return false;
       if (primaryGroup && item.primaryGroupName !== primaryGroup) return false;
       if (secondaryGroup && item.secondaryGroupName !== secondaryGroup) return false;
       return true;
@@ -104,7 +106,7 @@ export default function RestockActionCenter({
         : String(a ?? "").localeCompare(String(b ?? ""), undefined, { numeric: true });
       return sort.direction === "asc" ? comparison : -comparison;
     });
-  }, [planning.items, productGuid, selectedBom, search, health, primaryGroup, secondaryGroup, sort]);
+  }, [planning.items, productGuid, selectedBom, search, health, obsoleteOnly, primaryGroup, secondaryGroup, sort]);
 
   function toggleSort(key: keyof RestockPlanningItem) {
     setSort((current) => current.key === key
@@ -136,14 +138,10 @@ export default function RestockActionCenter({
 
   async function savePolicy() {
     if (!draft) return;
-    if (selected?.catalogStatus === "OBSOLETE" && draft.targetStock === 0) {
-      window.alert("This item is obsolete. Set a target quantity intended to cover approximately 3–4 years before saving the policy.");
-      return;
-    }
     await perform(() => window.desktop.planning.saveRestockPolicy(draft), "Restock policy saved locally.");
   }
 
-  const dataAttention = planning.summary.unconfigured + planning.summary.missingBom;
+  const obsoleteNeedsRestock = planning.items.filter((item) => item.catalogStatus === "OBSOLETE" && item.targetStock === 0).length;
   return (
     <div className="planning-section-stack">
       <div className={`freshness-banner ${planning.freshness.tallyStale ? "freshness-banner--warning" : ""}`}>
@@ -155,7 +153,7 @@ export default function RestockActionCenter({
         <button className="action-card action-card--critical" type="button" onClick={() => setHealth("CRITICAL")}><span>Critical shortages</span><strong>{planning.summary.critical}</strong></button>
         <button className="action-card action-card--warning" type="button" onClick={() => setHealth("REORDER_NOW")}><span>Reorder now</span><strong>{planning.summary.reorderNow}</strong></button>
         <button className="action-card" type="button" onClick={() => onNavigate("orders")}><span>Orders at risk</span><strong>{planning.summary.ordersAtRisk}</strong></button>
-        <button className="action-card" type="button" onClick={() => planning.summary.unconfigured > 0 ? setHealth("UNCONFIGURED") : onNavigate("boms")}><span>Data needs attention</span><strong>{dataAttention}</strong></button>
+        <button className="action-card" type="button" onClick={() => { setObsoleteOnly(true); setHealth(""); setProductGuid(""); }}><span>OBSOLETE NEEDS RESTOCK</span><strong>{obsoleteNeedsRestock}</strong></button>
       </section>
 
       <article className="panel planning-table-panel">
@@ -171,10 +169,10 @@ export default function RestockActionCenter({
             const first = planning.items.find((item) => item.tallyItemGuid === bom?.lines[0]?.componentTallyGuid);
             if (first) choose(first);
           }}><option value="">Choose a Finished Product…</option>{finishedProducts.map((item) => <option key={item.tallyGuid} value={item.tallyGuid}>{item.name} · {[item.primaryGroupName, item.secondaryGroupName].filter(Boolean).join(" › ") || "Ungrouped"}</option>)}</select>
-          <select aria-label="Filter by status" value={health} onChange={(event) => setHealth(event.target.value)}><option value="">All statuses</option>{Object.entries(healthLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select>
+          <select aria-label="Filter by status" value={health} onChange={(event) => { setHealth(event.target.value); setObsoleteOnly(false); }}><option value="">All statuses</option>{Object.entries(healthLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select>
           <select aria-label="Filter by primary group" value={primaryGroup} onChange={(event) => { setPrimaryGroup(event.target.value); setSecondaryGroup(""); }}><option value="">All primary groups</option>{primaryGroupNames.map((entry) => <option key={entry}>{entry}</option>)}</select>
           <select aria-label="Filter by secondary group" value={secondaryGroup} onChange={(event) => setSecondaryGroup(event.target.value)} disabled={secondaryGroupNames.length === 0}><option value="">All secondary groups</option>{secondaryGroupNames.map((entry) => <option key={entry}>{entry}</option>)}</select>
-          <button className="button button--secondary" type="button" onClick={() => { setSearch(""); setProductGuid(""); setHealth(""); setPrimaryGroup(""); setSecondaryGroup(""); }}>Clear filters</button>
+          <button className="button button--secondary" type="button" onClick={() => { setSearch(""); setProductGuid(""); setHealth(""); setObsoleteOnly(false); setPrimaryGroup(""); setSecondaryGroup(""); }}>Clear filters</button>
         </div>
         <div className="table-scroll planning-restock-table"><table>
           <thead><tr><th>{sortLabel("Status", "health")}</th><th>{sortLabel("Stock Item", "itemName")}</th><th className="numeric">{sortLabel("On hand", "onHand")}</th><th className="numeric">{sortLabel("Reserved", "reserved")}</th><th className="numeric">{sortLabel("Service", "serviceReserve")}</th><th className="numeric">{sortLabel("Available", "available")}</th><th className="numeric">{sortLabel("Incoming", "incoming")}</th><th className="numeric">{sortLabel("Projected", "projected")}</th><th className="numeric">{sortLabel("Reorder", "reorderPoint")}</th><th className="numeric">{sortLabel("Target", "targetStock")}</th><th className="numeric">{sortLabel("Suggested order", "suggestedOrderQuantity")}</th><th>{sortLabel("Supplier", "preferredSupplierName")}</th></tr></thead>

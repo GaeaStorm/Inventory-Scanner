@@ -13,6 +13,8 @@ export type RecommendationStatus =
   | "EXPORTED";
 export type BomStatus = "DRAFT" | "ACTIVE" | "ARCHIVED";
 export type ProductOrderStatus = "DRAFT" | "CONFIRMED" | "CANCELLED" | "COMPLETED";
+export type ProductOrderType = "PRODUCTION" | "SERVICE";
+export type WarrantyStatus = "IN_WARRANTY" | "OUT_OF_WARRANTY" | "NOT_APPLICABLE";
 export type ProductOrderFieldType = "TEXT" | "NUMBER" | "DATE" | "BOOLEAN";
 export type OrderFeasibility =
   | "READY"
@@ -147,6 +149,9 @@ export interface ProductOrderRequirement {
 
 export interface ProductOrder {
   id: string;
+  orderType: ProductOrderType;
+  serialNumber: string;
+  warrantyStatus: WarrantyStatus;
   fileNumber: string;
   organisation: string;
   externalReference: string;
@@ -173,6 +178,7 @@ export interface ProductOrder {
   workflowStateName: string;
   workflowStateColor: string;
   stageHistory: ProductOrderStageHistory[];
+  activity: ProductOrderActivity[];
   bomVersionId: string | null;
   bomVersionLabel: string;
   feasibility: OrderFeasibility;
@@ -181,6 +187,15 @@ export interface ProductOrder {
   createdAt: string;
   updatedAt: string;
   requirements: ProductOrderRequirement[];
+}
+
+export interface ProductOrderActivity {
+  id: string;
+  eventType: "CREATED" | "UPDATED" | "STAGE_CHANGED" | "STATUS_CHANGED" | "TALLY_IMPORTED";
+  actorName: string;
+  actorRole: string;
+  summary: string;
+  createdAt: string;
 }
 
 export interface ProductOrderStageHistory {
@@ -194,6 +209,8 @@ export interface ProductOrderStageHistory {
 
 export interface SaveProductOrderInput {
   id?: string;
+  orderType?: ProductOrderType;
+  serialNumber?: string;
   fileNumber?: string;
   organisation?: string;
   externalReference: string;
@@ -221,6 +238,7 @@ export interface SaveProductOrderInput {
 
 export interface ProductOrderWorkflowState {
   id: string;
+  orderType: ProductOrderType;
   name: string;
   color: string;
   position: number;
@@ -239,6 +257,25 @@ export interface SaveProductOrderWorkflowStateInput {
   name: string;
   color?: string;
   terminal?: boolean;
+}
+
+export interface BulkProductOrderUpdateInput {
+  orderIds: string[];
+  workflowStateId?: string;
+  responsiblePerson?: string;
+  priority?: string;
+}
+
+export interface TallySalesOrderImportLine {
+  tallyGuid: string;
+  voucherNumber: string;
+  voucherDate: string;
+  customerName: string;
+  reference: string;
+  productTallyGuid: string;
+  productName: string;
+  quantity: number;
+  value: number | null;
 }
 
 export interface SaveProductOrderFieldDefinitionInput {

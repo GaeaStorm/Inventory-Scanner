@@ -9,7 +9,7 @@ import { ApplicationDatabase } from "../src/database/application-database";
 import { OperationsDatabase } from "../src/operations/database";
 import { permissionsForRole, requirePermission } from "../src/operations/permissions";
 import type { ActorContext, ConditionBalance } from "../src/operations/types";
-import { PlanningDatabase } from "../src/planning/database";
+import { PlanningDatabase, warrantyStatusForSerial } from "../src/planning/database";
 import { traceabilityColumns } from "../src/renderer/traceability";
 import { parseBomWorkbook } from "../src/renderer/bom-import";
 import { retainedBackupPaths, StoresDatabase } from "../src/stores/database";
@@ -261,6 +261,117 @@ test("production-order tracker persists canonical stages, stage history, spreads
   }
 });
 
+test("service orders use separate stages, do not reserve production stock, and derive warranty from Serial No", () => {
+  const context = createContext();
+  try {
+    assert.equal(warrantyStatusForSerial("2506-ABC", "2026-06-20T00:00:00.000Z"), "IN_WARRANTY");
+    assert.equal(warrantyStatusForSerial("2412-ABC", "2026-04-20T00:00:00.000Z"), "OUT_OF_WARRANTY");
+    assert.equal(warrantyStatusForSerial("2613-ABC", "2026-06-20T00:00:00.000Z"), "OUT_OF_WARRANTY");
+
+    const saved = context.planning.saveProductOrder({
+      orderType: "SERVICE",
+      serialNumber: "2506-SVC-001",
+      externalReference: "SRV-1",
+      organisation: "Service Customer",
+      productTallyGuid: context.productGuid,
+      quantity: 1,
+      workflowStateId: "service-incoming",
+      requiredDate: "2026-06-30",
+    });
+    assert.equal(saved.orderType, "SERVICE");
+    assert.equal(saved.workflowStateName, "Service · Incoming");
+    assert.equal(saved.warrantyStatus, "IN_WARRANTY");
+    assert.equal(saved.priority, "LOW");
+    assert.equal(saved.requirements.length, 0);
+    assert.equal(
+      Number((context.host.db.prepare(
+        "SELECT COUNT(*) AS count FROM planning_reservations WHERE product_order_id = ?",
+      ).get(saved.id) as any).count),
+      0,
+    );
+
+    context.planning.updateProductOrderWorkflowState(saved.id, "service-initial-testing");
+    const advanced = context.planning.getState().productOrders.find((order) => order.id === saved.id);
+    assert.equal(advanced?.workflowStateName, "Service · Initial Testing");
+    assert.equal(advanced?.stageHistory.length, 2);
+    assert.throws(
+      () => context.planning.updateProductOrderWorkflowState(saved.id, "initial-testing"),
+      /belonging to this order type/,
+    );
+    assert.throws(
+      () => context.operations.releaseProductOrder(saved.id, "release-service", "", context.actor),
+      /cannot enter Production execution/,
+    );
+  } finally {
+    closeContext(context);
+  }
+});
+
+test("Tally Sales Orders import conservatively and bulk updates preserve order-type stages", () => {
+  const context = createContext();
+  try {
+    const imported = context.planning.importTallySalesOrders([{
+      tallyGuid: "TALLY-SO-1",
+      voucherNumber: "SO-1001",
+      voucherDate: "2026-06-20",
+      customerName: "Tally Customer",
+      reference: "CUSTOMER-PO-9",
+      productTallyGuid: context.productGuid,
+      productName: "Test Product",
+      quantity: 2,
+      value: 50000,
+    }], context.actor);
+    assert.deepEqual(imported, { imported: 1, skipped: 0, unmatched: 0 });
+    const order = context.planning.getState().productOrders.find((entry) => entry.externalReference === "SO-1001");
+    assert.ok(order);
+    assert.equal(order.orderType, "PRODUCTION");
+    assert.equal(order.workflowStateId, "po-pending");
+    assert.ok(order.activity.some((entry) => entry.eventType === "TALLY_IMPORTED"));
+
+    const repeated = context.planning.importTallySalesOrders([{
+      tallyGuid: "TALLY-SO-1",
+      voucherNumber: "SO-1001",
+      voucherDate: "2026-06-20",
+      customerName: "Changed in Tally",
+      reference: "CUSTOMER-PO-9",
+      productTallyGuid: context.productGuid,
+      productName: "Test Product",
+      quantity: 3,
+      value: 70000,
+    }], context.actor);
+    assert.deepEqual(repeated, { imported: 0, skipped: 1, unmatched: 0 });
+
+    context.planning.bulkUpdateProductOrders({
+      orderIds: [order.id],
+      responsiblePerson: "Production Owner",
+      priority: "HIGH",
+      workflowStateId: "po-generated",
+    }, context.actor);
+    const updated = context.planning.getState().productOrders.find((entry) => entry.id === order.id);
+    assert.equal(updated?.responsiblePerson, "Production Owner");
+    assert.equal(updated?.priority, "HIGH");
+    assert.equal(updated?.workflowStateId, "po-generated");
+    assert.ok(updated?.activity.some((entry) => entry.eventType === "STAGE_CHANGED"));
+  } finally {
+    closeContext(context);
+  }
+});
+
+test("obsolete items remain visible to Accounts until a restock policy is decided", () => {
+  const context = createContext();
+  try {
+    context.stores.setCatalogStatus({
+      tallyItemGuid: context.componentGuid,
+      status: "OBSOLETE",
+    });
+    const item = context.planning.getState().items.find((entry) => entry.tallyItemGuid === context.componentGuid);
+    assert.equal(item?.catalogStatus, "OBSOLETE");
+    assert.equal(item?.targetStock, 0);
+  } finally {
+    closeContext(context);
+  }
+});
+
 test("order stages are fixed while custom fields can be deleted safely", () => {
   const context = createContext();
   try {
@@ -270,7 +381,8 @@ test("order stages are fixed while custom fields can be deleted safely", () => {
     });
     context.planning.deleteProductOrderFieldDefinition(field.id);
     let state = context.planning.getState();
-    assert.equal(state.productOrderWorkflowStates.length, 15);
+    assert.equal(state.productOrderWorkflowStates.filter((entry) => entry.orderType === "PRODUCTION").length, 15);
+    assert.equal(state.productOrderWorkflowStates.filter((entry) => entry.orderType === "SERVICE").length, 9);
     assert.equal(state.productOrderFieldDefinitions.some((entry) => entry.id === field.id), false);
     assert.throws(
       () => context.planning.saveProductOrderWorkflowState({ name: "Temporary state" }),

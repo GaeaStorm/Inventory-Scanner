@@ -66,7 +66,7 @@ export default function OpeningQuantityPanel(props: {
     <article className="panel opening-panel">
       <div className="panel__header">
         <div className="heading-with-info">
-          <div><p className="eyebrow">OPENING STOCK</p><h2>Set local opening count</h2></div>
+          <div><p className="eyebrow">OPENING STOCK/EMERGENCY STOCK SET</p><h2>Set local opening count</h2></div>
           <InfoTip>Use this for stock not represented by historical Tally GRNs. Positive differences become Opening Legacy Stock; GRN-linked quantities are not rewritten.</InfoTip>
         </div>
       </div>

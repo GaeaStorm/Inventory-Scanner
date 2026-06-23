@@ -5,10 +5,12 @@ import type { ApplicationDatabase, ApplicationDatabaseMigration } from "../datab
 import type {
   BomLine,
   BomVersion,
+  BulkProductOrderUpdateInput,
   PlanningFreshness,
   PlanningState,
   PlanningSummary,
   ProductOrder,
+  ProductOrderType,
   ProductOrderFieldDefinition,
   ProductOrderRequirement,
   ProductOrderWorkflowState,
@@ -20,7 +22,9 @@ import type {
   SaveProductOrderFieldDefinitionInput,
   SaveProductOrderInput,
   SaveProductOrderWorkflowStateInput,
+  TallySalesOrderImportLine,
 } from "./types";
+import type { ActorContext } from "../operations/types";
 
 const MODULE_NAME = "planning";
 const EXPORT_SCHEMA_VERSION = "3.0";
@@ -88,6 +92,24 @@ function median(values: number[]): number | null {
   return sorted.length % 2 === 0
     ? Math.round((sorted[middle - 1] + sorted[middle]) / 2)
     : sorted[middle];
+}
+
+function normalizedOrderType(value: unknown): ProductOrderType {
+  return text(value).toLocaleUpperCase() === "SERVICE" ? "SERVICE" : "PRODUCTION";
+}
+
+export function warrantyStatusForSerial(
+  serialNumberValue: string,
+  orderCreatedAtValue: string,
+): ProductOrder["warrantyStatus"] {
+  const match = text(serialNumberValue).match(/^(\d{2})(0[1-9]|1[0-2])/);
+  if (!match) return "OUT_OF_WARRANTY";
+  const manufactureMonth = (2000 + Number(match[1])) * 12 + Number(match[2]) - 1;
+  const createdAt = new Date(orderCreatedAtValue);
+  if (Number.isNaN(createdAt.valueOf())) return "OUT_OF_WARRANTY";
+  const orderMonth = createdAt.getUTCFullYear() * 12 + createdAt.getUTCMonth();
+  const ageMonths = orderMonth - manufactureMonth;
+  return ageMonths >= 0 && ageMonths <= 15 ? "IN_WARRANTY" : "OUT_OF_WARRANTY";
 }
 
 const migrations: ApplicationDatabaseMigration[] = [
@@ -340,6 +362,66 @@ const migrations: ApplicationDatabaseMigration[] = [
       `);
     },
   },
+  {
+    version: 4,
+    description: "Add separately timed service orders, serial numbers, and warranty tracking",
+    up(database: DatabaseSync) {
+      database.exec(`
+        ALTER TABLE planning_product_order_workflow_states
+          ADD COLUMN order_type TEXT NOT NULL DEFAULT 'PRODUCTION'
+          CHECK (order_type IN ('PRODUCTION','SERVICE'));
+        ALTER TABLE planning_product_orders
+          ADD COLUMN order_type TEXT NOT NULL DEFAULT 'PRODUCTION'
+          CHECK (order_type IN ('PRODUCTION','SERVICE'));
+        ALTER TABLE planning_product_orders
+          ADD COLUMN serial_number TEXT NOT NULL DEFAULT '';
+
+        INSERT INTO planning_product_order_workflow_states(id, name, color, position, terminal, order_type) VALUES
+          ('service-incoming', 'Service · Incoming', '#6B778C', 101, 0, 'SERVICE'),
+          ('service-estimation', 'Service · Estimation', '#5268CA', 102, 0, 'SERVICE'),
+          ('service-estimate-approval', 'Service · Estimate Approval', '#9F7AEA', 103, 0, 'SERVICE'),
+          ('service-fault-finding', 'Service · Fault Finding', '#246BCE', 104, 0, 'SERVICE'),
+          ('service-initial-testing', 'Service · Initial Testing', '#246BCE', 105, 0, 'SERVICE'),
+          ('service-burn-test', 'Service · Burn Test', '#246BCE', 106, 0, 'SERVICE'),
+          ('service-final-testing', 'Service · Final Testing', '#246BCE', 107, 0, 'SERVICE'),
+          ('service-payment', 'Service · Payment', '#B7791F', 108, 0, 'SERVICE'),
+          ('service-dispatch', 'Service · Dispatch', '#23855B', 109, 1, 'SERVICE');
+
+        DROP INDEX idx_planning_orders_reference;
+        CREATE UNIQUE INDEX idx_planning_orders_reference
+          ON planning_product_orders(external_reference, product_item_id, order_type, serial_number)
+          WHERE external_reference <> '';
+        CREATE INDEX idx_planning_orders_type
+          ON planning_product_orders(order_type, status, required_date);
+      `);
+    },
+  },
+  {
+    version: 5,
+    description: "Record user-visible order activity",
+    up(database: DatabaseSync) {
+      database.exec(`
+        CREATE TABLE planning_product_order_activity (
+          id TEXT PRIMARY KEY,
+          product_order_id TEXT NOT NULL REFERENCES planning_product_orders(id) ON DELETE CASCADE,
+          event_type TEXT NOT NULL CHECK (event_type IN ('CREATED','UPDATED','STAGE_CHANGED','STATUS_CHANGED','TALLY_IMPORTED')),
+          actor_name TEXT NOT NULL DEFAULT '',
+          actor_role TEXT NOT NULL DEFAULT '',
+          summary TEXT NOT NULL,
+          created_at TEXT NOT NULL
+        ) STRICT;
+        CREATE INDEX idx_planning_order_activity
+          ON planning_product_order_activity(product_order_id, created_at DESC);
+
+        INSERT INTO planning_product_order_activity(
+          id, product_order_id, event_type, actor_name, actor_role, summary, created_at
+        )
+        SELECT lower(hex(randomblob(16))), id, 'CREATED', 'System', 'SYSTEM',
+          'Existing order added to activity history', created_at
+        FROM planning_product_orders;
+      `);
+    },
+  },
 ];
 
 export class PlanningDatabase {
@@ -360,6 +442,27 @@ export class PlanningDatabase {
 
   get db(): DatabaseSync {
     return this.host.db;
+  }
+
+  private recordOrderActivity(
+    orderId: string,
+    eventType: ProductOrder["activity"][number]["eventType"],
+    summary: string,
+    actor?: ActorContext,
+  ): void {
+    this.db.prepare(`
+      INSERT INTO planning_product_order_activity(
+        id, product_order_id, event_type, actor_name, actor_role, summary, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      randomUUID(),
+      orderId,
+      eventType,
+      actor?.displayName ?? "System",
+      actor?.role ?? "SYSTEM",
+      summary,
+      nowIso(),
+    );
   }
 
   resetForCatalogReplacement(): void {
@@ -642,21 +745,26 @@ export class PlanningDatabase {
     });
   }
 
-  updateProductOrderWorkflowState(orderId: string, workflowStateId: string): void {
+  updateProductOrderWorkflowState(orderId: string, workflowStateId: string, actor?: ActorContext): void {
     this.ensureReady();
     const state = this.db.prepare(`
-      SELECT id FROM planning_product_order_workflow_states WHERE id = ?
+      SELECT id, order_type FROM planning_product_order_workflow_states WHERE id = ?
     `).get(text(workflowStateId)) as Row | undefined;
     if (!state) throw new Error("Workflow state not found.");
-    if (text(state.id) === "quality-control" && !this.db.prepare(`
+    const order = this.db.prepare(`
+      SELECT workflow_state_id, order_type FROM planning_product_orders WHERE id = ?
+    `).get(text(orderId)) as Row | undefined;
+    if (!order) throw new Error("Product order not found.");
+    if (normalizedOrderType(order.order_type) !== normalizedOrderType(state.order_type)) {
+      throw new Error("Choose a stage belonging to this order type.");
+    }
+    if (normalizedOrderType(order.order_type) === "PRODUCTION" && text(state.id) === "quality-control" && !this.db.prepare(`
       SELECT 1 FROM planning_product_order_stage_history
       WHERE product_order_id = ? AND workflow_state_id = 'material-purchase'
     `).get(text(orderId))) {
       throw new Error("Quality Control is available only after the order has entered Material Purchase.");
     }
     this.host.transaction("updating an order stage", () => {
-      const order = this.db.prepare("SELECT workflow_state_id FROM planning_product_orders WHERE id = ?").get(text(orderId)) as Row | undefined;
-      if (!order) throw new Error("Product order not found.");
       if (text(order.workflow_state_id) === text(state.id)) return;
       const timestamp = nowIso();
       this.db.prepare(`
@@ -670,12 +778,21 @@ export class PlanningDatabase {
       this.db.prepare(`
         UPDATE planning_product_orders SET workflow_state_id = ?, updated_at = ? WHERE id = ?
       `).run(state.id, timestamp, text(orderId));
+      const stateName = text((this.db.prepare(
+        "SELECT name FROM planning_product_order_workflow_states WHERE id = ?",
+      ).get(state.id) as Row | undefined)?.name);
+      this.recordOrderActivity(text(orderId), "STAGE_CHANGED", `Stage changed to ${stateName}`, actor);
     });
   }
 
-  saveProductOrder(input: SaveProductOrderInput): ProductOrder {
+  saveProductOrder(input: SaveProductOrderInput, actor?: ActorContext, activityType?: "TALLY_IMPORTED"): ProductOrder {
     this.ensureReady();
     const product = this.stockItemByGuid(input.productTallyGuid);
+    const orderType = normalizedOrderType(input.orderType);
+    const serialNumber = text(input.serialNumber);
+    if (orderType === "SERVICE" && !/^(\d{2})(0[1-9]|1[0-2])/.test(serialNumber)) {
+      throw new Error("Service Order Serial No must begin with a valid YYMM manufacturing date.");
+    }
     const quantity = wholeNumber(input.quantity, "Product order quantity", false);
     const status = input.status === "DRAFT" ? "DRAFT" : "CONFIRMED";
     const suppliedId = text(input.id);
@@ -684,23 +801,31 @@ export class PlanningDatabase {
       ? this.db.prepare(`
           SELECT id FROM planning_product_orders
           WHERE external_reference = ? AND product_item_id = ?
-        `).get(externalReference, product.id) as Row | undefined
+            AND order_type = ? AND serial_number = ?
+        `).get(externalReference, product.id, orderType, serialNumber) as Row | undefined
       : undefined;
     const orderId = suppliedId || text(matchingReference?.id) || randomUUID();
     const timestamp = nowIso();
 
     this.host.transaction("saving a product order and reservations", () => {
       const existing = this.db.prepare("SELECT * FROM planning_product_orders WHERE id = ?").get(orderId) as Row | undefined;
-      const bom = this.activeBomForProduct(Number(product.id));
+      if (existing && normalizedOrderType(existing.order_type) !== orderType) {
+        throw new Error("An existing order cannot be changed between Production and Service.");
+      }
+      const bom = orderType === "PRODUCTION" ? this.activeBomForProduct(Number(product.id)) : null;
       const workflowStateId = text(input.workflowStateId)
         || text(existing?.workflow_state_id)
         || text((this.db.prepare(`
-          SELECT id FROM planning_product_order_workflow_states ORDER BY position LIMIT 1
-        `).get() as Row | undefined)?.id);
-      if (!this.db.prepare("SELECT 1 FROM planning_product_order_workflow_states WHERE id = ?").get(workflowStateId)) {
+          SELECT id FROM planning_product_order_workflow_states
+          WHERE order_type = ? ORDER BY position LIMIT 1
+        `).get(orderType) as Row | undefined)?.id);
+      const workflowState = this.db.prepare(`
+        SELECT id, order_type FROM planning_product_order_workflow_states WHERE id = ?
+      `).get(workflowStateId) as Row | undefined;
+      if (!workflowState || normalizedOrderType(workflowState.order_type) !== orderType) {
         throw new Error("Choose a valid workflow state.");
       }
-      if (workflowStateId === "quality-control" && !this.db.prepare(`
+      if (orderType === "PRODUCTION" && workflowStateId === "quality-control" && !this.db.prepare(`
         SELECT 1 FROM planning_product_order_stage_history
         WHERE product_order_id = ? AND workflow_state_id = 'material-purchase'
       `).get(orderId)) {
@@ -712,8 +837,9 @@ export class PlanningDatabase {
           bom_version_id, notes, created_at, updated_at, file_number, organisation,
           purchase_order_date, last_dispatch_date, pending_quantity, value_including_gst,
           pending_material, raw_material_to_order, crf_status, crac_status, task_remarks,
-          responsible_person, follow_up_date, dispatch_schedule, priority, workflow_state_id
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          responsible_person, follow_up_date, dispatch_schedule, priority, workflow_state_id,
+          order_type, serial_number
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
           external_reference = excluded.external_reference,
           product_item_id = excluded.product_item_id,
@@ -738,6 +864,7 @@ export class PlanningDatabase {
           dispatch_schedule = excluded.dispatch_schedule,
           priority = excluded.priority,
           workflow_state_id = excluded.workflow_state_id,
+          serial_number = excluded.serial_number,
           updated_at = excluded.updated_at
       `).run(
         orderId,
@@ -764,8 +891,10 @@ export class PlanningDatabase {
         input.responsiblePerson === undefined ? text(existing?.responsible_person) : text(input.responsiblePerson),
         input.followUpDate === undefined ? text(existing?.follow_up_date) : optionalDate(input.followUpDate),
         input.dispatchSchedule === undefined ? text(existing?.dispatch_schedule) : text(input.dispatchSchedule),
-        input.priority === undefined ? text(existing?.priority) : text(input.priority),
+        input.priority === undefined ? (text(existing?.priority) || (orderType === "SERVICE" ? "LOW" : "")) : text(input.priority),
         workflowStateId,
+        orderType,
+        serialNumber,
       );
       if (!existing || text(existing.workflow_state_id) !== workflowStateId) {
         if (existing) {
@@ -799,8 +928,16 @@ export class PlanningDatabase {
         || text(existing.bom_version_id) !== text(bom?.id);
       if (reservationBasisChanged) {
         this.db.prepare("DELETE FROM planning_reservations WHERE product_order_id = ?").run(orderId);
-        if (status === "CONFIRMED" && bom) this.createReservations(orderId, bom, quantity);
+        if (orderType === "PRODUCTION" && status === "CONFIRMED" && bom) this.createReservations(orderId, bom, quantity);
       }
+      this.recordOrderActivity(
+        orderId,
+        activityType ?? (existing ? "UPDATED" : "CREATED"),
+        activityType === "TALLY_IMPORTED"
+          ? `Imported from Tally Sales Order ${externalReference || input.fileNumber || orderId}`
+          : existing ? "Order information updated" : `${orderType === "SERVICE" ? "Service" : "Production"} Order created`,
+        actor,
+      );
     });
     return this.getProductOrders().find((order) => order.id === orderId)!;
   }
@@ -827,15 +964,16 @@ export class PlanningDatabase {
     }
   }
 
-  updateProductOrderStatus(orderId: string, status: "CANCELLED" | "COMPLETED" | "CONFIRMED"): void {
+  updateProductOrderStatus(orderId: string, status: "CANCELLED" | "COMPLETED" | "CONFIRMED", actor?: ActorContext): void {
     this.ensureReady();
     const row = this.db.prepare("SELECT * FROM planning_product_orders WHERE id = ?").get(orderId) as Row | undefined;
     if (!row) throw new Error("Product order not found.");
     this.host.transaction("updating a product order", () => {
-      let bom = row.bom_version_id
+      const orderType = normalizedOrderType(row.order_type);
+      let bom = orderType === "PRODUCTION" && row.bom_version_id
         ? this.db.prepare("SELECT * FROM planning_bom_versions WHERE id = ?").get(row.bom_version_id) as Row | undefined
         : undefined;
-      if (status === "CONFIRMED" && !bom) {
+      if (orderType === "PRODUCTION" && status === "CONFIRMED" && !bom) {
         bom = this.activeBomForProduct(Number(row.product_item_id)) ?? undefined;
       }
       this.db.prepare(`
@@ -845,7 +983,7 @@ export class PlanningDatabase {
       `).run(status, status === "CONFIRMED" ? (bom?.id ?? null) : row.bom_version_id, nowIso(), orderId);
       if (status === "CONFIRMED") {
         this.db.prepare("DELETE FROM planning_reservations WHERE product_order_id = ?").run(orderId);
-        if (bom) this.createReservations(orderId, bom, Number(row.quantity));
+        if (orderType === "PRODUCTION" && bom) this.createReservations(orderId, bom, Number(row.quantity));
       } else {
         this.db.prepare(`
           UPDATE planning_reservations
@@ -853,7 +991,84 @@ export class PlanningDatabase {
           WHERE product_order_id = ? AND status = 'ACTIVE'
         `).run(nowIso(), orderId);
       }
+      this.recordOrderActivity(orderId, "STATUS_CHANGED", `Order marked ${status.toLocaleLowerCase()}`, actor);
     });
+  }
+
+  bulkUpdateProductOrders(input: BulkProductOrderUpdateInput, actor?: ActorContext): void {
+    this.ensureReady();
+    const ids = [...new Set(input.orderIds.map(text).filter(Boolean))];
+    if (ids.length === 0) throw new Error("Select at least one order.");
+    for (const id of ids) {
+      const order = this.getProductOrders().find((entry) => entry.id === id);
+      if (!order) continue;
+      if (input.workflowStateId) this.updateProductOrderWorkflowState(id, input.workflowStateId, actor);
+      if (input.responsiblePerson !== undefined || input.priority !== undefined) {
+        this.saveProductOrder({
+          id,
+          orderType: order.orderType,
+          serialNumber: order.serialNumber,
+          externalReference: order.externalReference,
+          productTallyGuid: order.productTallyGuid,
+          quantity: order.quantity,
+          requiredDate: order.requiredDate,
+          responsiblePerson: input.responsiblePerson ?? order.responsiblePerson,
+          priority: input.priority ?? order.priority,
+        }, actor);
+      }
+    }
+  }
+
+  importTallySalesOrders(lines: TallySalesOrderImportLine[], actor?: ActorContext): {
+    imported: number;
+    skipped: number;
+    unmatched: number;
+  } {
+    this.ensureReady();
+    let imported = 0;
+    let skipped = 0;
+    let unmatched = 0;
+    for (const line of lines) {
+      const product = line.productTallyGuid
+        ? this.db.prepare("SELECT tally_guid FROM tally_stock_items WHERE tally_guid = ?").get(line.productTallyGuid)
+        : this.db.prepare(`
+            SELECT tally_guid FROM tally_stock_items
+            WHERE name = ? COLLATE NOCASE OR local_name_override = ? COLLATE NOCASE
+            LIMIT 1
+          `).get(line.productName, line.productName);
+      if (!product) {
+        unmatched += 1;
+        continue;
+      }
+      const productGuid = text((product as Row).tally_guid);
+      const existing = this.db.prepare(`
+        SELECT id FROM planning_product_orders
+        WHERE order_type = 'PRODUCTION'
+          AND external_reference = ?
+          AND product_item_id = (SELECT id FROM tally_stock_items WHERE tally_guid = ?)
+      `).get(line.voucherNumber || line.reference, productGuid);
+      if (existing) {
+        skipped += 1;
+        continue;
+      }
+      this.saveProductOrder({
+        orderType: "PRODUCTION",
+        fileNumber: line.tallyGuid,
+        organisation: line.customerName,
+        externalReference: line.voucherNumber || line.reference,
+        purchaseOrderDate: line.voucherDate,
+        productTallyGuid: productGuid,
+        quantity: Math.max(1, Math.round(line.quantity)),
+        pendingQuantity: Math.max(1, Math.round(line.quantity)),
+        valueIncludingGst: line.value,
+        requiredDate: line.voucherDate,
+        workflowStateId: "po-pending",
+        status: "CONFIRMED",
+        notes: "Imported read-only from Tally Sales Order. Local workflow fields remain managed here.",
+      }, actor, "TALLY_IMPORTED");
+      imported += 1;
+    }
+    return { imported, skipped, unmatched };
   }
 
 
@@ -898,10 +1113,11 @@ export class PlanningDatabase {
 
   private getProductOrderWorkflowStates(): ProductOrderWorkflowState[] {
     return (this.db.prepare(`
-      SELECT id, name, color, position, terminal
+      SELECT id, name, color, position, terminal, order_type
       FROM planning_product_order_workflow_states ORDER BY position, name
     `).all() as Row[]).map((row) => ({
       id: text(row.id),
+      orderType: normalizedOrderType(row.order_type),
       name: text(row.name),
       color: text(row.color),
       position: Number(row.position),
@@ -932,7 +1148,8 @@ export class PlanningDatabase {
       JOIN tally_stock_items item ON item.id = o.product_item_id
       LEFT JOIN planning_bom_versions bom ON bom.id = o.bom_version_id
       LEFT JOIN planning_product_order_workflow_states workflow ON workflow.id = o.workflow_state_id
-      ORDER BY CASE o.status WHEN 'CONFIRMED' THEN 0 WHEN 'DRAFT' THEN 1 ELSE 2 END,
+      ORDER BY CASE o.order_type WHEN 'PRODUCTION' THEN 0 ELSE 1 END,
+        CASE o.status WHEN 'CONFIRMED' THEN 0 WHEN 'DRAFT' THEN 1 ELSE 2 END,
         o.required_date, o.created_at DESC
     `).all() as Row[];
     const requirementsStatement = this.db.prepare(`
@@ -965,6 +1182,13 @@ export class PlanningDatabase {
       JOIN planning_product_order_workflow_states workflow ON workflow.id = history.workflow_state_id
       WHERE history.product_order_id = ? ORDER BY history.entered_at
     `);
+    const activityStatement = this.db.prepare(`
+      SELECT id, event_type, actor_name, actor_role, summary, created_at
+      FROM planning_product_order_activity
+      WHERE product_order_id = ?
+      ORDER BY created_at DESC, id DESC
+      LIMIT 100
+    `);
     const priorCommittedByComponent = new Map<number, number>();
     return rows.map((row) => {
       const requirements = (requirementsStatement.all(row.id) as Row[]).map((requirement): ProductOrderRequirement => {
@@ -996,8 +1220,9 @@ export class PlanningDatabase {
           shortageAfterIncoming: Math.max(0, required - projectedBeforeOrder),
         };
       });
-      let feasibility: ProductOrder["feasibility"] = "BOM_INCOMPLETE";
-      if (row.bom_version_id && requirements.length > 0) {
+      const orderType = normalizedOrderType(row.order_type);
+      let feasibility: ProductOrder["feasibility"] = orderType === "SERVICE" ? "READY" : "BOM_INCOMPLETE";
+      if (orderType === "PRODUCTION" && row.bom_version_id && requirements.length > 0) {
         if (requirements.every((line) => line.shortageNow === 0)) feasibility = "READY";
         else if (requirements.every((line) => line.shortageAfterIncoming === 0)) feasibility = "READY_WITH_INCOMING";
         else if (requirements.some((line) => line.shortageAfterIncoming >= line.requiredQuantity)) feasibility = "SHORT_COMPONENTS";
@@ -1022,8 +1247,21 @@ export class PlanningDatabase {
           durationHours: Math.max(0, (end - start) / 3_600_000),
         };
       });
+      const activity = (activityStatement.all(row.id) as Row[]).map((entry) => ({
+        id: text(entry.id),
+        eventType: entry.event_type,
+        actorName: text(entry.actor_name),
+        actorRole: text(entry.actor_role),
+        summary: text(entry.summary),
+        createdAt: text(entry.created_at),
+      }));
       return {
         id: text(row.id),
+        orderType,
+        serialNumber: text(row.serial_number),
+        warrantyStatus: orderType === "SERVICE"
+          ? warrantyStatusForSerial(text(row.serial_number), text(row.created_at))
+          : "NOT_APPLICABLE",
         fileNumber: text(row.file_number),
         organisation: text(row.organisation),
         externalReference: text(row.external_reference),
@@ -1050,6 +1288,7 @@ export class PlanningDatabase {
         workflowStateName: text(row.workflow_state_name) || "Pending",
         workflowStateColor: text(row.workflow_state_color) || "#6B778C",
         stageHistory,
+        activity,
         bomVersionId: row.bom_version_id ? text(row.bom_version_id) : null,
         bomVersionLabel: row.bom_version_id ? `${text(row.bom_label)} (v${row.bom_version_number})` : "No active BOM",
         feasibility,
@@ -1146,14 +1385,6 @@ export class PlanningDatabase {
       WHERE item.active = 1
         AND item.catalog_ignored = 0
         AND item.catalog_status <> 'DUPLICATE'
-        AND (
-          item.catalog_status <> 'OBSOLETE'
-          OR EXISTS (
-            SELECT 1 FROM purchase_lots stocked_lot
-            WHERE stocked_lot.stock_item_id = item.id
-              AND stocked_lot.quantity_remaining > 0
-          )
-        )
       ORDER BY item.name
     `).all() as Row[];
     return rows.map((row) => {
@@ -1284,9 +1515,9 @@ export class PlanningDatabase {
       healthy: items.filter((item) => item.health === "HEALTHY").length,
       excess: items.filter((item) => item.health === "EXCESS").length,
       unconfigured: items.filter((item) => item.health === "UNCONFIGURED").length,
-      ordersAtRisk: productOrders.filter((order) => ["AT_RISK", "SHORT_COMPONENTS", "BOM_INCOMPLETE"].includes(order.feasibility) && order.status === "CONFIRMED").length,
-      ordersReady: productOrders.filter((order) => ["READY", "READY_WITH_INCOMING"].includes(order.feasibility) && order.status === "CONFIRMED").length,
-      missingBom: productOrders.filter((order) => order.feasibility === "BOM_INCOMPLETE" && order.status === "CONFIRMED").length,
+      ordersAtRisk: productOrders.filter((order) => order.orderType === "PRODUCTION" && ["AT_RISK", "SHORT_COMPONENTS", "BOM_INCOMPLETE"].includes(order.feasibility) && order.status === "CONFIRMED").length,
+      ordersReady: productOrders.filter((order) => order.orderType === "PRODUCTION" && ["READY", "READY_WITH_INCOMING"].includes(order.feasibility) && order.status === "CONFIRMED").length,
+      missingBom: productOrders.filter((order) => order.orderType === "PRODUCTION" && order.feasibility === "BOM_INCOMPLETE" && order.status === "CONFIRMED").length,
     };
     return {
       moduleVersion: this.host.moduleVersion(MODULE_NAME),

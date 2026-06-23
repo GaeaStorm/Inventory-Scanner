@@ -80,11 +80,8 @@ export default function CatalogStatusPanel(props: {
       props.onNotice(
         action === "DUPLICATE"
           ? `${selected.name} is now hidden as a duplicate.`
-          : `${selected.name} is marked obsolete and will remain selectable only while stock remains.`,
+          : `${selected.name} is marked obsolete and has been sent to Accounts for a restock decision.`,
       );
-      if (action === "OBSOLETE") {
-        window.alert("This item is now obsolete. Open its Restock Policy and set a target quantity intended to cover roughly 3–4 years of expected usage.");
-      }
       setItemGuid("");
       setPrimaryGuid("");
     } catch (error) {

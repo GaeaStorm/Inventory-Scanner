@@ -87,6 +87,15 @@ export interface TallyPurchaseOrder {
   lines: TallyVoucherInventoryLine[];
 }
 
+export interface TallySalesOrder {
+  guid: string;
+  voucherNumber: string;
+  voucherDate: string;
+  customerName: string;
+  reference: string;
+  lines: TallyVoucherInventoryLine[];
+}
+
 export interface TallyGrn {
   guid: string;
   voucherNumber: string;
@@ -129,6 +138,7 @@ export interface TallyStoresSnapshot {
   bomComponents: TallyBomComponent[];
   suppliers: TallySupplier[];
   purchaseOrders: TallyPurchaseOrder[];
+  salesOrders?: TallySalesOrder[];
   grns: TallyGrn[];
   voucherTypes?: TallyVoucherType[];
   historyScan?: TallyHistoryScanSummary;

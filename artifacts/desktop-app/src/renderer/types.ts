@@ -4,13 +4,37 @@ export interface DesktopInfo {
   appVersion: string;
   apiBaseUrl: string;
   computerName: string;
-  deploymentRole: "PRODUCTION_SERVER" | "LAN_CLIENT";
+  deploymentRole: DeploymentRole;
   tallyComputerHost: string;
   dataDirectory: string;
   excelPath: string;
   databasePath: string;
   port: number;
   scannerUrls: string[];
+}
+
+export type DeploymentRole = "UNCONFIGURED" | "PRODUCTION_SERVER" | "LAN_CLIENT";
+
+export interface DeploymentState {
+  configured: boolean;
+  role: DeploymentRole;
+  productionHost: string;
+  inventoryPort: number;
+  tallyHost: string;
+  tallyPort: number;
+  accountsComputer: boolean;
+  platform: string;
+  productionUrl: string;
+}
+
+export interface SaveDeploymentInput {
+  role: Exclude<DeploymentRole, "UNCONFIGURED">;
+  productionHost: string;
+  inventoryPort: number;
+  tallyHost: string;
+  tallyPort: number;
+  accountsComputer: boolean;
+  configureWindowsFirewall: boolean;
 }
 
 export interface Product {

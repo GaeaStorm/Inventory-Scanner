@@ -6,10 +6,12 @@ import AuthGate from "./AuthGate";
 import BoxQrCodeCreatorTab from "./BoxQrCodeCreatorTab";
 import BulkMaterialInForm from "./BulkMaterialInForm";
 import CatalogStatusPanel from "./CatalogStatusPanel";
+import DeploymentSetup from "./DeploymentSetup";
 import InventoryPlanningDashboard from "./InventoryPlanningDashboard";
 import OpeningQuantityPanel from "./OpeningQuantityPanel";
 import OperationsTab from "./OperationsTab";
 import TallyTab from "./TallyTab";
+import UserManagementPanel from "./UserManagementPanel";
 import {
   getDashboard,
   getScannerQrUrl,
@@ -21,6 +23,7 @@ import type {
   AuthState,
   DashboardState,
   DesktopInfo,
+  DeploymentState,
   OperationsState,
   Permission,
   PlanningState,
@@ -66,6 +69,8 @@ export default function App() {
   const [auth, setAuth] = useState<AuthState | null>(null);
   const [session, setSession] = useState<AuthSession | null>(null);
   const [desktopInfo, setDesktopInfo] = useState<DesktopInfo | null>(null);
+  const [deployment, setDeployment] = useState<DeploymentState | null>(null);
+  const [showDeploymentSetup, setShowDeploymentSetup] = useState(false);
   const [dashboard, setDashboard] = useState<DashboardState | null>(null);
   const [stores, setStores] = useState<StoresState | null>(null);
   const [planning, setPlanning] = useState<PlanningState | null>(null);
@@ -96,6 +101,13 @@ export default function App() {
     let cancelled = false;
     async function initialize() {
       try {
+        const deploymentState = await window.desktop.deployment.getState();
+        if (cancelled) return;
+        setDeployment(deploymentState);
+        if (!deploymentState.configured) {
+          setShowDeploymentSetup(true);
+          return;
+        }
         const info = await window.desktop.getInfo();
         if (cancelled) return;
         setDesktopInfo(info);
@@ -118,7 +130,10 @@ export default function App() {
           setAuth(await window.desktop.auth.state());
         }
       } catch (reason) {
-        if (!cancelled) setError(reason instanceof Error ? reason.message : String(reason));
+        if (!cancelled) {
+          setError(reason instanceof Error ? reason.message : String(reason));
+          setShowDeploymentSetup(true);
+        }
       } finally {
         if (!cancelled) setLoading(false);
       }
@@ -197,7 +212,11 @@ export default function App() {
   }
 
   if (loading) {
-    return <main className="loading-screen">Opening the Local Stores Database…</main>;
+    return <main className="loading-screen">Opening Inventory Scanner…</main>;
+  }
+
+  if (showDeploymentSetup && deployment) {
+    return <DeploymentSetup state={deployment} onCancel={deployment.configured && auth ? () => setShowDeploymentSetup(false) : undefined} />;
   }
 
   if (!session || !auth?.currentUser) {
@@ -322,15 +341,18 @@ export default function App() {
                   <div><dt>Tally computer</dt><dd>{desktopInfo?.tallyComputerHost ?? "accounts"}:9000</dd></div>
                 </dl>
                 <p className="table-footnote">{desktopInfo?.deploymentRole === "LAN_CLIENT" ? "This installation has no local company database. Your role and all changes are validated by Production." : "Keep this computer running during company use. Accounts exposes Tally over the LAN; all inventory records and backups remain here."}</p>
+                <div className="settings-actions">
+                  <button className="button button--secondary" type="button" onClick={() => setShowDeploymentSetup(true)}>Change LAN setup</button>
+                </div>
               </article>
               <article className="panel">
                 <div className="panel__header"><div><p className="eyebrow">PHONE CONNECTION</p><h2>Connect the Expo scanner</h2></div></div>
                 <div className="scanner-settings">
                   <div className="scanner-qr-card">{scannerQrUrl ? <img src={scannerQrUrl} alt="Phone scanner connection QR" /> : <span>No LAN address detected</span>}</div>
-                  <div className="scanner-address-controls">
+                  {/* <div className="scanner-address-controls">
                     <label>Desktop API address<select value={selectedScannerUrl} onChange={(event) => setSelectedScannerUrl(event.target.value)}>{scannerUrls.map((url) => <option key={url}>{url}</option>)}</select></label>
                     <button className="button button--secondary" type="button" onClick={() => void navigator.clipboard.writeText(selectedScannerUrl)} disabled={!selectedScannerUrl}>Copy address</button>
-                  </div>
+                  </div> */}
                 </div>
               </article>
               <article className="panel settings-database-card">
@@ -338,6 +360,13 @@ export default function App() {
                 <dl className="settings-details"><div><dt>Path</dt><dd>{stores.database.path}</dd></div><div><dt>Schema</dt><dd>v{stores.database.schemaVersion}</dd></div><div><dt>Size</dt><dd>{formatBytes(stores.database.sizeBytes)}</dd></div><div><dt>Latest backup</dt><dd>{stores.database.latestBackup ?? "—"}</dd></div><div><dt>Host ID</dt><dd><code>{stores.database.hostId}</code></dd></div><div><dt>Writer mode</dt><dd>Authoritative desktop host</dd></div></dl>
               </article>
             </div>
+
+            {can("AUTH_MANAGE_USERS") && <UserManagementPanel
+              auth={auth}
+              onRefresh={refresh}
+              onNotice={setNotice}
+              onError={setError}
+            />}
 
             {desktopInfo?.deploymentRole !== "LAN_CLIENT" && <BackupRestorePanel
               stores={stores}

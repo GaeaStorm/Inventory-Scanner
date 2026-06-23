@@ -4,6 +4,8 @@ import type {
   ConfirmImportInput,
   CreateLocalStockItemInput,
   DesktopInfo,
+  DeploymentState,
+  SaveDeploymentInput,
   ExportBatchInput,
   ExportBatchResult,
   OpeningQuantityInput,
@@ -60,6 +62,11 @@ export {};
 declare global {
   interface Window {
     desktop: {
+      deployment: {
+        getState: () => Promise<DeploymentState>;
+        testProduction: (input: Pick<SaveDeploymentInput, "productionHost" | "inventoryPort">) => Promise<{ ok: true; url: string; message: string }>;
+        save: (input: SaveDeploymentInput) => Promise<DeploymentState>;
+      };
       getInfo: () => Promise<DesktopInfo>;
       auth: {
         state: (token?: string) => Promise<AuthState>;
@@ -82,6 +89,7 @@ declare global {
         syncStores: (settings: TallyConnectionSettings) => Promise<{
           snapshot: import("../tally/types").TallyStoresSnapshot;
           summary: import("../stores/types").StoresSyncSummary;
+          orderImport: { imported: number; skipped: number; unmatched: number };
           state: StoresState;
         }>;
       };
@@ -119,6 +127,7 @@ declare global {
           status: "CANCELLED" | "COMPLETED" | "CONFIRMED",
         ) => Promise<PlanningState>;
         updateProductOrderWorkflowState: (orderId: string, workflowStateId: string) => Promise<PlanningState>;
+        bulkUpdateProductOrders: (input: import("../planning/types").BulkProductOrderUpdateInput) => Promise<PlanningState>;
         saveProductOrderWorkflowState: (input: SaveProductOrderWorkflowStateInput) => Promise<PlanningState>;
         deleteProductOrderWorkflowState: (stateId: string) => Promise<PlanningState>;
         saveProductOrderFieldDefinition: (input: SaveProductOrderFieldDefinitionInput) => Promise<PlanningState>;

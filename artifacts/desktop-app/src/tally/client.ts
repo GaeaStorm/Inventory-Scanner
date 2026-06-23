@@ -10,6 +10,7 @@ import type {
   TallyGrn,
   TallyNamedMaster,
   TallyPurchaseOrder,
+  TallySalesOrder,
   TallyStockItem,
   TallyStoresSnapshot,
   TallySupplier,
@@ -482,7 +483,7 @@ function mapVoucherTypes(nodes: unknown[]): TallyVoucherType[] {
   ).sort((left, right) => left.name.localeCompare(right.name));
 }
 
-type StoresVoucherKind = "PURCHASE_ORDER" | "RECEIPT_NOTE" | "PURCHASE" | null;
+type StoresVoucherKind = "PURCHASE_ORDER" | "SALES_ORDER" | "RECEIPT_NOTE" | "PURCHASE" | null;
 
 function voucherTypeKind(
   voucherTypeName: string,
@@ -508,6 +509,7 @@ function voucherTypeKind(
 
   const normalized = candidates.map(normalizeKey);
   if (normalized.some((value) => value.includes("PURCHASEORDER"))) return "PURCHASE_ORDER";
+  if (normalized.some((value) => value.includes("SALESORDER"))) return "SALES_ORDER";
   if (normalized.some((value) => value.includes("RECEIPTNOTE") || value === "GRN" || value.includes("GOODSRECEIPT"))) {
     return "RECEIPT_NOTE";
   }
@@ -725,6 +727,24 @@ function mapPurchaseOrders(
   );
 }
 
+function mapSalesOrders(
+  nodes: unknown[],
+  stockItems: TallyStockItem[],
+): TallySalesOrder[] {
+  const itemByName = new Map(stockItems.map((item) => [item.name.toLocaleLowerCase(), item]));
+  return uniqueBy(
+    nodes.map((node) => ({
+      guid: directField(node, ["GUID"]),
+      voucherNumber: directField(node, ["VoucherNumber"]),
+      voucherDate: normalizeTallyDate(directField(node, ["Date", "EffectiveDate"])),
+      customerName: nestedField(node, ["PartyLedgerName"]),
+      reference: directField(node, ["Reference", "BasicOrderRef"]),
+      lines: mapInventoryLines(node, itemByName),
+    })).filter((order) => order.voucherNumber || order.guid),
+    (order) => order.guid || `${order.voucherDate}\u0000${order.voucherNumber}`,
+  );
+}
+
 function mapGrns(
   nodes: unknown[],
   stockItems: TallyStockItem[],
@@ -891,6 +911,7 @@ export class TallyClient {
       toDate,
     };
     let purchaseOrderNodes: unknown[] = [];
+    let salesOrderNodes: unknown[] = [];
     let grnNodes: unknown[] = [];
     let purchaseNodes: unknown[] = [];
     let historyScan: NonNullable<TallyStoresSnapshot["historyScan"]>;
@@ -929,11 +950,14 @@ export class TallyClient {
           const persistedView = normalizeKey(directField(voucher, ["PersistedView"]));
           if (persistedView.includes("RECEIPTNOTE")) kind = "RECEIPT_NOTE";
           else if (persistedView.includes("PURCHASEORDER")) kind = "PURCHASE_ORDER";
+          else if (persistedView.includes("SALESORDER")) kind = "SALES_ORDER";
         }
 
         if (kind === "PURCHASE_ORDER") {
           purchaseOrderNodes.push(voucher);
           if (typeName) purchaseOrderTypeNames.add(typeName);
+        } else if (kind === "SALES_ORDER") {
+          salesOrderNodes.push(voucher);
         } else if (kind === "RECEIPT_NOTE") {
           grnNodes.push(voucher);
           if (typeName) receiptNoteTypeNames.add(typeName);
@@ -973,6 +997,13 @@ export class TallyClient {
         VOUCHER_METHODS,
         { ...dateOptions, filterFormula: '$VoucherTypeName = "Purchase Order"' },
       );
+      salesOrderNodes = await optionalCollection(
+        "Sales Orders",
+        "Inventory Scanner Sales Orders",
+        "Voucher",
+        VOUCHER_METHODS,
+        { ...dateOptions, filterFormula: '$VoucherTypeName = "Sales Order"' },
+      );
       grnNodes = await optionalCollection(
         "Receipt Notes / GRNs",
         "Inventory Scanner Receipt Notes",
@@ -991,8 +1022,8 @@ export class TallyClient {
         fromDate: settings.historyFrom,
         toDate,
         dateChunks: 1,
-        vouchersScanned: purchaseOrderNodes.length + grnNodes.length + purchaseNodes.length,
-        inventoryVouchersScanned: purchaseOrderNodes.length + grnNodes.length + purchaseNodes.length,
+        vouchersScanned: purchaseOrderNodes.length + salesOrderNodes.length + grnNodes.length + purchaseNodes.length,
+        inventoryVouchersScanned: purchaseOrderNodes.length + salesOrderNodes.length + grnNodes.length + purchaseNodes.length,
         purchaseOrdersFound: purchaseOrderNodes.length,
         receiptNotesFound: grnNodes.length,
         purchaseVouchersFound: purchaseNodes.length,
@@ -1000,11 +1031,12 @@ export class TallyClient {
         purchaseOrderTypeNames: ["Purchase Order"],
         receiptNoteTypeNames: ["Receipt Note"],
         purchaseTypeNames: ["Purchase"],
-        inventoryVoucherTypeNames: ["Purchase Order", "Receipt Note", "Purchase"],
+        inventoryVoucherTypeNames: ["Purchase Order", "Sales Order", "Receipt Note", "Purchase"],
       };
     }
 
     const purchaseOrders = mapPurchaseOrders(purchaseOrderNodes, stockItems, suppliers);
+    const salesOrders = mapSalesOrders(salesOrderNodes, stockItems);
     const grns = mapGrns(grnNodes, stockItems, suppliers);
     mergePurchaseRates(grns, purchaseNodes, stockItems);
 
@@ -1031,6 +1063,7 @@ export class TallyClient {
       bomComponents,
       suppliers,
       purchaseOrders,
+      salesOrders,
       grns,
       voucherTypes,
       historyScan,

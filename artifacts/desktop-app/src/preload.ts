@@ -1,9 +1,25 @@
 import { contextBridge, ipcRenderer } from "electron";
 
 let sessionToken = "";
-const remoteServerUrl = (process.env.INVENTORY_SCANNER_REMOTE_URL ?? "").trim().replace(/\/+$/, "");
+let remoteServerUrl = "";
+let deploymentLoaded = false;
+
+async function getDeploymentState() {
+  const state = await ipcRenderer.invoke("deployment:get-state") as {
+    role: "UNCONFIGURED" | "PRODUCTION_SERVER" | "LAN_CLIENT";
+    productionUrl: string;
+  };
+  remoteServerUrl = state.role === "LAN_CLIENT" ? state.productionUrl.replace(/\/+$/, "") : "";
+  deploymentLoaded = true;
+  return state;
+}
+
+async function ensureDeploymentLoaded(): Promise<void> {
+  if (!deploymentLoaded) await getDeploymentState();
+}
 
 async function authenticatedSession(channel: string, ...args: unknown[]) {
+  await ensureDeploymentLoaded();
   if (remoteServerUrl && channel === "desktop:print-html") {
     return ipcRenderer.invoke(channel, sessionToken, ...args);
   }
@@ -12,6 +28,8 @@ async function authenticatedSession(channel: string, ...args: unknown[]) {
 }
 
 async function remoteRequest(path: string, init?: RequestInit) {
+  await ensureDeploymentLoaded();
+  if (!remoteServerUrl) throw new Error("This computer is not configured as a LAN client.");
   const response = await fetch(`${remoteServerUrl}${path}`, {
     ...init,
     headers: {
@@ -62,6 +80,7 @@ async function remoteChannel(channel: string, args: unknown[]) {
     case "planning:save-product-order": return remoteRequest("/api/planning/product-orders", jsonBody(first));
     case "planning:update-product-order-status": return remoteRequest(`/api/planning/product-orders/${encodeURIComponent(String(first))}/status`, jsonBody({ status: second }));
     case "planning:update-product-order-workflow-state": return remoteRequest(`/api/planning/product-orders/${encodeURIComponent(String(first))}/workflow-state`, jsonBody({ workflowStateId: second }));
+    case "planning:bulk-update-product-orders": return remoteRequest("/api/planning/product-orders/bulk-update", jsonBody(first));
     case "planning:save-product-order-workflow-state": return remoteRequest("/api/planning/product-order-workflow-states", jsonBody(first));
     case "planning:delete-product-order-workflow-state": return remoteRequest(`/api/planning/product-order-workflow-states/${encodeURIComponent(String(first))}`, { method: "DELETE" });
     case "planning:save-product-order-field-definition": return remoteRequest("/api/planning/product-order-fields", jsonBody(first));
@@ -102,33 +121,58 @@ function rememberSession<T extends { token?: string }>(session: T): T {
 }
 
 contextBridge.exposeInMainWorld("desktop", {
-  getInfo: () => ipcRenderer.invoke("desktop:get-info"),
+  deployment: {
+    getState: () => getDeploymentState(),
+    testProduction: (input: unknown) => ipcRenderer.invoke("deployment:test-production", input),
+    save: (input: unknown) => ipcRenderer.invoke("deployment:save", input),
+  },
+  getInfo: async () => {
+    const info = await ipcRenderer.invoke("desktop:get-info");
+    remoteServerUrl = info.deploymentRole === "LAN_CLIENT" ? String(info.apiBaseUrl).replace(/\/+$/, "") : "";
+    deploymentLoaded = true;
+    return info;
+  },
   auth: {
-    state: (token?: string) => remoteServerUrl
-      ? remoteRequest("/api/operations/auth/state", { headers: token ? { "X-Inventory-Session": token } : undefined })
-      : ipcRenderer.invoke("auth:state", token ?? sessionToken),
-    bootstrap: async (input: unknown) => rememberSession(remoteServerUrl
-      ? await remoteRequest("/api/operations/auth/bootstrap", jsonBody(input))
-      : await ipcRenderer.invoke("auth:bootstrap", input)),
-    login: async (input: unknown) => rememberSession(remoteServerUrl
-      ? await remoteRequest("/api/operations/auth/login", jsonBody(input))
-      : await ipcRenderer.invoke("auth:login", input)),
-    updateEmail: (input: unknown) => remoteServerUrl
-      ? remoteRequest("/api/operations/auth/email", jsonBody(input))
-      : ipcRenderer.invoke("auth:update-email", sessionToken, input),
+    state: async (token?: string) => {
+      await ensureDeploymentLoaded();
+      return remoteServerUrl
+        ? remoteRequest("/api/operations/auth/state", { headers: token ? { "X-Inventory-Session": token } : undefined })
+        : ipcRenderer.invoke("auth:state", token ?? sessionToken);
+    },
+    bootstrap: async (input: unknown) => {
+      await ensureDeploymentLoaded();
+      return rememberSession(remoteServerUrl
+        ? await remoteRequest("/api/operations/auth/bootstrap", jsonBody(input))
+        : await ipcRenderer.invoke("auth:bootstrap", input));
+    },
+    login: async (input: unknown) => {
+      await ensureDeploymentLoaded();
+      return rememberSession(remoteServerUrl
+        ? await remoteRequest("/api/operations/auth/login", jsonBody(input))
+        : await ipcRenderer.invoke("auth:login", input));
+    },
+    updateEmail: async (input: unknown) => {
+      await ensureDeploymentLoaded();
+      return remoteServerUrl
+        ? remoteRequest("/api/operations/auth/email", jsonBody(input))
+        : ipcRenderer.invoke("auth:update-email", sessionToken, input);
+    },
     forgotPassword: async (input: unknown) => {
+      await ensureDeploymentLoaded();
       if (remoteServerUrl) {
         throw new Error("For security, forgotten credentials must be reset on the Production server computer or by an administrator.");
       }
       return ipcRenderer.invoke("auth:forgot-password", input);
     },
     resume: async (token: string) => {
+      await ensureDeploymentLoaded();
       sessionToken = token;
       return rememberSession(remoteServerUrl
         ? await remoteRequest("/api/operations/auth/resume", jsonBody({ token }))
         : await ipcRenderer.invoke("auth:resume", token));
     },
     logout: async () => {
+      await ensureDeploymentLoaded();
       if (remoteServerUrl) await remoteRequest("/api/operations/auth/logout", { method: "POST" });
       else await ipcRenderer.invoke("auth:logout", sessionToken);
       sessionToken = "";
@@ -176,6 +220,7 @@ contextBridge.exposeInMainWorld("desktop", {
     saveProductOrder: (input: unknown) => authenticatedSession("planning:save-product-order", input),
     updateProductOrderStatus: (orderId: string, status: string) => authenticatedSession("planning:update-product-order-status", orderId, status),
     updateProductOrderWorkflowState: (orderId: string, workflowStateId: string) => authenticatedSession("planning:update-product-order-workflow-state", orderId, workflowStateId),
+    bulkUpdateProductOrders: (input: unknown) => authenticatedSession("planning:bulk-update-product-orders", input),
     saveProductOrderWorkflowState: (input: unknown) => authenticatedSession("planning:save-product-order-workflow-state", input),
     deleteProductOrderWorkflowState: (stateId: string) => authenticatedSession("planning:delete-product-order-workflow-state", stateId),
     saveProductOrderFieldDefinition: (input: unknown) => authenticatedSession("planning:save-product-order-field-definition", input),

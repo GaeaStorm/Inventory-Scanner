@@ -14,6 +14,8 @@
     "build": "pnpm run build:renderer && pnpm run build:electron",
     "package": "pnpm run build && electron-builder --dir",
     "dist": "pnpm run build && electron-builder",
+    "dist:mac": "pnpm run build && electron-builder --mac dmg --arm64",
+    "dist:win": "pnpm run build && electron-builder --win nsis --x64",
     "typecheck": "tsc --noEmit",
     "test": "node ./scripts/run-tests.mjs"
   },
@@ -53,6 +55,7 @@
       "package.json"
     ],
     "asar": true,
+    "compression": "maximum",
     "npmRebuild": false,
     "electronLanguages": [
       "en-US"

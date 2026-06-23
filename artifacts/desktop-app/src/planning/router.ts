@@ -20,6 +20,9 @@ export function createPlanningRouter(service: PlanningService, operations: Opera
   router.post("/boms", (request, response) => response.status(201).json(service.saveBom(request.body, actor(request, "BOM_MANAGE"))));
   router.post("/boms/:bomId/activate", (request, response) => response.json(service.activateBom(request.params.bomId, actor(request, "BOM_MANAGE"))));
   router.post("/product-orders", (request, response) => response.status(201).json(service.saveProductOrder(request.body, actor(request, "PRODUCT_ORDER_MANAGE"))));
+  router.post("/product-orders/bulk-update", (request, response) => response.json(
+    service.bulkUpdateProductOrders(request.body, actor(request, "PRODUCT_ORDER_MANAGE")),
+  ));
   router.post("/product-orders/:orderId/status", (request, response) => response.json(
     service.updateProductOrderStatus(request.params.orderId, request.body.status, actor(request, "PRODUCT_ORDER_MANAGE")),
   ));

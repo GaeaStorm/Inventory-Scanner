@@ -8,7 +8,7 @@ import {
   View,
 } from "react-native";
 import { CameraView, type BarcodeScanningResult, useCameraPermissions } from "expo-camera";
-import { Feather } from "@expo/vector-icons";
+import Feather from "@expo/vector-icons/Feather";
 import { SafeAreaView } from "react-native-safe-area-context";
 
 import { useColors } from "@/hooks/useColors";

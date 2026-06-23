@@ -1,10 +1,12 @@
 import type { ApplicationDatabase } from "../database/application-database";
 import type { StoresService } from "../stores/service";
 import type { ActorContext } from "../operations/types";
+import type { TallySalesOrder } from "../tally/types";
 import { requirePermission } from "../operations/permissions";
 import { PlanningDatabase } from "./database";
 import { PlanningExporter } from "./exporter";
 import type {
+  BulkProductOrderUpdateInput,
   PlanningExportInput,
   RecommendationDecisionInput,
   RestockPolicyInput,
@@ -65,20 +67,44 @@ export class PlanningService {
 
   saveProductOrder(input: SaveProductOrderInput, actor: ActorContext) {
     requirePermission(actor, "PRODUCT_ORDER_MANAGE");
-    this.database.saveProductOrder(input);
+    this.database.saveProductOrder(input, actor);
     return this.getState();
   }
 
   updateProductOrderStatus(orderId: string, status: "CANCELLED" | "COMPLETED" | "CONFIRMED", actor: ActorContext) {
     requirePermission(actor, "PRODUCT_ORDER_MANAGE");
-    this.database.updateProductOrderStatus(orderId, status);
+    this.database.updateProductOrderStatus(orderId, status, actor);
     return this.getState();
   }
 
   updateProductOrderWorkflowState(orderId: string, workflowStateId: string, actor: ActorContext) {
     requirePermission(actor, "PRODUCT_ORDER_MANAGE");
-    this.database.updateProductOrderWorkflowState(orderId, workflowStateId);
+    this.database.updateProductOrderWorkflowState(orderId, workflowStateId, actor);
     return this.getState();
+  }
+
+  bulkUpdateProductOrders(input: BulkProductOrderUpdateInput, actor: ActorContext) {
+    requirePermission(actor, "PRODUCT_ORDER_MANAGE");
+    this.database.bulkUpdateProductOrders(input, actor);
+    return this.getState();
+  }
+
+  importTallySalesOrders(orders: TallySalesOrder[], actor: ActorContext) {
+    requirePermission(actor, "TALLY_REVIEW");
+    const lines = orders.flatMap((order) => order.lines
+      .filter((line) => line.quantity != null && line.quantity > 0)
+      .map((line) => ({
+        tallyGuid: order.guid,
+        voucherNumber: order.voucherNumber,
+        voucherDate: order.voucherDate,
+        customerName: order.customerName,
+        reference: order.reference,
+        productTallyGuid: line.itemGuid,
+        productName: line.itemName,
+        quantity: line.quantity!,
+        value: line.value,
+      })));
+    return this.database.importTallySalesOrders(lines, actor);
   }
 
   saveProductOrderWorkflowState(input: SaveProductOrderWorkflowStateInput, actor: ActorContext) {

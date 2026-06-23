@@ -40,6 +40,10 @@ function duration(hours: number): string {
   return `${(hours / 24).toFixed(hours < 240 ? 1 : 0)} days`;
 }
 
+function stageLabel(value: string): string {
+  return value.replace(/^Service · /, "");
+}
+
 export default function AdministrationDashboard({ operations, planning, onRefresh }: Props) {
   const wastage = operations.wastage;
   const [selectedStage, setSelectedStage] = useState("");
@@ -79,25 +83,28 @@ export default function AdministrationDashboard({ operations, planning, onRefres
     {wastage.unvaluedQuantity > 0 && <div className="alert alert--warning">Some scrapped stock has no purchase rate in its source lot. The displayed rupee total excludes those units.</div>}
     <article className="panel administration-stages">
       <div className="panel__header"><div><p className="eyebrow">ORDER CYCLE</p><h2>Time spent in each stage</h2></div><span className="table-count">Click a stage for order details</span></div>
-      <div className="administration-stage-list">
-        {stageMetrics.map((stage) => <button className={selectedStage === stage.id ? "active" : ""} type="button" key={stage.id} onClick={() => setSelectedStage((current) => current === stage.id ? "" : stage.id)}>
-          <span style={{ background: stage.color }} />
-          <strong>{stage.name}</strong>
-          <small>{stage.completedCount ? `Typical ${duration(stage.completedAverage)}` : "No completed history"}</small>
-          <b>{stage.activeCount ? `${stage.activeCount} active · ${duration(stage.currentAverage)} so far` : "No active orders"}</b>
-        </button>)}
-      </div>
+      {(["PRODUCTION", "SERVICE"] as const).map((orderType) => <section className="administration-stage-section" key={orderType}>
+        <h3>{orderType === "PRODUCTION" ? "Production Orders" : "Service Orders"}</h3>
+        <div className="administration-stage-list">
+          {stageMetrics.filter((stage) => stage.orderType === orderType).map((stage) => <button className={selectedStage === stage.id ? "active" : ""} type="button" key={stage.id} onClick={() => setSelectedStage((current) => current === stage.id ? "" : stage.id)}>
+            <span style={{ background: stage.color }} />
+            <strong>{stageLabel(stage.name)}</strong>
+            <small>{stage.completedCount ? `Typical ${duration(stage.completedAverage)}` : "No completed history"}</small>
+            <b>{stage.activeCount ? `${stage.activeCount} active · ${duration(stage.currentAverage)} so far` : "No active orders"}</b>
+          </button>)}
+        </div>
+      </section>)}
       {selected && <div className="administration-stage-detail">
-        <h3>{selected.name} · order-level history</h3>
-        <div className="table-scroll"><table><thead><tr><th>Customer / PO</th><th>Product</th><th>Entered</th><th>Exited</th><th>Time in stage</th><th>Journey</th></tr></thead><tbody>
-          {selected.visits.slice().sort((left, right) => right.entry.enteredAt.localeCompare(left.entry.enteredAt)).map(({ order, entry }) => <tr key={entry.id}><td><strong>{order.organisation || "Customer not set"}</strong><small className="table-subtext">{order.externalReference || order.fileNumber || "PO not set"}</small></td><td>{order.productName}</td><td>{new Date(entry.enteredAt).toLocaleString("en-IN")}</td><td>{entry.exitedAt ? new Date(entry.exitedAt).toLocaleString("en-IN") : "Current"}</td><td>{duration(entry.durationHours)}</td><td><button className="text-button" type="button" onClick={() => setSelectedOrderId(order.id)}>View all stages</button></td></tr>)}
+        <h3>{selected.orderType === "SERVICE" ? "Service" : "Production"} · {stageLabel(selected.name)} · order-level history</h3>
+        <div className="table-scroll"><table><thead><tr><th>Customer / Order</th><th>Product / Serial</th><th>Entered</th><th>Exited</th><th>Time in stage</th><th>Journey</th></tr></thead><tbody>
+          {selected.visits.slice().sort((left, right) => right.entry.enteredAt.localeCompare(left.entry.enteredAt)).map(({ order, entry }) => <tr key={entry.id}><td><strong>{order.organisation || "Customer not set"}</strong><small className="table-subtext">{order.externalReference || order.fileNumber || "Order not set"}</small></td><td>{order.productName}{order.serialNumber && <small className="table-subtext">{order.serialNumber}</small>}</td><td>{new Date(entry.enteredAt).toLocaleString("en-IN")}</td><td>{entry.exitedAt ? new Date(entry.exitedAt).toLocaleString("en-IN") : "Current"}</td><td>{duration(entry.durationHours)}</td><td><button className="text-button" type="button" onClick={() => setSelectedOrderId(order.id)}>View all stages</button></td></tr>)}
           {selected.visits.length === 0 && <tr><td colSpan={6} className="empty-table">No orders have entered this stage yet.</td></tr>}
         </tbody></table></div>
       </div>}
       {selectedOrder && <div className="administration-order-journey">
-        <div><p className="eyebrow">ORDER JOURNEY</p><h3>{selectedOrder.organisation || "Customer not set"} · {selectedOrder.externalReference || selectedOrder.fileNumber || "PO not set"}</h3><p>{selectedOrder.productName}</p></div>
+        <div><p className="eyebrow">{selectedOrder.orderType === "SERVICE" ? "SERVICE ORDER JOURNEY" : "PRODUCTION ORDER JOURNEY"}</p><h3>{selectedOrder.organisation || "Customer not set"} · {selectedOrder.externalReference || selectedOrder.fileNumber || "Order not set"}</h3><p>{selectedOrder.productName}{selectedOrder.serialNumber ? ` · ${selectedOrder.serialNumber}` : ""}</p></div>
         <button className="icon-button" type="button" aria-label="Close order journey" onClick={() => setSelectedOrderId("")}>×</button>
-        <div className="administration-order-journey__stages">{selectedOrder.stageHistory.map((entry) => <div key={entry.id}><span>{entry.stateName}</span><strong>{duration(entry.durationHours)}</strong><small>{entry.exitedAt ? `${new Date(entry.enteredAt).toLocaleDateString("en-IN")} – ${new Date(entry.exitedAt).toLocaleDateString("en-IN")}` : `Since ${new Date(entry.enteredAt).toLocaleString("en-IN")}`}</small></div>)}</div>
+        <div className="administration-order-journey__stages">{selectedOrder.stageHistory.map((entry) => <div key={entry.id}><span>{stageLabel(entry.stateName)}</span><strong>{duration(entry.durationHours)}</strong><small>{entry.exitedAt ? `${new Date(entry.enteredAt).toLocaleDateString("en-IN")} – ${new Date(entry.exitedAt).toLocaleDateString("en-IN")}` : `Since ${new Date(entry.enteredAt).toLocaleString("en-IN")}`}</small></div>)}</div>
       </div>}
     </article>
     <div className="administration-dashboard__grid">

@@ -923,6 +923,149 @@ code {
   color: #657086;
 }
 
+.deployment-screen {
+  display: grid;
+  min-height: 100vh;
+  place-items: center;
+  padding: 32px;
+}
+
+.deployment-card {
+  width: min(820px, 100%);
+}
+
+.deployment-card .auth-brand {
+  margin-bottom: 24px;
+}
+
+.deployment-card .auth-brand p:not(.eyebrow) {
+  margin: 8px 0 0;
+}
+
+.deployment-role-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+  margin: 22px 0;
+}
+
+.deployment-role {
+  display: grid;
+  gap: 7px;
+  min-height: 112px;
+  border: 1px solid #dfe4ed;
+  border-radius: 13px;
+  background: #fbfcfe;
+  color: #263148;
+  padding: 18px;
+  text-align: left;
+}
+
+.deployment-role strong {
+  font-size: 16px;
+}
+
+.deployment-role span {
+  color: #707b90;
+  line-height: 1.5;
+}
+
+.deployment-role--selected {
+  border-color: #6780e8;
+  background: #f0f4ff;
+  box-shadow: 0 0 0 3px rgba(83, 111, 229, 0.12);
+}
+
+.deployment-form {
+  margin-top: 16px;
+}
+
+.deployment-check {
+  margin-top: 18px;
+}
+
+.deployment-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: 24px;
+}
+
+.account-setup-panel {
+  margin-bottom: 20px;
+}
+
+.role-checklist {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+  margin: 18px 0;
+}
+
+.role-check {
+  display: grid;
+  gap: 4px;
+  border: 1px solid #e1e6ef;
+  border-radius: 10px;
+  background: #fbfcfe;
+  color: #4d5870;
+  padding: 12px;
+  text-align: left;
+}
+
+.role-check span {
+  color: #8a93a5;
+  font-size: 11pt;
+}
+
+.role-check--ready {
+  border-color: #bfe5d3;
+  background: #f1fbf6;
+}
+
+.account-setup-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.15fr) minmax(340px, 0.85fr);
+  gap: 20px;
+  align-items: start;
+}
+
+.account-form {
+  border-left: 1px solid #edf0f5;
+  padding-left: 20px;
+}
+
+.account-form-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  grid-column: 1 / -1;
+}
+
+@media (max-width: 680px) {
+  .deployment-role-grid,
+  .deployment-form {
+    grid-template-columns: 1fr;
+  }
+
+  .deployment-actions {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .role-checklist,
+  .account-setup-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .account-form {
+    border-top: 1px solid #edf0f5;
+    border-left: 0;
+    padding-top: 20px;
+    padding-left: 0;
+  }
+}
+
 .spinner {
   width: 34px;
   height: 34px;

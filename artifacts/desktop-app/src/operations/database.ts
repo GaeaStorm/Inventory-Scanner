@@ -62,8 +62,11 @@ const SHARED_PHONE_USER_ID = "SYSTEM:SHARED_PHONE";
 
 type Row = Record<string, any>;
 
+let lastTimestamp = 0;
+
 function nowIso(): string {
-  return new Date().toISOString();
+  lastTimestamp = Math.max(Date.now(), lastTimestamp + 1);
+  return new Date(lastTimestamp).toISOString();
 }
 
 function dateOnly(value?: string): string {
@@ -2265,8 +2268,11 @@ export class OperationsDatabase {
   private ensureProductionExecution(productOrderId: string, actor?: ActorContext): void {
     const id = text(productOrderId);
     if (!id) return;
-    const order = this.db.prepare("SELECT id FROM planning_product_orders WHERE id = ?").get(id) as Row | undefined;
+    const order = this.db.prepare("SELECT id, order_type FROM planning_product_orders WHERE id = ?").get(id) as Row | undefined;
     if (!order) throw new Error("Product order not found.");
+    if (text(order.order_type) === "SERVICE") {
+      throw new Error("Service Orders are tracked on the order dashboard and cannot enter Production execution.");
+    }
     const timestamp = nowIso();
     this.db.prepare(`
       INSERT INTO ops_production_executions(product_order_id, status, created_at, updated_at)
