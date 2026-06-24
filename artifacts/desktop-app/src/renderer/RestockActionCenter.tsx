@@ -207,14 +207,22 @@ export default function RestockActionCenter({
           <button className="button button--secondary" type="button" onClick={() => { setSearch(""); setProductGuid(""); setHealth(""); setObsoleteOnly(false); setGroupFilter([]); setCategoryFilter(""); }}>Clear filters</button>
         </div>
         <div className="table-scroll planning-restock-table"><table>
-          <thead><tr><th>{sortLabel("Status", "health")}</th><th>{sortLabel("Stock Item", "itemName")}</th><th className="numeric">{sortLabel("On hand", "onHand")}</th><th className="numeric">{sortLabel("Reserved", "reserved")}</th><th className="numeric">{sortLabel("Service", "serviceReserve")}</th><th className="numeric">{sortLabel("Available", "available")}</th><th className="numeric">{sortLabel("Incoming", "incoming")}</th><th className="numeric">{sortLabel("Projected", "projected")}</th><th className="numeric">{sortLabel("Reorder", "reorderPoint")}</th><th className="numeric">{sortLabel("Target", "targetStock")}</th><th className="numeric">{sortLabel("Suggested order", "suggestedOrderQuantity")}</th><th>{sortLabel("Supplier", "preferredSupplierName")}</th></tr></thead>
+          <thead><tr><th>{sortLabel("Status", "health")}</th><th className="stock-item-column">{sortLabel("Stock Item", "itemName")}</th><th className="numeric">{sortLabel("Currently In Bin", "onHand")}</th><th className="numeric">{sortLabel("Available to Use", "available")}</th><th className="numeric">{sortLabel("Incoming", "incoming")}</th><th className="numeric">{sortLabel("Reserved", "reserved")}</th><th className="numeric">{sortLabel("Service", "serviceReserve")}</th><th className="numeric">{sortLabel("Projected", "projected")}</th><th className="numeric">{sortLabel("Reorder", "reorderPoint")}</th><th className="numeric">{sortLabel("Target", "targetStock")}</th><th className="numeric">{sortLabel("Suggested order", "suggestedOrderQuantity")}</th></tr></thead>
           <tbody>
             {filtered.map((item) => <tr key={item.tallyItemGuid} className={selectedGuid === item.tallyItemGuid ? "selected-row" : ""} onClick={() => choose(item)}>
               <td><span className={`planning-health planning-health--${item.health.toLocaleLowerCase().replaceAll("_", "-")}`}>{healthLabels[item.health]}</span></td>
-              <td><strong>{item.itemName}</strong><small className="table-subtext">{[item.primaryGroupName, item.secondaryGroupName].filter(Boolean).join(" › ") || "No group"}{item.catalogSource === "LOCAL" ? " · Local-only" : ""}</small></td>
-              <td className="numeric">{item.onHand}</td><td className="numeric">{item.reserved}</td><td className="numeric">{item.serviceReserve}</td><td className="numeric">{item.available}</td><td className="numeric">{item.incoming}</td><td className="numeric">{item.projected}</td><td className="numeric">{item.reorderPoint}</td><td className="numeric">{item.targetStock}</td><td className="numeric"><strong>{item.suggestedOrderQuantity}</strong></td><td>{item.preferredSupplierName || "—"}</td>
+              <td className="stock-item-column"><strong>{item.itemName}</strong><small className="table-subtext">{[item.primaryGroupName, item.secondaryGroupName].filter(Boolean).join(" › ") || "No group"}{item.catalogSource === "LOCAL" ? " · Local-only" : ""}</small></td>
+              <td className="numeric">{item.onHand}</td>
+              <td className="numeric">{item.available}</td>
+              <td className="numeric">{item.incoming}</td>
+              <td className="numeric">{item.reserved}</td>
+              <td className="numeric">{item.serviceReserve}</td>
+              <td className="numeric">{item.projected}</td>
+              <td className="numeric">{item.reorderPoint}</td>
+              <td className="numeric">{item.targetStock}</td>
+              <td className="numeric"><strong>{item.suggestedOrderQuantity}</strong></td>
             </tr>)}
-            {filtered.length === 0 && <tr><td colSpan={12} className="empty-table">No Stock Items match these filters.</td></tr>}
+            {filtered.length === 0 && <tr><td colSpan={11} className="empty-table">No Stock Items match these filters.</td></tr>}
           </tbody>
         </table></div>
       </article>
@@ -242,8 +250,8 @@ export default function RestockActionCenter({
               <label>Target stock<input {...numberInput(draft.targetStock, (value) => setDraft({ ...draft, targetStock: value }))} /></label>
               <label>Service reserve<input {...numberInput(draft.serviceReserve, (value) => setDraft({ ...draft, serviceReserve: value }))} /></label>
               <label>Preferred supplier<select value={draft.preferredSupplierId ?? ""} onChange={(event) => setDraft({ ...draft, preferredSupplierId: event.target.value ? Number(event.target.value) : null })}><option value="">Not set</option>{suppliers.map((entry) => <option key={entry.id} value={entry.id}>{entry.name}</option>)}</select></label>
-              <label>Lead time days<input {...numberInput(draft.leadTimeDays, (value) => setDraft({ ...draft, leadTimeDays: value }))} /></label>
-              <label>Safety days<input {...numberInput(draft.safetyDays, (value) => setDraft({ ...draft, safetyDays: value }))} /></label>
+              <label>Avg. delivery days<input {...numberInput(draft.leadTimeDays, (value) => setDraft({ ...draft, leadTimeDays: value }))} /></label>
+              <label>Buffer delivery days<input {...numberInput(draft.safetyDays, (value) => setDraft({ ...draft, safetyDays: value }))} /></label>
               <label>Minimum order qty<input {...numberInput(draft.minimumOrderQuantity, (value) => setDraft({ ...draft, minimumOrderQuantity: value }))} /></label>
               <label>Usage lookback days<input {...numberInput(draft.usageLookbackDays, (value) => setDraft({ ...draft, usageLookbackDays: value }), 7)} /></label>
               <label className="form-grid__wide">Notes<textarea rows={2} value={draft.notes ?? ""} onChange={(event) => setDraft({ ...draft, notes: event.target.value })} /></label>
