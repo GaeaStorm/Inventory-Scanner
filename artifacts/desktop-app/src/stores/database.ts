@@ -1144,9 +1144,20 @@ export class StoresDatabase {
       throw new Error("A Stock Group cannot be its own parent.");
     }
     if (parentName.toLocaleLowerCase() !== "primary") {
-      const parent = this.db.prepare(`
+      let parent = this.db.prepare(`
         SELECT name FROM tally_stock_groups WHERE name = ? COLLATE NOCASE AND active = 1
       `).get(parentName) as Row | undefined;
+      if (!parent) {
+        const implicitParent = this.db.prepare(`
+          SELECT 1 FROM tally_stock_items WHERE parent_name = ? COLLATE NOCASE AND active = 1 LIMIT 1
+        `).get(parentName) as Row | undefined;
+        if (implicitParent) {
+          this.createCatalogGroup({ name: parentName });
+          parent = this.db.prepare(`
+            SELECT name FROM tally_stock_groups WHERE name = ? COLLATE NOCASE AND active = 1
+          `).get(parentName) as Row | undefined;
+        }
+      }
       if (!parent) throw new Error("Choose an existing parent Stock Group.");
     }
     const existing = this.db.prepare(`

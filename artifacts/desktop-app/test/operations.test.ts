@@ -198,6 +198,7 @@ test("local-first catalog builds nested groups and categories and exports comple
     assert.equal(saved?.primaryGroupName, "Raw Material");
     assert.equal(saved?.secondaryGroupName, "ICs");
     assert.equal(saved?.categoryName, "Fine Pitch");
+
     assert.equal(state.dataMode, "local");
     assert.deepEqual(
       state.stockCategories.find((entry) => entry.name === "Fine Pitch")?.path,
@@ -232,6 +233,23 @@ test("local-first catalog builds nested groups and categories and exports comple
     state = context.stores.getState();
     assert.equal(state.stockItems.some((entry) => entry.tallyGuid === item.tallyGuid), false);
     assert.equal(state.catalogGroups.some((entry) => entry.name === "Import"), false);
+  } finally {
+    closeContext(context);
+  }
+});
+
+test("catalog group creation accepts implicit parent names from stock item assignments", () => {
+  const context = createContext();
+  try {
+    const item = context.stores.createLocalStockItem({ name: "Implicit Parent Item", parentName: "POT" });
+    context.host.db.prepare("DELETE FROM tally_stock_groups WHERE name = ?").run("POT");
+    context.stores.createCatalogGroup({ name: "Helical Pot", parentName: "POT" });
+
+    const state = context.stores.getState();
+    assert.ok(state.catalogGroups.some((group) => group.name === "POT"));
+    assert.ok(state.catalogGroups.some((group) => group.name === "Helical Pot" && group.parentName.toLocaleLowerCase() === "pot"));
+    const saved = state.stockItems.find((entry) => entry.tallyGuid === item.tallyGuid);
+    assert.deepEqual(saved?.groupPath, ["POT"]);
   } finally {
     closeContext(context);
   }

@@ -1,5 +1,6 @@
 import { useMemo, useState, type ChangeEvent } from "react";
 
+import GroupFilterDropdown, { buildGroupTree, groupPathMatches } from "./GroupFilterDropdown";
 import InfoTip from "./InfoTip";
 
 import type {
@@ -55,8 +56,8 @@ export default function RestockActionCenter({
   const [productGuid, setProductGuid] = useState("");
   const [health, setHealth] = useState("");
   const [obsoleteOnly, setObsoleteOnly] = useState(false);
-  const [primaryGroup, setPrimaryGroup] = useState("");
-  const [secondaryGroup, setSecondaryGroup] = useState("");
+  const [groupFilter, setGroupFilter] = useState<string[]>([]);
+  const [categoryFilter, setCategoryFilter] = useState("");
   const [selectedGuid, setSelectedGuid] = useState(planning.items[0]?.tallyItemGuid ?? "");
   const [busy, setBusy] = useState(false);
   const [sort, setSort] = useState<{ key: keyof RestockPlanningItem; direction: "asc" | "desc" }>({ key: "health", direction: "asc" });
@@ -77,16 +78,21 @@ export default function RestockActionCenter({
     () => [...stores.suppliers].filter((entry) => entry.name !== "Opening Legacy Stock").sort((a, b) => a.name.localeCompare(b.name)),
     [stores.suppliers],
   );
-  const primaryGroupNames = useMemo(
-    () => [...new Set(planning.items.map((item) => item.primaryGroupName).filter(Boolean))].sort(),
-    [planning.items],
+  const catalogByGuid = useMemo(
+    () => new Map(stores.stockItems.map((item) => [item.tallyGuid, item])),
+    [stores.stockItems],
   );
-  const secondaryGroupNames = useMemo(
+  const groupTree = useMemo(
+    () => buildGroupTree(planning.items
+      .map((item) => catalogByGuid.get(item.tallyItemGuid)?.groupPath)
+      .filter((path): path is string[] => Boolean(path && path.length > 0))),
+    [planning.items, catalogByGuid],
+  );
+  const categoryOptions = useMemo(
     () => [...new Set(planning.items
-      .filter((item) => !primaryGroup || item.primaryGroupName === primaryGroup)
-      .map((item) => item.secondaryGroupName)
-      .filter(Boolean))].sort(),
-    [planning.items, primaryGroup],
+      .map((item) => catalogByGuid.get(item.tallyItemGuid)?.categoryName)
+      .filter((name): name is string => Boolean(name)))].sort((left, right) => left.localeCompare(right)),
+    [planning.items, catalogByGuid],
   );
   const filtered = useMemo(() => {
     const needle = search.trim().toLocaleLowerCase();
@@ -96,8 +102,9 @@ export default function RestockActionCenter({
       if (needle && !`${item.itemName} ${item.primaryGroupName} ${item.secondaryGroupName} ${item.preferredSupplierName}`.toLocaleLowerCase().includes(needle)) return false;
       if (health && item.health !== health) return false;
       if (obsoleteOnly && !(item.catalogStatus === "OBSOLETE" && item.targetStock === 0)) return false;
-      if (primaryGroup && item.primaryGroupName !== primaryGroup) return false;
-      if (secondaryGroup && item.secondaryGroupName !== secondaryGroup) return false;
+      const catalogItem = catalogByGuid.get(item.tallyItemGuid);
+      if (groupFilter.length > 0 && !groupPathMatches(groupFilter, catalogItem?.groupPath ?? [])) return false;
+      if (categoryFilter && catalogItem?.categoryName !== categoryFilter) return false;
       return true;
     });
     return rows.sort((left, right) => {
@@ -108,7 +115,7 @@ export default function RestockActionCenter({
         : String(a ?? "").localeCompare(String(b ?? ""), undefined, { numeric: true });
       return sort.direction === "asc" ? comparison : -comparison;
     });
-  }, [planning.items, productGuid, selectedBom, search, health, obsoleteOnly, primaryGroup, secondaryGroup, sort]);
+  }, [planning.items, productGuid, selectedBom, search, health, obsoleteOnly, groupFilter, categoryFilter, catalogByGuid, sort]);
 
   function toggleSort(key: keyof RestockPlanningItem) {
     setSort((current) => current.key === key
@@ -192,9 +199,12 @@ export default function RestockActionCenter({
             if (first) choose(first);
           }}><option value="">Choose a Finished Product…</option>{finishedProducts.map((item) => <option key={item.tallyGuid} value={item.tallyGuid}>{item.name} · {[item.primaryGroupName, item.secondaryGroupName].filter(Boolean).join(" › ") || "Ungrouped"}</option>)}</select>
           <select aria-label="Filter by status" value={health} onChange={(event) => { setHealth(event.target.value); setObsoleteOnly(false); }}><option value="">All statuses</option>{Object.entries(healthLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select>
-          <select aria-label="Filter by primary group" value={primaryGroup} onChange={(event) => { setPrimaryGroup(event.target.value); setSecondaryGroup(""); }}><option value="">All primary groups</option>{primaryGroupNames.map((entry) => <option key={entry}>{entry}</option>)}</select>
-          <select aria-label="Filter by secondary group" value={secondaryGroup} onChange={(event) => setSecondaryGroup(event.target.value)} disabled={secondaryGroupNames.length === 0}><option value="">All secondary groups</option>{secondaryGroupNames.map((entry) => <option key={entry}>{entry}</option>)}</select>
-          <button className="button button--secondary" type="button" onClick={() => { setSearch(""); setProductGuid(""); setHealth(""); setObsoleteOnly(false); setPrimaryGroup(""); setSecondaryGroup(""); }}>Clear filters</button>
+          <GroupFilterDropdown ariaLabel="Filter by Stock Group" tree={groupTree} value={groupFilter} onChange={setGroupFilter} />
+          <select aria-label="Filter by Stock Category" value={categoryFilter} onChange={(event) => setCategoryFilter(event.target.value)}>
+            <option value="">All Stock Categories</option>
+            {categoryOptions.map((name) => <option key={name} value={name}>{name}</option>)}
+          </select>
+          <button className="button button--secondary" type="button" onClick={() => { setSearch(""); setProductGuid(""); setHealth(""); setObsoleteOnly(false); setGroupFilter([]); setCategoryFilter(""); }}>Clear filters</button>
         </div>
         <div className="table-scroll planning-restock-table"><table>
           <thead><tr><th>{sortLabel("Status", "health")}</th><th>{sortLabel("Stock Item", "itemName")}</th><th className="numeric">{sortLabel("On hand", "onHand")}</th><th className="numeric">{sortLabel("Reserved", "reserved")}</th><th className="numeric">{sortLabel("Service", "serviceReserve")}</th><th className="numeric">{sortLabel("Available", "available")}</th><th className="numeric">{sortLabel("Incoming", "incoming")}</th><th className="numeric">{sortLabel("Projected", "projected")}</th><th className="numeric">{sortLabel("Reorder", "reorderPoint")}</th><th className="numeric">{sortLabel("Target", "targetStock")}</th><th className="numeric">{sortLabel("Suggested order", "suggestedOrderQuantity")}</th><th>{sortLabel("Supplier", "preferredSupplierName")}</th></tr></thead>

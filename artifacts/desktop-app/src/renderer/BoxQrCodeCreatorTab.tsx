@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import QRCode from "qrcode";
 
+import GroupFilterDropdown, { buildGroupTree, groupPathMatches } from "./GroupFilterDropdown";
 import { operationalStockItems } from "./stock-item-visibility";
 import type { StoresBox, StoresState } from "./types";
 import "./BoxQrCodeCreatorTab.css";
@@ -63,8 +64,8 @@ export default function BoxQrCodeCreatorTab({ stores, onChanged }: Props) {
   const [expectedRevision, setExpectedRevision] = useState<number | undefined>();
   const [selectedGuids, setSelectedGuids] = useState<string[]>([]);
   const [search, setSearch] = useState("");
-  const [primaryGroupFilter, setPrimaryGroupFilter] = useState("ALL");
-  const [secondaryGroupFilter, setSecondaryGroupFilter] = useState("ALL");
+  const [groupFilter, setGroupFilter] = useState<string[]>([]);
+  const [categoryFilter, setCategoryFilter] = useState("ALL");
   const [stockFilter, setStockFilter] = useState<"ALL" | "AVAILABLE" | "EMPTY">("ALL");
   const [bomFilter, setBomFilter] = useState<"ALL" | "BOM" | "NO_BOM">("ALL");
   const [qrDataUrl, setQrDataUrl] = useState("");
@@ -84,30 +85,27 @@ export default function BoxQrCodeCreatorTab({ stores, onChanged }: Props) {
     () => selectedGuids.map((guid) => stores.stockItems.find((item) => item.tallyGuid === guid)).filter(Boolean),
     [selectedGuids, stores.stockItems],
   );
-  const primaryGroupOptions = useMemo(
-    () => [...new Set(selectableItems.map((item) => item.primaryGroupName || "Ungrouped"))].sort((left, right) => left.localeCompare(right)),
+  const groupTree = useMemo(
+    () => buildGroupTree(selectableItems.map((item) => item.groupPath).filter((path) => path.length > 0)),
     [selectableItems],
   );
-  const secondaryGroupOptions = useMemo(
-    () => [...new Set(selectableItems
-      .filter((item) => primaryGroupFilter === "ALL" || (item.primaryGroupName || "Ungrouped") === primaryGroupFilter)
-      .map((item) => item.secondaryGroupName)
-      .filter(Boolean))].sort((left, right) => left.localeCompare(right)),
-    [primaryGroupFilter, selectableItems],
+  const categoryOptions = useMemo(
+    () => [...new Set(selectableItems.map((item) => item.categoryName).filter(Boolean))].sort((left, right) => left.localeCompare(right)),
+    [selectableItems],
   );
   const filtered = useMemo(() => {
     const query = search.trim().toLocaleLowerCase();
     return selectableItems.filter((item) => {
       if (selectedGuids.includes(item.tallyGuid)) return false;
-      if (primaryGroupFilter !== "ALL" && (item.primaryGroupName || "Ungrouped") !== primaryGroupFilter) return false;
-      if (secondaryGroupFilter !== "ALL" && item.secondaryGroupName !== secondaryGroupFilter) return false;
+      if (groupFilter.length > 0 && !groupPathMatches(groupFilter, item.groupPath)) return false;
+      if (categoryFilter !== "ALL" && item.categoryName !== categoryFilter) return false;
       if (stockFilter === "AVAILABLE" && item.localAvailableQuantity <= 0) return false;
       if (stockFilter === "EMPTY" && item.localAvailableQuantity > 0) return false;
       if (bomFilter === "BOM" && !item.hasBom) return false;
       if (bomFilter === "NO_BOM" && item.hasBom) return false;
       return !query || [item.name, item.primaryGroupName, item.secondaryGroupName, item.tallyGuid].some((value) => value.toLocaleLowerCase().includes(query));
     });
-  }, [bomFilter, primaryGroupFilter, secondaryGroupFilter, search, selectedGuids, stockFilter, selectableItems]);
+  }, [bomFilter, groupFilter, categoryFilter, search, selectedGuids, stockFilter, selectableItems]);
 
   useEffect(() => {
     setQrDataUrl("");
@@ -280,11 +278,11 @@ export default function BoxQrCodeCreatorTab({ stores, onChanged }: Props) {
           <div className="panel__header"><div><p className="eyebrow">STORES CATALOG</p><h2>Select one to five items</h2></div><span className="table-count">{selectedGuids.length}/5 selected</span></div>
           <label className="box-qr-search-field">Search Tally Stock Items<input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Item name, group, or GUID" /></label>
           <div className="box-qr-catalog-filters">
-            <label>Primary group<select value={primaryGroupFilter} onChange={(event) => { setPrimaryGroupFilter(event.target.value); setSecondaryGroupFilter("ALL"); }}><option value="ALL">All primary groups</option>{primaryGroupOptions.map((group) => <option key={group} value={group}>{group}</option>)}</select></label>
-            <label>Secondary group<select value={secondaryGroupFilter} onChange={(event) => setSecondaryGroupFilter(event.target.value)} disabled={secondaryGroupOptions.length === 0}><option value="ALL">All secondary groups</option>{secondaryGroupOptions.map((group) => <option key={group} value={group}>{group}</option>)}</select></label>
+            <label>Stock Group<GroupFilterDropdown ariaLabel="Filter by Stock Group" tree={groupTree} value={groupFilter} onChange={setGroupFilter} /></label>
+            <label>Stock Category<select value={categoryFilter} onChange={(event) => setCategoryFilter(event.target.value)}><option value="ALL">All Stock Categories</option>{categoryOptions.map((name) => <option key={name} value={name}>{name}</option>)}</select></label>
             <label>Stock<select value={stockFilter} onChange={(event) => setStockFilter(event.target.value as typeof stockFilter)}><option value="ALL">All stock</option><option value="AVAILABLE">Available only</option><option value="EMPTY">Zero stock</option></select></label>
             <label>Product type<select value={bomFilter} onChange={(event) => setBomFilter(event.target.value as typeof bomFilter)}><option value="ALL">All items</option><option value="BOM">Has BOM</option><option value="NO_BOM">No BOM</option></select></label>
-            <button type="button" className="text-button" onClick={() => { setSearch(""); setPrimaryGroupFilter("ALL"); setSecondaryGroupFilter("ALL"); setStockFilter("ALL"); setBomFilter("ALL"); }}>Clear filters</button>
+            <button type="button" className="text-button" onClick={() => { setSearch(""); setGroupFilter([]); setCategoryFilter("ALL"); setStockFilter("ALL"); setBomFilter("ALL"); }}>Clear filters</button>
           </div>
           <div className="box-qr-catalog-result-count">Showing {filtered.length} of {selectableItems.length} catalog items</div>
           <div className="box-qr-catalog-scroll" tabIndex={0}>
