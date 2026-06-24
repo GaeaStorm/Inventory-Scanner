@@ -1483,7 +1483,11 @@ export class OperationsDatabase {
         `).get(legacy.grn_id, legacy.stock_item_id) as Row | undefined;
         if (!lotRow) throw new Error("The purchase lot for the receipt could not be located.");
 
-        const total = whole(receiptLine.quantity, "Received quantity");
+        const delivered = whole(receiptLine.quantity, "Received quantity");
+        const rejected = whole(receiptLine.rejectedQuantity ?? 0, "Rejected quantity", true);
+        if (rejected > delivered) throw new Error("Rejected quantity cannot exceed the received quantity.");
+        const total = delivered - rejected;
+        if (total === 0) continue;
         const available = receiptLine.acceptedQuantity == null
           ? total - Number(receiptLine.pendingInspectionQuantity ?? 0) - Number(receiptLine.faultyQuantity ?? 0)
           : whole(receiptLine.acceptedQuantity, "Accepted quantity", true);
@@ -2194,6 +2198,10 @@ export class OperationsDatabase {
       const item = this.stockItem(input.tallyItemGuid);
       const quantity = whole(input.quantity, "Return quantity");
       const target = input.targetCondition;
+      const disposition = text(input.requirementDisposition) || "STILL_REQUIRED";
+      if (!["STILL_REQUIRED", "REQUIREMENT_REDUCED", "ORDER_CANCELLED"].includes(disposition)) {
+        throw new Error("Choose whether the returned material is still required, reduced, or tied to a cancelled order.");
+      }
       const serials = normalizeSerials(input.serialNumbers);
       const lines: Array<{ lotId: string; purchaseLotId: number; quantity: number; sourceCondition: null; targetCondition: StockCondition; serialNumbers: string[] }> = [];
       const referenceId = text(input.originalMovementId);
@@ -2286,8 +2294,31 @@ export class OperationsDatabase {
           serialNumbers: serials,
         }, actor, movementId, false);
       }
+      if (referenceId && text(input.productOrderId) && disposition === "STILL_REQUIRED") {
+        this.restoreProductionReservation(text(input.productOrderId), Number(item.id), quantity);
+      }
       return this.getMovement(movementId)!;
     });
+  }
+
+  private restoreProductionReservation(productOrderId: string, stockItemId: number, quantity: number): void {
+    const reservation = this.db.prepare(`
+      SELECT id, required_quantity, reserved_quantity
+      FROM planning_reservations
+      WHERE product_order_id = ? AND component_item_id = ?
+      ORDER BY status = 'ACTIVE' DESC, updated_at DESC
+      LIMIT 1
+    `).get(productOrderId, stockItemId) as Row | undefined;
+    if (!reservation) return;
+    const restored = Math.min(
+      Number(reservation.required_quantity),
+      Number(reservation.reserved_quantity) + quantity,
+    );
+    this.db.prepare(`
+      UPDATE planning_reservations
+      SET reserved_quantity = ?, status = 'ACTIVE', updated_at = ?
+      WHERE id = ?
+    `).run(restored, nowIso(), reservation.id);
   }
 
   supplierReturn(input: SupplierReturnInput, actor: ActorContext): OperationsMovement {

@@ -1869,6 +1869,7 @@ export class StoresDatabase {
         if (!Number.isInteger(rejectedQuantity) || rejectedQuantity < 0 || rejectedQuantity > line.quantity) {
           throw new Error("Rejected quantity must be a whole number between zero and the received quantity.");
         }
+        const acceptedQuantity = line.quantity - rejectedQuantity;
         const stockItemId = this.itemId(line.tallyItemGuid);
         let poLine: Row | undefined;
         if (poId) {
@@ -1883,12 +1884,12 @@ export class StoresDatabase {
           const outstanding = poLine
             ? Math.max(0, Number(poLine.ordered_quantity) - Number(poLine.received_quantity))
             : 0;
-          if (poLine && line.quantity > outstanding
+          if (poLine && acceptedQuantity > outstanding
             && line.discrepancyType !== "EXCESS_DELIVERY" && !input.nonPoException) {
             throw new Error(`Receipt quantity for one item exceeds the Purchase Order outstanding quantity of ${outstanding}. Mark it as Excess delivery to continue.`);
           }
         }
-        return { ...line, rejectedQuantity, stockItemId, poLine };
+        return { ...line, acceptedQuantity, rejectedQuantity, stockItemId, poLine };
       });
 
       const localGrnGuid = `LOCAL-GRN-${randomUUID()}`;
@@ -1903,16 +1904,17 @@ export class StoresDatabase {
 
       resolvedLines.forEach((line, index) => {
         const rate = nullableNumber(line.poLine?.rate);
-        const value = rate === null ? null : rate * line.quantity;
-        const acceptedQuantity = line.quantity - line.rejectedQuantity;
+        const grnValue = rate === null ? null : rate * line.quantity;
+        const acceptedValue = rate === null ? null : rate * line.acceptedQuantity;
+        const acceptedQuantity = line.acceptedQuantity;
         const lineInsert = this.db.prepare(
           "INSERT INTO grn_lines(grn_id, stock_item_id, quantity, rejected_quantity, rate, value) VALUES (?, ?, ?, ?, ?, ?)",
-        ).run(grnId, line.stockItemId, line.quantity, line.rejectedQuantity, sqlValue(rate), sqlValue(value));
+        ).run(grnId, line.stockItemId, line.quantity, line.rejectedQuantity, sqlValue(rate), sqlValue(grnValue));
         const grnLineId = Number(lineInsert.lastInsertRowid);
         this.db.prepare(`
           INSERT INTO purchase_lots(stock_item_id, supplier_id, grn_line_id, source_type, source_voucher_guid, source_voucher_date, po_number, grn_number, receipt_date, challan_number, challan_date, quantity_received, quantity_remaining, rate, value, created_at)
           VALUES (?, ?, ?, 'LOCAL_GRN', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        `).run(line.stockItemId, supplier.id, grnLineId, localGrnGuid, eventDate, poNumber, grnNumber, eventDate, challanNumber, challanDate, line.quantity, acceptedQuantity, sqlValue(rate), sqlValue(value), timestamp);
+        `).run(line.stockItemId, supplier.id, grnLineId, localGrnGuid, eventDate, poNumber, grnNumber, eventDate, challanNumber, challanDate, acceptedQuantity, acceptedQuantity, sqlValue(rate), sqlValue(acceptedValue), timestamp);
 
         const movementId = `MOV-${randomUUID()}`;
         this.db.prepare(`
@@ -1929,7 +1931,7 @@ export class StoresDatabase {
             UPDATE purchase_order_lines
             SET received_quantity = received_quantity + ?
             WHERE purchase_order_id = ? AND stock_item_id = ?
-          `).run(line.quantity, poId, line.stockItemId);
+          `).run(acceptedQuantity, poId, line.stockItemId);
         }
       });
 
@@ -2102,7 +2104,14 @@ export class StoresDatabase {
       this.ensureBoxContains(input.boxId, stockItemId);
 
       const available = Number((this.db.prepare("SELECT COALESCE(SUM(quantity_remaining), 0) AS quantity FROM purchase_lots WHERE stock_item_id = ?").get(stockItemId) as Row).quantity);
+      const reserved = this.reservedQuantity(stockItemId);
+      const ownReservation = text(input.productOrderId) ? this.reservedQuantity(stockItemId, text(input.productOrderId)) : 0;
+      const allowed = available - reserved + ownReservation;
       if (available < quantity) throw new Error(`Insufficient local stock. ${available} available; ${quantity} requested.`);
+      if (allowed < quantity) {
+        const protectedQuantity = reserved - ownReservation;
+        throw new Error(`Only ${Math.max(0, allowed)} units are free to issue. ${protectedQuantity} unit${protectedQuantity === 1 ? " is" : "s are"} protected for other production orders.`);
+      }
 
       const movementId = `MOV-${randomUUID()}`;
       const timestamp = nowIso();
@@ -2161,6 +2170,21 @@ export class StoresDatabase {
       ) VALUES (?, ?, 'System destinations', 0, 0, 1, ?, 'LOCAL', 1)
     `).run(guid, label, nowIso());
     return { id: Number(inserted.lastInsertRowid), tallyGuid: guid };
+  }
+
+  private reservedQuantity(stockItemId: number, productOrderId?: string): number {
+    if (productOrderId) {
+      return Number((this.db.prepare(`
+        SELECT COALESCE(SUM(reserved_quantity), 0) AS quantity
+        FROM planning_reservations
+        WHERE component_item_id = ? AND product_order_id = ? AND status = 'ACTIVE'
+      `).get(stockItemId, productOrderId) as Row).quantity);
+    }
+    return Number((this.db.prepare(`
+      SELECT COALESCE(SUM(reserved_quantity), 0) AS quantity
+      FROM planning_reservations
+      WHERE component_item_id = ? AND status = 'ACTIVE'
+    `).get(stockItemId) as Row).quantity);
   }
 
   setOpeningQuantity(input: OpeningQuantityInput): StoresOpeningQuantityAdjustment {
@@ -2862,6 +2886,7 @@ export class StoresDatabase {
           itemName: text(line.item_name),
           tallyItemGuid: text(line.tally_guid),
           orderedQuantity: Number(line.ordered_quantity),
+          acceptedQuantity: Number(line.received_quantity),
           receivedQuantity: Number(line.received_quantity),
           outstandingQuantity: Math.max(0, Number(line.ordered_quantity) - Number(line.received_quantity)),
           rate: nullableNumber(line.rate),

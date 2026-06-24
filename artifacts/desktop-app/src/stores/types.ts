@@ -64,6 +64,7 @@ export interface StoresPurchaseOrderLine {
   itemName: string;
   tallyItemGuid: string;
   orderedQuantity: number;
+  acceptedQuantity: number;
   receivedQuantity: number;
   outstandingQuantity: number;
   rate: number | null;

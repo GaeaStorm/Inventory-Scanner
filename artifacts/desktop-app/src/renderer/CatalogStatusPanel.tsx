@@ -19,6 +19,7 @@ export default function CatalogStatusPanel(props: {
   const [itemGuid, setItemGuid] = useState("");
   const [renameName, setRenameName] = useState("");
   const [duplicateGuid, setDuplicateGuid] = useState("");
+  const [visibilityGroup, setVisibilityGroup] = useState("");
 
   const selected = props.stores.stockItems.find((item) => item.tallyGuid === itemGuid) ?? null;
   const editableItems = useMemo(
@@ -125,6 +126,10 @@ export default function CatalogStatusPanel(props: {
   const parentChoices = masterKind === "CATEGORY"
     ? props.stores.stockCategories
     : props.stores.catalogGroups;
+  const selectedVisibilityGroup = props.stores.catalogGroups.find((group) => group.name === visibilityGroup)
+    ?? props.stores.catalogGroups[0]
+    ?? null;
+  const ignoredGroupCount = props.stores.catalogGroups.filter((group) => group.ignored).length;
 
   return (
     <article className="panel catalog-status-panel">
@@ -151,22 +156,13 @@ export default function CatalogStatusPanel(props: {
 
       <section className="catalog-edit-section">
         <h3>Stock Group visibility</h3>
-        <div className="catalog-group-chips">
-          {props.stores.catalogGroups.map((group) => (
-            <button
-              key={group.name}
-              className={`catalog-group-chip ${group.ignored ? "catalog-group-chip--ignored" : ""}`}
-              type="button"
-              disabled={busy}
-              onClick={() => void run(
-                () => window.desktop.stores.setCatalogVisibility({ groupName: group.name, ignored: !group.ignored }),
-                `${group.name} is now ${group.ignored ? "visible" : "ignored"}.`,
-              )}
-            >
-              <span>{group.path.join(" › ")}</span>
-              <strong>{group.ignored ? "Ignored" : "Visible"}</strong>
-            </button>
-          ))}
+        <div className="catalog-visibility-control">
+          <label>Stock Group<select value={selectedVisibilityGroup?.name ?? ""} onChange={(event) => setVisibilityGroup(event.target.value)}><option value="">Choose group…</option>{props.stores.catalogGroups.map((group) => <option key={group.name} value={group.name}>{group.path.join(" › ")} · {group.ignored ? "Ignored" : "Visible"}</option>)}</select></label>
+          {selectedVisibilityGroup && <div className={`catalog-visibility-card ${selectedVisibilityGroup.ignored ? "catalog-visibility-card--ignored" : ""}`}><span>{selectedVisibilityGroup.path.join(" › ")}</span><strong>{selectedVisibilityGroup.ignored ? "Ignored" : "Visible"}</strong><button className="button button--secondary button--small" type="button" disabled={busy} onClick={() => void run(
+            () => window.desktop.stores.setCatalogVisibility({ groupName: selectedVisibilityGroup.name, ignored: !selectedVisibilityGroup.ignored }),
+            `${selectedVisibilityGroup.name} is now ${selectedVisibilityGroup.ignored ? "visible" : "ignored"}.`,
+          )}>{selectedVisibilityGroup.ignored ? "Make visible" : "Ignore group"}</button></div>}
+          <p className="table-footnote">{ignoredGroupCount} of {props.stores.catalogGroups.length} Stock Groups ignored.</p>
         </div>
       </section>
 

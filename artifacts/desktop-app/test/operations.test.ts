@@ -530,6 +530,183 @@ test("Return found stock needs no product and non-production Material Out needs 
   }
 });
 
+test("generic issues cannot consume stock protected for production orders", () => {
+  const context = createContext();
+  try {
+    receive(context, "receipt-reservation-protection", { quantity: 10 });
+    const componentId = Number((context.host.db.prepare(
+      "SELECT id FROM tally_stock_items WHERE tally_guid = ?",
+    ).get(context.componentGuid) as any).id);
+    const productId = Number((context.host.db.prepare(
+      "SELECT id FROM tally_stock_items WHERE tally_guid = ?",
+    ).get(context.productGuid) as any).id);
+    const timestamp = new Date().toISOString();
+    context.host.db.prepare(`
+      INSERT INTO planning_product_orders(id, external_reference, product_item_id, quantity, required_date, status, notes, created_at, updated_at)
+      VALUES ('ORDER-PROTECTED', 'PO-PROTECTED', ?, 1, '2026-06-30', 'CONFIRMED', '', ?, ?)
+    `).run(productId, timestamp, timestamp);
+    context.host.db.prepare(`
+      INSERT INTO planning_reservations(id, product_order_id, component_item_id, required_quantity, reserved_quantity, status, created_at, updated_at)
+      VALUES ('RES-PROTECTED', 'ORDER-PROTECTED', ?, 6, 6, 'ACTIVE', ?, ?)
+    `).run(componentId, timestamp, timestamp);
+
+    assert.throws(() => context.stores.recordMaterialOut({
+      clientTransactionId: "generic-over-free-stock",
+      boxId: "",
+      tallyItemGuid: context.componentGuid,
+      purpose: "SERVICING",
+      quantity: 5,
+    }), /free to issue|protected/);
+
+    const issue = context.stores.recordMaterialOut({
+      clientTransactionId: "own-order-issue",
+      boxId: "",
+      tallyItemGuid: context.componentGuid,
+      destinationTallyItemGuid: context.productGuid,
+      productOrderId: "ORDER-PROTECTED",
+      quantity: 5,
+    });
+    context.operations.registerMaterialOut({
+      clientTransactionId: "own-order-issue",
+      tallyItemGuid: context.componentGuid,
+      destinationTallyItemGuid: context.productGuid,
+      productOrderId: "ORDER-PROTECTED",
+      quantity: 5,
+    }, issue, context.actor);
+    assert.equal(Number((context.host.db.prepare(
+      "SELECT reserved_quantity FROM planning_reservations WHERE id = 'RES-PROTECTED'",
+    ).get() as any).reserved_quantity), 1);
+  } finally {
+    closeContext(context);
+  }
+});
+
+test("linked production returns restore reservations only when material is still required", () => {
+  const context = createContext();
+  try {
+    receive(context, "receipt-return-reservation", { quantity: 8 });
+    const componentId = Number((context.host.db.prepare(
+      "SELECT id FROM tally_stock_items WHERE tally_guid = ?",
+    ).get(context.componentGuid) as any).id);
+    const productId = Number((context.host.db.prepare(
+      "SELECT id FROM tally_stock_items WHERE tally_guid = ?",
+    ).get(context.productGuid) as any).id);
+    const timestamp = new Date().toISOString();
+    context.host.db.prepare(`
+      INSERT INTO planning_product_orders(id, external_reference, product_item_id, quantity, required_date, status, notes, created_at, updated_at)
+      VALUES ('ORDER-RETURN-RES', 'PO-RETURN-RES', ?, 1, '2026-06-30', 'CONFIRMED', '', ?, ?)
+    `).run(productId, timestamp, timestamp);
+    context.host.db.prepare(`
+      INSERT INTO planning_reservations(id, product_order_id, component_item_id, required_quantity, reserved_quantity, status, created_at, updated_at)
+      VALUES ('RES-RETURN-RES', 'ORDER-RETURN-RES', ?, 4, 4, 'ACTIVE', ?, ?)
+    `).run(componentId, timestamp, timestamp);
+
+    const issue = context.stores.recordMaterialOut({
+      clientTransactionId: "return-reservation-issue",
+      boxId: "",
+      tallyItemGuid: context.componentGuid,
+      destinationTallyItemGuid: context.productGuid,
+      productOrderId: "ORDER-RETURN-RES",
+      quantity: 3,
+    });
+    context.operations.registerMaterialOut({
+      clientTransactionId: "return-reservation-issue",
+      tallyItemGuid: context.componentGuid,
+      destinationTallyItemGuid: context.productGuid,
+      productOrderId: "ORDER-RETURN-RES",
+      quantity: 3,
+    }, issue, context.actor);
+    assert.equal(Number((context.host.db.prepare(
+      "SELECT reserved_quantity FROM planning_reservations WHERE id = 'RES-RETURN-RES'",
+    ).get() as any).reserved_quantity), 1);
+
+    const originalMovementId = context.operations.getState().movements.find((movement) => movement.clientTransactionId === "return-reservation-issue")?.id;
+    assert.ok(originalMovementId);
+    context.operations.productionReturn({
+      clientTransactionId: "return-reservation-still-required",
+      tallyItemGuid: context.componentGuid,
+      quantity: 1,
+      originalMovementId,
+      productOrderId: "ORDER-RETURN-RES",
+      targetCondition: "AVAILABLE",
+      requirementDisposition: "STILL_REQUIRED",
+    }, context.actor);
+    assert.equal(Number((context.host.db.prepare(
+      "SELECT reserved_quantity FROM planning_reservations WHERE id = 'RES-RETURN-RES'",
+    ).get() as any).reserved_quantity), 2);
+
+    context.operations.productionReturn({
+      clientTransactionId: "return-reservation-reduced",
+      tallyItemGuid: context.componentGuid,
+      quantity: 1,
+      originalMovementId,
+      productOrderId: "ORDER-RETURN-RES",
+      targetCondition: "AVAILABLE",
+      requirementDisposition: "REQUIREMENT_REDUCED",
+    }, context.actor);
+    assert.equal(Number((context.host.db.prepare(
+      "SELECT reserved_quantity FROM planning_reservations WHERE id = 'RES-RETURN-RES'",
+    ).get() as any).reserved_quantity), 2);
+  } finally {
+    closeContext(context);
+  }
+});
+
+test("rejected purchase receipts do not close purchase order demand", () => {
+  const context = createContext();
+  try {
+    const componentId = Number((context.host.db.prepare(
+      "SELECT id FROM tally_stock_items WHERE tally_guid = ?",
+    ).get(context.componentGuid) as any).id);
+    const timestamp = new Date().toISOString();
+    const poId = Number(context.host.db.prepare(`
+      INSERT INTO purchase_orders(tally_guid, voucher_number, voucher_date, supplier_id, status, synced_at)
+      VALUES ('PO-REJECTED', 'PO-REJECTED', '2026-06-20', ?, 'OPEN', ?)
+    `).run(context.supplierId, timestamp).lastInsertRowid);
+    context.host.db.prepare(`
+      INSERT INTO purchase_order_lines(purchase_order_id, stock_item_id, ordered_quantity, received_quantity, rate, value)
+      VALUES (?, ?, 10, 0, 100, 1000)
+    `).run(poId, componentId);
+
+    const result = context.stores.recordBulkVendorReceipt({
+      clientTransactionId: "receipt-partial-rejected",
+      supplierId: context.supplierId,
+      purchaseOrderId: poId,
+      challanNumber: "CH-REJECTED",
+      challanDate: "2026-06-21",
+      receiptDate: "2026-06-21",
+      lines: [{
+        tallyItemGuid: context.componentGuid,
+        quantity: 10,
+        rejectedQuantity: 3,
+        acceptedQuantity: 7,
+      }],
+    });
+    context.operations.registerBulkReceipt({
+      clientTransactionId: "receipt-partial-rejected",
+      supplierId: context.supplierId,
+      purchaseOrderId: poId,
+      challanNumber: "CH-REJECTED",
+      challanDate: "2026-06-21",
+      receiptDate: "2026-06-21",
+      lines: [{
+        tallyItemGuid: context.componentGuid,
+        quantity: 10,
+        rejectedQuantity: 3,
+        acceptedQuantity: 7,
+      }],
+    }, result, context.actor);
+
+    const line = context.stores.getState().purchaseOrders.find((order) => order.id === poId)?.lines[0];
+    assert.equal(line?.acceptedQuantity, 7);
+    assert.equal(line?.outstandingQuantity, 3);
+    assert.equal(context.stores.getState().purchaseOrders.find((order) => order.id === poId)?.status, "OPEN");
+    assert.equal(balance(context, "AVAILABLE").quantity, 7);
+  } finally {
+    closeContext(context);
+  }
+});
+
 test("role permissions are enforced independently of renderer visibility", () => {
   const store: ActorContext = { userId: "u-store", displayName: "Store", username: "store", role: "STORE", auditIdentity: "STORE" };
   const sales: ActorContext = { userId: "u-sales", displayName: "Sales", username: "sales", role: "SALES", auditIdentity: "SALES" };

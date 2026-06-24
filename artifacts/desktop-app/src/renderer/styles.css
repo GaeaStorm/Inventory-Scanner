@@ -2126,35 +2126,56 @@ code {
   font-weight: 700;
 }
 
-.catalog-group-chips {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
+.catalog-visibility-control {
+  display: grid;
+  grid-template-columns: minmax(260px, 1fr) minmax(280px, 1.2fr);
+  gap: 12px;
+  align-items: end;
 }
 
-.catalog-group-chip {
-  display: inline-flex;
+.catalog-visibility-control .table-footnote {
+  grid-column: 1 / -1;
+  margin: 0;
+}
+
+.catalog-visibility-card {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  gap: 10px;
   align-items: center;
-  gap: 9px;
   border: 1px solid #d8e0eb;
-  border-radius: 999px;
+  border-radius: 8px;
   background: #f8fafc;
-  padding: 8px 12px;
+  padding: 10px 12px;
   color: #334155;
 }
 
-.catalog-group-chip strong {
+.catalog-visibility-card span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.catalog-visibility-card strong {
   color: #18724a;
   font-size: 10pt;
 }
 
-.catalog-group-chip--ignored {
+.catalog-visibility-card--ignored {
   border-color: #e6b3aa;
   background: #fff3f0;
 }
 
-.catalog-group-chip--ignored strong {
+.catalog-visibility-card--ignored strong {
   color: #a13b2b;
+}
+
+@media (max-width: 820px) {
+  .catalog-visibility-control,
+  .catalog-visibility-card {
+    grid-template-columns: 1fr;
+  }
 }
 
 .catalog-local-masters {

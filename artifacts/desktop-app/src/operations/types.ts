@@ -421,6 +421,7 @@ export interface ProductionReturnInput {
   productOrderId?: string;
   lotId?: string;
   targetCondition: "AVAILABLE" | "PENDING_INSPECTION" | "FAULTY";
+  requirementDisposition?: "STILL_REQUIRED" | "REQUIREMENT_REDUCED" | "ORDER_CANCELLED";
   explanation?: string;
   eventDate?: string;
   serialNumbers?: string[];
