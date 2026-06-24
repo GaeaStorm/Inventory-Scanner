@@ -119,7 +119,7 @@ async function startApi(): Promise<DesktopInfo> {
   // module reads its initial location when it is loaded.
   process.env.EXCEL_PATH = excelPath;
 
-  const { default: dashboardRouter } = await import("../../api-server/src/routes/dashboard");
+  const { default: dashboardRouter } = await import("./dashboard/dashboard");
   const desktopApi = express();
 
   desktopApi.use(express.json({ limit: "2mb" }));

@@ -53,6 +53,7 @@ artifacts/scanner-app/android/
 artifacts/scanner-app/ios/
 artifacts/scanner-app/.kotlin/
 artifacts/scanner-app/.gradle/
+artifacts/mockup-sandbox
 
 # -------------------------------------------------------------------
 # Environment-specific configuration and secrets
@@ -109,6 +110,10 @@ lerna-debug.log*
 # Local editor and AI-tool state
 .cursor/
 .agents/
+.codex-work/
+.codex-ui-preview.html
+.claude/
+
 
 # -------------------------------------------------------------------
 # Operating-system files

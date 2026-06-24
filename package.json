@@ -17,10 +17,7 @@
   "scripts": {
     "build": "pnpm run typecheck && pnpm -r --if-present run build",
     "typecheck:libs": "tsc --build",
-    "typecheck": "pnpm run typecheck:libs && pnpm -r --filter \"./artifacts/**\" --filter \"./scripts\" --if-present run typecheck",
-    "launch": "pnpm --filter @workspace/scripts run launch",
-    "start": "pnpm launch",
-    "dev:server": "pnpm --filter @workspace/api-server run dev",
+    "typecheck": "pnpm run typecheck:libs && pnpm -r --filter \"./artifacts/**\" --if-present run typecheck",
     "dev:app": "pnpm --filter @workspace/scanner-app run dev",
     "dev:mockup": "pnpm --filter @workspace/mockup-sandbox run dev",
     "desktop:setup": "node artifacts/desktop-app/scripts/setup-workspace.mjs",

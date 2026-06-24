@@ -12,12 +12,11 @@ The repository is a pnpm workspace:
 artifacts/
   desktop-app/       Electron desktop, Express API, SQLite services, React UI
   scanner-app/       Expo/React Native phone scanner
-  api-server/        Older standalone API artifact; not the authoritative desktop runtime
+  mockup-sandbox/    Replit design/preview sandbox for UI component mockups
 lib/
   api-client-react/  Generated API client types
   api-spec/          OpenAPI source
   api-zod/           Generated validation types
-  db/                Shared database package
 deployment/windows/  Production, LAN client, and Accounts/Tally setup scripts
 docs/                Maintained product and engineering documentation
 ```

@@ -4,14 +4,14 @@ import path from "node:path";
 import { Router, type Request, type Response } from "express";
 import QRCode from "qrcode";
 
-import { logger } from "../lib/logger";
-import { getLanAddresses } from "../lib/network";
+import { logger } from "./lib/logger";
+import { getLanAddresses } from "./lib/network";
 import {
   getWorkbookPath,
   readWorkbookPreview,
   setWorkbookPath,
   type WorkbookPreview,
-} from "../lib/workbook";
+} from "./lib/workbook";
 
 const router = Router();
 
