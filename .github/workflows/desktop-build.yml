@@ -33,14 +33,9 @@ jobs:
 
       - name: Set up pnpm
         uses: pnpm/action-setup@v4
-        with:
-          version: 11.7.0
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
-        with:
-          node-version: 24
-          cache: pnpm
 
       - name: Configure Electron workspace
         run: node artifacts/desktop-app/scripts/setup-workspace.mjs
