@@ -24,7 +24,11 @@
     },
     "android": {
       "package": "com.gaeastorm.inventoryscanner",
-      "versionCode": 1
+      "permissions": [
+        "CAMERA",
+        "INTERNET",
+        "VIBRATE"
+      ]
     },
     "web": {
       "favicon": "./assets/images/icon.png"
@@ -32,19 +36,10 @@
     "plugins": [
       "expo-router",
       "expo-font",
-      "expo-web-browser",
       [
         "expo-camera",
         {
           "cameraPermission": "Allow Stock Scanner to use the camera to scan inventory QR codes."
-        }
-      ],
-      [
-        "expo-build-properties",
-        {
-          "android": {
-            "usesCleartextTraffic": true
-          }
         }
       ]
     ]

@@ -1,0 +1,98 @@
+{
+  "name": "@workspace/desktop-app",
+  "version": "3.1.0",
+  "private": true,
+  "description": "Cross-platform desktop application for Inventory Scanner",
+  "author": "GaeaStorm",
+  "license": "MIT",
+  "main": "dist/main.cjs",
+  "scripts": {
+    "setup:workspace": "node ./scripts/setup-workspace.mjs",
+    "dev": "node ./scripts/dev.mjs",
+    "build:renderer": "vite build",
+    "build:electron": "node ./build.mjs",
+    "build": "pnpm run build:renderer && pnpm run build:electron",
+    "package": "pnpm run build && electron-builder --dir",
+    "dist": "pnpm run build && electron-builder",
+    "dist:mac": "pnpm run build && electron-builder --mac dmg --arm64",
+    "dist:win": "pnpm run build && electron-builder --win nsis --x64",
+    "typecheck": "tsc --noEmit",
+    "test": "node ./scripts/run-tests.mjs"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.6",
+    "@types/node": "catalog:",
+    "@types/qrcode": "^1.5.5",
+    "@types/react": "catalog:",
+    "@types/react-dom": "catalog:",
+    "@vitejs/plugin-react": "catalog:",
+    "electron": "^42.4.0",
+    "electron-builder": "^26.15.3",
+    "esbuild": "0.27.3",
+    "esbuild-plugin-pino": "^2.3.3",
+    "express": "^5.2.1",
+    "fast-xml-parser": "5.2.5",
+    "pino": "9.14.0",
+    "pino-pretty": "13.1.3",
+    "qrcode": "^1.5.4",
+    "react": "catalog:",
+    "react-dom": "catalog:",
+    "thread-stream": "3.1.0",
+    "typescript": "~5.9.3",
+    "vite": "catalog:",
+    "xlsx": "^0.18.5"
+  },
+  "build": {
+    "appId": "com.gaeastorm.inventoryscanner",
+    "productName": "Inventory Scanner",
+    "artifactName": "${productName}-${version}-${os}-${arch}.${ext}",
+    "directories": {
+      "output": "release",
+      "buildResources": "build"
+    },
+    "files": [
+      "dist/**/*",
+      "package.json"
+    ],
+    "asar": true,
+    "compression": "maximum",
+    "npmRebuild": false,
+    "electronLanguages": [
+      "en-US"
+    ],
+    "win": {
+      "target": [
+        "nsis"
+      ],
+      "icon": "build/icon.ico"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true
+    },
+    "mac": {
+      "target": [
+        "dmg",
+        "zip"
+      ],
+      "category": "public.app-category.business",
+      "icon": "build/icon.icns"
+    },
+    "linux": {
+      "target": [
+        "AppImage",
+        "deb"
+      ],
+      "category": "Office",
+      "icon": "build/public/logo.png"
+    },
+    "extraResources": [
+      {
+        "from": "build/public/logo.png",
+        "to": "app-logo.png"
+      }
+    ]
+  }
+}

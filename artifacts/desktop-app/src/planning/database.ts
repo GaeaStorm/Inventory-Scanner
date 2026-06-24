@@ -1,0 +1,1566 @@
+import { randomUUID } from "node:crypto";
+import type { DatabaseSync } from "node:sqlite";
+
+import type { ApplicationDatabase, ApplicationDatabaseMigration } from "../database/application-database";
+import type {
+  BomLine,
+  BomVersion,
+  BulkProductOrderUpdateInput,
+  PlanningFreshness,
+  PlanningState,
+  PlanningSummary,
+  ProductOrder,
+  ProductOrderType,
+  ProductOrderFieldDefinition,
+  ProductOrderRequirement,
+  ProductOrderWorkflowState,
+  RecommendationDecisionInput,
+  RestockHealth,
+  RestockPlanningItem,
+  RestockPolicyInput,
+  SaveBomInput,
+  SaveProductOrderFieldDefinitionInput,
+  SaveProductOrderInput,
+  SaveProductOrderWorkflowStateInput,
+  TallySalesOrderImportLine,
+} from "./types";
+import type { ActorContext } from "../operations/types";
+
+const MODULE_NAME = "planning";
+const EXPORT_SCHEMA_VERSION = "3.0";
+
+type Row = Record<string, any>;
+
+function nowIso(): string {
+  return new Date().toISOString();
+}
+
+function dateOnly(value?: string): string {
+  if (value && /^\d{4}-\d{2}-\d{2}$/.test(value)) return value;
+  const date = value ? new Date(value) : new Date();
+  if (Number.isNaN(date.valueOf())) throw new Error("Enter a valid date.");
+  return date.toISOString().slice(0, 10);
+}
+
+function wholeNumber(value: unknown, label: string, allowZero = true): number {
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < (allowZero ? 0 : 1)) {
+    throw new Error(`${label} must be ${allowZero ? "zero or a positive" : "a positive"} whole number.`);
+  }
+  return parsed;
+}
+
+function percentage(value: unknown, label: string): number {
+  const parsed = Number(value ?? 0);
+  if (!Number.isFinite(parsed) || parsed < 0 || parsed > 100) {
+    throw new Error(`${label} must be between 0 and 100.`);
+  }
+  return parsed;
+}
+
+function text(value: unknown): string {
+  return String(value ?? "").trim();
+}
+
+function optionalDate(value: unknown): string {
+  const normalized = text(value);
+  if (!normalized) return "";
+  return dateOnly(normalized);
+}
+
+function optionalNumber(value: unknown, label: string, whole = false): number | null {
+  if (value == null || text(value) === "") return null;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 0 || (whole && !Number.isInteger(parsed))) {
+    throw new Error(`${label} must be ${whole ? "a whole number" : "a number"} that is zero or greater.`);
+  }
+  return parsed;
+}
+
+function fieldKey(value: unknown): string {
+  return text(value)
+    .toLocaleLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .slice(0, 60);
+}
+
+function median(values: number[]): number | null {
+  if (values.length === 0) return null;
+  const sorted = [...values].sort((a, b) => a - b);
+  const middle = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 0
+    ? Math.round((sorted[middle - 1] + sorted[middle]) / 2)
+    : sorted[middle];
+}
+
+function normalizedOrderType(value: unknown): ProductOrderType {
+  return text(value).toLocaleUpperCase() === "SERVICE" ? "SERVICE" : "PRODUCTION";
+}
+
+export function warrantyStatusForSerial(
+  serialNumberValue: string,
+  orderCreatedAtValue: string,
+): ProductOrder["warrantyStatus"] {
+  const match = text(serialNumberValue).match(/^(\d{2})(0[1-9]|1[0-2])/);
+  if (!match) return "OUT_OF_WARRANTY";
+  const manufactureMonth = (2000 + Number(match[1])) * 12 + Number(match[2]) - 1;
+  const createdAt = new Date(orderCreatedAtValue);
+  if (Number.isNaN(createdAt.valueOf())) return "OUT_OF_WARRANTY";
+  const orderMonth = createdAt.getUTCFullYear() * 12 + createdAt.getUTCMonth();
+  const ageMonths = orderMonth - manufactureMonth;
+  return ageMonths >= 0 && ageMonths <= 15 ? "IN_WARRANTY" : "OUT_OF_WARRANTY";
+}
+
+const migrations: ApplicationDatabaseMigration[] = [
+  {
+    version: 1,
+    description: "Create restock policies, BOM versions, product orders, reservations, and planning exports",
+    up(database: DatabaseSync) {
+      database.exec(`
+        CREATE TABLE planning_restock_policies (
+          stock_item_id INTEGER PRIMARY KEY REFERENCES tally_stock_items(id) ON DELETE CASCADE,
+          planning_method TEXT NOT NULL DEFAULT 'MANUAL' CHECK (planning_method IN ('MANUAL','USAGE_SUGGESTED')),
+          reorder_point INTEGER NOT NULL DEFAULT 0 CHECK (reorder_point >= 0),
+          target_stock INTEGER NOT NULL DEFAULT 0 CHECK (target_stock >= 0),
+          service_reserve INTEGER NOT NULL DEFAULT 0 CHECK (service_reserve >= 0),
+          preferred_supplier_id INTEGER REFERENCES suppliers(id),
+          lead_time_days INTEGER NOT NULL DEFAULT 0 CHECK (lead_time_days >= 0),
+          safety_days INTEGER NOT NULL DEFAULT 0 CHECK (safety_days >= 0),
+          minimum_order_quantity INTEGER NOT NULL DEFAULT 0 CHECK (minimum_order_quantity >= 0),
+          usage_lookback_days INTEGER NOT NULL DEFAULT 90 CHECK (usage_lookback_days BETWEEN 7 AND 730),
+          notes TEXT NOT NULL DEFAULT '',
+          updated_by TEXT NOT NULL DEFAULT '',
+          updated_at TEXT NOT NULL
+        ) STRICT;
+
+        CREATE TABLE planning_recommendations (
+          stock_item_id INTEGER PRIMARY KEY REFERENCES tally_stock_items(id) ON DELETE CASCADE,
+          status TEXT NOT NULL DEFAULT 'SUGGESTED' CHECK (status IN ('SUGGESTED','REVIEWED','APPROVED','EXPORTED')),
+          approved_order_quantity INTEGER CHECK (approved_order_quantity IS NULL OR approved_order_quantity >= 0),
+          reviewed_by TEXT NOT NULL DEFAULT '',
+          reviewed_at TEXT,
+          exported_at TEXT,
+          updated_at TEXT NOT NULL
+        ) STRICT;
+
+        CREATE TABLE planning_bom_versions (
+          id TEXT PRIMARY KEY,
+          product_item_id INTEGER NOT NULL REFERENCES tally_stock_items(id) ON DELETE CASCADE,
+          version_number INTEGER NOT NULL CHECK (version_number > 0),
+          label TEXT NOT NULL DEFAULT '',
+          status TEXT NOT NULL CHECK (status IN ('DRAFT','ACTIVE','ARCHIVED')),
+          source TEXT NOT NULL CHECK (source IN ('TALLY','MANUAL','FILE_IMPORT')),
+          valid_from TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          created_by TEXT NOT NULL DEFAULT '',
+          UNIQUE(product_item_id, version_number)
+        ) STRICT;
+
+        CREATE TABLE planning_bom_lines (
+          id INTEGER PRIMARY KEY,
+          bom_version_id TEXT NOT NULL REFERENCES planning_bom_versions(id) ON DELETE CASCADE,
+          component_item_id INTEGER NOT NULL REFERENCES tally_stock_items(id),
+          quantity_per_product INTEGER NOT NULL CHECK (quantity_per_product > 0),
+          loss_buffer_percent REAL NOT NULL DEFAULT 0 CHECK (loss_buffer_percent >= 0 AND loss_buffer_percent <= 100),
+          UNIQUE(bom_version_id, component_item_id)
+        ) STRICT;
+
+        CREATE TABLE planning_product_orders (
+          id TEXT PRIMARY KEY,
+          external_reference TEXT NOT NULL DEFAULT '',
+          product_item_id INTEGER NOT NULL REFERENCES tally_stock_items(id),
+          quantity INTEGER NOT NULL CHECK (quantity > 0),
+          required_date TEXT NOT NULL,
+          status TEXT NOT NULL CHECK (status IN ('DRAFT','CONFIRMED','CANCELLED','COMPLETED')),
+          bom_version_id TEXT REFERENCES planning_bom_versions(id),
+          notes TEXT NOT NULL DEFAULT '',
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        ) STRICT;
+
+        CREATE TABLE planning_reservations (
+          id TEXT PRIMARY KEY,
+          product_order_id TEXT NOT NULL REFERENCES planning_product_orders(id) ON DELETE CASCADE,
+          component_item_id INTEGER NOT NULL REFERENCES tally_stock_items(id),
+          required_quantity INTEGER NOT NULL CHECK (required_quantity >= 0),
+          reserved_quantity INTEGER NOT NULL CHECK (reserved_quantity >= 0),
+          status TEXT NOT NULL CHECK (status IN ('ACTIVE','RELEASED','CONSUMED')),
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          UNIQUE(product_order_id, component_item_id)
+        ) STRICT;
+
+        CREATE TABLE planning_export_batches (
+          id TEXT PRIMARY KEY,
+          schema_version TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          created_by TEXT NOT NULL DEFAULT '',
+          excel_filename TEXT NOT NULL,
+          csv_filename TEXT NOT NULL DEFAULT '',
+          item_count INTEGER NOT NULL,
+          payload_hash TEXT NOT NULL DEFAULT ''
+        ) STRICT;
+
+        CREATE UNIQUE INDEX idx_planning_orders_reference
+          ON planning_product_orders(external_reference, product_item_id)
+          WHERE external_reference <> '';
+        CREATE INDEX idx_planning_orders_status ON planning_product_orders(status, required_date);
+        CREATE INDEX idx_planning_reservations_component ON planning_reservations(component_item_id, status);
+        CREATE INDEX idx_planning_boms_product ON planning_bom_versions(product_item_id, status, version_number);
+      `);
+    },
+  },
+  {
+    version: 2,
+    description: "Add configurable production-order workflow and tracker fields",
+    up(database: DatabaseSync) {
+      database.exec(`
+        CREATE TABLE planning_product_order_workflow_states (
+          id TEXT PRIMARY KEY,
+          name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+          color TEXT NOT NULL,
+          position INTEGER NOT NULL,
+          terminal INTEGER NOT NULL DEFAULT 0 CHECK (terminal IN (0, 1))
+        ) STRICT;
+
+        INSERT INTO planning_product_order_workflow_states(id, name, color, position, terminal) VALUES
+          ('pending', 'Pending', '#6B778C', 1, 0),
+          ('crf-pending', 'CRF Pending', '#9F7AEA', 2, 0),
+          ('crf-sent', 'CRF Sent', '#6554C0', 3, 0),
+          ('product-confirmation', 'Product Confirmation', '#0052CC', 4, 0),
+          ('raw-material', 'Raw Material to be Procured', '#FF8B00', 5, 0),
+          ('material-available', 'Material Available', '#00A3BF', 6, 0),
+          ('in-production', 'In Production', '#0065FF', 7, 0),
+          ('ready-dispatch', 'Ready for Dispatch', '#00875A', 8, 0),
+          ('dispatched', 'Dispatched', '#36B37E', 9, 1),
+          ('pending-material', 'Pending Material', '#DE350B', 10, 0),
+          ('hold', 'Hold', '#97A0AF', 11, 0);
+
+        ALTER TABLE planning_product_orders ADD COLUMN file_number TEXT NOT NULL DEFAULT '';
+        ALTER TABLE planning_product_orders ADD COLUMN organisation TEXT NOT NULL DEFAULT '';
+        ALTER TABLE planning_product_orders ADD COLUMN purchase_order_date TEXT NOT NULL DEFAULT '';
+        ALTER TABLE planning_product_orders ADD COLUMN last_dispatch_date TEXT NOT NULL DEFAULT '';
+        ALTER TABLE planning_product_orders ADD COLUMN pending_quantity INTEGER;
+        ALTER TABLE planning_product_orders ADD COLUMN value_including_gst REAL;
+        ALTER TABLE planning_product_orders ADD COLUMN pending_material TEXT NOT NULL DEFAULT '';
+        ALTER TABLE planning_product_orders ADD COLUMN raw_material_to_order TEXT NOT NULL DEFAULT '';
+        ALTER TABLE planning_product_orders ADD COLUMN crf_status TEXT NOT NULL DEFAULT '';
+        ALTER TABLE planning_product_orders ADD COLUMN crac_status TEXT NOT NULL DEFAULT '';
+        ALTER TABLE planning_product_orders ADD COLUMN task_remarks TEXT NOT NULL DEFAULT '';
+        ALTER TABLE planning_product_orders ADD COLUMN responsible_person TEXT NOT NULL DEFAULT '';
+        ALTER TABLE planning_product_orders ADD COLUMN follow_up_date TEXT NOT NULL DEFAULT '';
+        ALTER TABLE planning_product_orders ADD COLUMN dispatch_schedule TEXT NOT NULL DEFAULT '';
+        ALTER TABLE planning_product_orders ADD COLUMN priority TEXT NOT NULL DEFAULT '';
+        ALTER TABLE planning_product_orders ADD COLUMN workflow_state_id TEXT REFERENCES planning_product_order_workflow_states(id);
+
+        UPDATE planning_product_orders
+        SET workflow_state_id = CASE
+          WHEN status = 'COMPLETED' THEN 'dispatched'
+          WHEN status = 'CANCELLED' THEN 'hold'
+          ELSE 'pending'
+        END;
+
+        CREATE INDEX idx_planning_orders_workflow
+          ON planning_product_orders(workflow_state_id, required_date);
+
+        CREATE TABLE planning_product_order_field_definitions (
+          id TEXT PRIMARY KEY,
+          field_key TEXT NOT NULL UNIQUE,
+          label TEXT NOT NULL UNIQUE COLLATE NOCASE,
+          field_type TEXT NOT NULL CHECK (field_type IN ('TEXT','NUMBER','DATE','BOOLEAN')),
+          position INTEGER NOT NULL,
+          created_at TEXT NOT NULL
+        ) STRICT;
+
+        CREATE TABLE planning_product_order_field_values (
+          product_order_id TEXT NOT NULL REFERENCES planning_product_orders(id) ON DELETE CASCADE,
+          field_id TEXT NOT NULL REFERENCES planning_product_order_field_definitions(id) ON DELETE CASCADE,
+          value_json TEXT NOT NULL,
+          PRIMARY KEY(product_order_id, field_id)
+        ) STRICT;
+      `);
+    },
+  },
+  {
+    version: 3,
+    description: "Standardize the customer-order lifecycle and record time spent in every stage",
+    up(database: DatabaseSync) {
+      database.exec(`
+        INSERT OR IGNORE INTO planning_product_order_workflow_states(id, name, color, position, terminal) VALUES
+          ('po-pending', 'PO Pending', '#6B778C', 1, 0),
+          ('po-generated', 'PO Generated', '#5268CA', 2, 0),
+          ('crf-pending', 'CRF Pending', '#9F7AEA', 3, 0),
+          ('crf-sent', 'CRF Sent', '#6554C0', 4, 0),
+          ('material-planning', 'Material Planning', '#5268CA', 5, 0),
+          ('material-purchase', 'Material Purchase', '#B7791F', 6, 0),
+          ('quality-control', 'Quality Control', '#B7791F', 7, 0),
+          ('pcb-soldering', 'PCB Soldering', '#246BCE', 8, 0),
+          ('initial-testing', 'Initial Testing', '#246BCE', 9, 0),
+          ('burn-test', 'Burn Test', '#246BCE', 10, 0),
+          ('final-testing', 'Final Testing', '#246BCE', 11, 0),
+          ('packing', 'Packing', '#246BCE', 12, 0),
+          ('pending-dispatch', 'Pending Dispatch', '#B7791F', 13, 0),
+          ('dispatched', 'Dispatched', '#23855B', 14, 1),
+          ('crac-generated', 'CRAC Generated', '#23855B', 15, 1);
+
+        UPDATE planning_product_order_workflow_states SET name = 'PO Pending', color = '#6B778C', position = 1, terminal = 0 WHERE id = 'po-pending';
+        UPDATE planning_product_order_workflow_states SET name = 'PO Generated', color = '#5268CA', position = 2, terminal = 0 WHERE id = 'po-generated';
+        UPDATE planning_product_order_workflow_states SET name = 'CRF Pending', color = '#9F7AEA', position = 3, terminal = 0 WHERE id = 'crf-pending';
+        UPDATE planning_product_order_workflow_states SET name = 'CRF Sent', color = '#6554C0', position = 4, terminal = 0 WHERE id = 'crf-sent';
+        UPDATE planning_product_order_workflow_states SET name = 'Material Planning', color = '#5268CA', position = 5, terminal = 0 WHERE id = 'material-planning';
+        UPDATE planning_product_order_workflow_states SET name = 'Material Purchase', color = '#B7791F', position = 6, terminal = 0 WHERE id = 'material-purchase';
+        UPDATE planning_product_order_workflow_states SET name = 'Quality Control', color = '#B7791F', position = 7, terminal = 0 WHERE id = 'quality-control';
+        UPDATE planning_product_order_workflow_states SET name = 'PCB Soldering', color = '#246BCE', position = 8, terminal = 0 WHERE id = 'pcb-soldering';
+        UPDATE planning_product_order_workflow_states SET name = 'Initial Testing', color = '#246BCE', position = 9, terminal = 0 WHERE id = 'initial-testing';
+        UPDATE planning_product_order_workflow_states SET name = 'Burn Test', color = '#246BCE', position = 10, terminal = 0 WHERE id = 'burn-test';
+        UPDATE planning_product_order_workflow_states SET name = 'Final Testing', color = '#246BCE', position = 11, terminal = 0 WHERE id = 'final-testing';
+        UPDATE planning_product_order_workflow_states SET name = 'Packing', color = '#246BCE', position = 12, terminal = 0 WHERE id = 'packing';
+        UPDATE planning_product_order_workflow_states SET name = 'Pending Dispatch', color = '#B7791F', position = 13, terminal = 0 WHERE id = 'pending-dispatch';
+        UPDATE planning_product_order_workflow_states SET name = 'Dispatched', color = '#23855B', position = 14, terminal = 1 WHERE id = 'dispatched';
+        UPDATE planning_product_order_workflow_states SET name = 'CRAC Generated', color = '#23855B', position = 15, terminal = 1 WHERE id = 'crac-generated';
+
+        UPDATE planning_product_orders SET workflow_state_id = CASE workflow_state_id
+          WHEN 'pending' THEN 'po-pending'
+          WHEN 'product-confirmation' THEN 'po-generated'
+          WHEN 'raw-material' THEN 'material-purchase'
+          WHEN 'pending-material' THEN 'material-purchase'
+          WHEN 'material-available' THEN 'material-planning'
+          WHEN 'in-production' THEN 'pcb-soldering'
+          WHEN 'ready-dispatch' THEN 'pending-dispatch'
+          WHEN 'hold' THEN 'po-pending'
+          ELSE workflow_state_id
+        END;
+        UPDATE planning_product_orders SET workflow_state_id = 'po-pending'
+        WHERE workflow_state_id NOT IN (
+          'po-pending','po-generated','crf-pending','crf-sent','material-planning',
+          'material-purchase','quality-control','pcb-soldering','initial-testing',
+          'burn-test','final-testing','packing','pending-dispatch','dispatched','crac-generated'
+        ) OR workflow_state_id IS NULL;
+
+        DELETE FROM planning_product_order_workflow_states WHERE id NOT IN (
+          'po-pending','po-generated','crf-pending','crf-sent','material-planning',
+          'material-purchase','quality-control','pcb-soldering','initial-testing',
+          'burn-test','final-testing','packing','pending-dispatch','dispatched','crac-generated'
+        );
+
+        CREATE TABLE planning_product_order_stage_history (
+          id TEXT PRIMARY KEY,
+          product_order_id TEXT NOT NULL REFERENCES planning_product_orders(id) ON DELETE CASCADE,
+          workflow_state_id TEXT NOT NULL REFERENCES planning_product_order_workflow_states(id),
+          entered_at TEXT NOT NULL,
+          exited_at TEXT
+        ) STRICT;
+        CREATE INDEX idx_planning_stage_history_state
+          ON planning_product_order_stage_history(workflow_state_id, entered_at, exited_at);
+        CREATE INDEX idx_planning_stage_history_order
+          ON planning_product_order_stage_history(product_order_id, entered_at);
+
+        INSERT INTO planning_product_order_stage_history(id, product_order_id, workflow_state_id, entered_at, exited_at)
+        SELECT lower(hex(randomblob(16))), id, workflow_state_id, updated_at, NULL
+        FROM planning_product_orders;
+      `);
+    },
+  },
+  {
+    version: 4,
+    description: "Add separately timed service orders, serial numbers, and warranty tracking",
+    up(database: DatabaseSync) {
+      database.exec(`
+        ALTER TABLE planning_product_order_workflow_states
+          ADD COLUMN order_type TEXT NOT NULL DEFAULT 'PRODUCTION'
+          CHECK (order_type IN ('PRODUCTION','SERVICE'));
+        ALTER TABLE planning_product_orders
+          ADD COLUMN order_type TEXT NOT NULL DEFAULT 'PRODUCTION'
+          CHECK (order_type IN ('PRODUCTION','SERVICE'));
+        ALTER TABLE planning_product_orders
+          ADD COLUMN serial_number TEXT NOT NULL DEFAULT '';
+
+        INSERT INTO planning_product_order_workflow_states(id, name, color, position, terminal, order_type) VALUES
+          ('service-incoming', 'Service · Incoming', '#6B778C', 101, 0, 'SERVICE'),
+          ('service-estimation', 'Service · Estimation', '#5268CA', 102, 0, 'SERVICE'),
+          ('service-estimate-approval', 'Service · Estimate Approval', '#9F7AEA', 103, 0, 'SERVICE'),
+          ('service-fault-finding', 'Service · Fault Finding', '#246BCE', 104, 0, 'SERVICE'),
+          ('service-initial-testing', 'Service · Initial Testing', '#246BCE', 105, 0, 'SERVICE'),
+          ('service-burn-test', 'Service · Burn Test', '#246BCE', 106, 0, 'SERVICE'),
+          ('service-final-testing', 'Service · Final Testing', '#246BCE', 107, 0, 'SERVICE'),
+          ('service-payment', 'Service · Payment', '#B7791F', 108, 0, 'SERVICE'),
+          ('service-dispatch', 'Service · Dispatch', '#23855B', 109, 1, 'SERVICE');
+
+        DROP INDEX idx_planning_orders_reference;
+        CREATE UNIQUE INDEX idx_planning_orders_reference
+          ON planning_product_orders(external_reference, product_item_id, order_type, serial_number)
+          WHERE external_reference <> '';
+        CREATE INDEX idx_planning_orders_type
+          ON planning_product_orders(order_type, status, required_date);
+      `);
+    },
+  },
+  {
+    version: 5,
+    description: "Record user-visible order activity",
+    up(database: DatabaseSync) {
+      database.exec(`
+        CREATE TABLE planning_product_order_activity (
+          id TEXT PRIMARY KEY,
+          product_order_id TEXT NOT NULL REFERENCES planning_product_orders(id) ON DELETE CASCADE,
+          event_type TEXT NOT NULL CHECK (event_type IN ('CREATED','UPDATED','STAGE_CHANGED','STATUS_CHANGED','TALLY_IMPORTED')),
+          actor_name TEXT NOT NULL DEFAULT '',
+          actor_role TEXT NOT NULL DEFAULT '',
+          summary TEXT NOT NULL,
+          created_at TEXT NOT NULL
+        ) STRICT;
+        CREATE INDEX idx_planning_order_activity
+          ON planning_product_order_activity(product_order_id, created_at DESC);
+
+        INSERT INTO planning_product_order_activity(
+          id, product_order_id, event_type, actor_name, actor_role, summary, created_at
+        )
+        SELECT lower(hex(randomblob(16))), id, 'CREATED', 'System', 'SYSTEM',
+          'Existing order added to activity history', created_at
+        FROM planning_product_orders;
+      `);
+    },
+  },
+];
+
+export class PlanningDatabase {
+  readonly host: ApplicationDatabase;
+  private readonly beforeMigration?: () => void;
+
+  constructor(host: ApplicationDatabase, beforeMigration?: () => void) {
+    this.host = host;
+    this.beforeMigration = beforeMigration;
+    this.ensureReady();
+  }
+
+  ensureReady(): number {
+    const version = this.host.migrateModule(MODULE_NAME, migrations, this.beforeMigration);
+    this.syncMissingTallyBoms();
+    return version;
+  }
+
+  get db(): DatabaseSync {
+    return this.host.db;
+  }
+
+  private recordOrderActivity(
+    orderId: string,
+    eventType: ProductOrder["activity"][number]["eventType"],
+    summary: string,
+    actor?: ActorContext,
+  ): void {
+    this.db.prepare(`
+      INSERT INTO planning_product_order_activity(
+        id, product_order_id, event_type, actor_name, actor_role, summary, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      randomUUID(),
+      orderId,
+      eventType,
+      actor?.displayName ?? "System",
+      actor?.role ?? "SYSTEM",
+      summary,
+      nowIso(),
+    );
+  }
+
+  resetForCatalogReplacement(): void {
+    this.ensureReady();
+    this.host.transaction("clearing demo planning data before catalog replacement", () => {
+      this.db.exec(`
+        DELETE FROM planning_export_batches;
+        DELETE FROM planning_reservations;
+        DELETE FROM planning_product_orders;
+        DELETE FROM planning_bom_lines;
+        DELETE FROM planning_bom_versions;
+        DELETE FROM planning_recommendations;
+        DELETE FROM planning_restock_policies;
+      `);
+    });
+  }
+
+  private stockItemByGuid(guid: string): Row {
+    const row = this.db.prepare(
+      "SELECT id, tally_guid, name, parent_name FROM tally_stock_items WHERE tally_guid = ? AND active = 1",
+    ).get(text(guid)) as Row | undefined;
+    if (!row) throw new Error("The selected Tally Stock Item is no longer active in the Stores Catalog.");
+    return row;
+  }
+
+  syncMissingTallyBoms(): number {
+    const products = this.db.prepare(`
+      SELECT DISTINCT bc.product_item_id
+      FROM bom_components bc
+      WHERE bc.quantity IS NOT NULL AND bc.quantity > 0
+        AND NOT EXISTS (
+          SELECT 1 FROM planning_bom_versions existing
+          WHERE existing.product_item_id = bc.product_item_id
+        )
+    `).all() as Row[];
+    if (products.length === 0) return 0;
+    this.host.transaction("importing synchronized Tally BOMs into planning", () => {
+      for (const product of products) {
+        const id = randomUUID();
+        this.db.prepare(`
+          INSERT INTO planning_bom_versions(
+            id, product_item_id, version_number, label, status, source, valid_from, created_at, created_by
+          ) VALUES (?, ?, 1, 'Imported from Tally', 'ACTIVE', 'TALLY', ?, ?, 'Tally sync')
+        `).run(id, product.product_item_id, dateOnly(), nowIso());
+        const lines = this.db.prepare(`
+          SELECT component_item_id, quantity FROM bom_components
+          WHERE product_item_id = ? AND quantity IS NOT NULL AND quantity > 0
+        `).all(product.product_item_id) as Row[];
+        for (const line of lines) {
+          this.db.prepare(`
+            INSERT INTO planning_bom_lines(
+              bom_version_id, component_item_id, quantity_per_product, loss_buffer_percent
+            ) VALUES (?, ?, ?, 0)
+          `).run(id, line.component_item_id, line.quantity);
+        }
+      }
+    });
+    return products.length;
+  }
+
+  saveRestockPolicy(input: RestockPolicyInput): void {
+    this.ensureReady();
+    const item = this.stockItemByGuid(input.tallyItemGuid);
+    const method = input.planningMethod === "USAGE_SUGGESTED" ? "USAGE_SUGGESTED" : "MANUAL";
+    const reorderPoint = wholeNumber(input.reorderPoint, "Reorder point");
+    const targetStock = wholeNumber(input.targetStock, "Target stock");
+    if (targetStock < reorderPoint) throw new Error("Target stock cannot be lower than the reorder point.");
+    const supplierId = input.preferredSupplierId == null ? null : Number(input.preferredSupplierId);
+    if (supplierId != null && !this.db.prepare("SELECT 1 FROM suppliers WHERE id = ?").get(supplierId)) {
+      throw new Error("The selected preferred supplier is no longer available.");
+    }
+    this.host.transaction("saving a restock policy", () => {
+      this.db.prepare(`
+        INSERT INTO planning_restock_policies(
+          stock_item_id, planning_method, reorder_point, target_stock, service_reserve,
+          preferred_supplier_id, lead_time_days, safety_days, minimum_order_quantity,
+          usage_lookback_days, notes, updated_by, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(stock_item_id) DO UPDATE SET
+          planning_method = excluded.planning_method,
+          reorder_point = excluded.reorder_point,
+          target_stock = excluded.target_stock,
+          service_reserve = excluded.service_reserve,
+          preferred_supplier_id = excluded.preferred_supplier_id,
+          lead_time_days = excluded.lead_time_days,
+          safety_days = excluded.safety_days,
+          minimum_order_quantity = excluded.minimum_order_quantity,
+          usage_lookback_days = excluded.usage_lookback_days,
+          notes = excluded.notes,
+          updated_by = excluded.updated_by,
+          updated_at = excluded.updated_at
+      `).run(
+        item.id,
+        method,
+        reorderPoint,
+        targetStock,
+        wholeNumber(input.serviceReserve, "Service reserve"),
+        supplierId,
+        wholeNumber(input.leadTimeDays, "Lead time"),
+        wholeNumber(input.safetyDays, "Safety days"),
+        wholeNumber(input.minimumOrderQuantity, "Minimum order quantity"),
+        Math.max(7, Math.min(730, wholeNumber(input.usageLookbackDays, "Usage lookback", false))),
+        text(input.notes),
+        text(input.updatedBy),
+        nowIso(),
+      );
+      this.db.prepare(`
+        INSERT INTO planning_recommendations(stock_item_id, status, updated_at)
+        VALUES (?, 'SUGGESTED', ?)
+        ON CONFLICT(stock_item_id) DO UPDATE SET
+          status = 'SUGGESTED',
+          approved_order_quantity = NULL,
+          reviewed_by = '',
+          reviewed_at = NULL,
+          exported_at = NULL,
+          updated_at = excluded.updated_at
+      `).run(item.id, nowIso());
+    });
+  }
+
+  decideRecommendation(input: RecommendationDecisionInput): void {
+    this.ensureReady();
+    const item = this.stockItemByGuid(input.tallyItemGuid);
+    const allowed = ["SUGGESTED", "REVIEWED", "APPROVED"];
+    if (!allowed.includes(input.status)) throw new Error("Choose a valid recommendation status.");
+    const quantity = input.approvedOrderQuantity == null
+      ? null
+      : wholeNumber(input.approvedOrderQuantity, "Approved order quantity");
+    this.host.transaction("reviewing a restock recommendation", () => {
+      this.db.prepare(`
+        INSERT INTO planning_recommendations(
+          stock_item_id, status, approved_order_quantity, reviewed_by, reviewed_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(stock_item_id) DO UPDATE SET
+          status = excluded.status,
+          approved_order_quantity = excluded.approved_order_quantity,
+          reviewed_by = excluded.reviewed_by,
+          reviewed_at = excluded.reviewed_at,
+          updated_at = excluded.updated_at
+      `).run(item.id, input.status, quantity, text(input.reviewedBy), nowIso(), nowIso());
+    });
+  }
+
+  saveBom(input: SaveBomInput): BomVersion {
+    this.ensureReady();
+    const product = this.stockItemByGuid(input.productTallyGuid);
+    const lines = Array.isArray(input.lines) ? input.lines : [];
+    if (lines.length === 0) throw new Error("Add at least one component to the BOM.");
+    const normalized = lines.map((line) => ({
+      component: this.stockItemByGuid(line.componentTallyGuid),
+      quantity: wholeNumber(line.quantityPerProduct, "Component quantity", false),
+      loss: percentage(line.lossBufferPercent ?? 0, "Loss buffer"),
+    }));
+    if (new Set(normalized.map((line) => Number(line.component.id))).size !== normalized.length) {
+      throw new Error("Each component can appear only once in a BOM version.");
+    }
+    if (normalized.some((line) => Number(line.component.id) === Number(product.id))) {
+      throw new Error("A product cannot contain itself as a component.");
+    }
+
+    const id = randomUUID();
+    this.host.transaction("saving a product BOM version", () => {
+      const automaticVersion = Number((this.db.prepare(`
+        SELECT COALESCE(MAX(version_number), 0) + 1 AS version
+        FROM planning_bom_versions WHERE product_item_id = ?
+      `).get(product.id) as Row).version);
+      const requestedVersion = input.versionNumber == null
+        ? automaticVersion
+        : wholeNumber(input.versionNumber, "BOM version", false);
+      const existingVersion = this.db.prepare(`
+        SELECT 1 FROM planning_bom_versions
+        WHERE product_item_id = ? AND version_number = ?
+      `).get(product.id, requestedVersion);
+      if (existingVersion) {
+        throw new Error(`BOM version ${requestedVersion} already exists for ${text(product.name)}.`);
+      }
+      if (input.activate !== false) {
+        this.db.prepare(`
+          UPDATE planning_bom_versions SET status = 'ARCHIVED'
+          WHERE product_item_id = ? AND status = 'ACTIVE'
+        `).run(product.id);
+      }
+      this.db.prepare(`
+        INSERT INTO planning_bom_versions(
+          id, product_item_id, version_number, label, status, source, valid_from, created_at, created_by
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        id,
+        product.id,
+        requestedVersion,
+        text(input.label) || `BOM v${requestedVersion}`,
+        input.activate === false ? "DRAFT" : "ACTIVE",
+        input.source === "FILE_IMPORT" ? "FILE_IMPORT" : "MANUAL",
+        dateOnly(input.validFrom),
+        nowIso(),
+        text(input.createdBy),
+      );
+      for (const line of normalized) {
+        this.db.prepare(`
+          INSERT INTO planning_bom_lines(
+            bom_version_id, component_item_id, quantity_per_product, loss_buffer_percent
+          ) VALUES (?, ?, ?, ?)
+        `).run(id, line.component.id, line.quantity, line.loss);
+      }
+    });
+    return this.getBoms().find((bom) => bom.id === id)!;
+  }
+
+  activateBom(bomId: string): void {
+    this.ensureReady();
+    const row = this.db.prepare("SELECT product_item_id FROM planning_bom_versions WHERE id = ?").get(bomId) as Row | undefined;
+    if (!row) throw new Error("BOM version not found.");
+    this.host.transaction("activating a BOM version", () => {
+      this.db.prepare("UPDATE planning_bom_versions SET status = 'ARCHIVED' WHERE product_item_id = ? AND status = 'ACTIVE'").run(row.product_item_id);
+      this.db.prepare("UPDATE planning_bom_versions SET status = 'ACTIVE' WHERE id = ?").run(bomId);
+    });
+  }
+
+  private activeBomForProduct(productItemId: number): Row | null {
+    return (this.db.prepare(`
+      SELECT * FROM planning_bom_versions
+      WHERE product_item_id = ? AND status = 'ACTIVE'
+      ORDER BY version_number DESC LIMIT 1
+    `).get(productItemId) as Row | undefined) ?? null;
+  }
+
+  saveProductOrderWorkflowState(input: SaveProductOrderWorkflowStateInput): ProductOrderWorkflowState {
+    this.ensureReady();
+    void input;
+    throw new Error("Order stages are fixed so timing reports remain consistent.");
+  }
+
+  deleteProductOrderWorkflowState(stateIdValue: string): void {
+    this.ensureReady();
+    void stateIdValue;
+    throw new Error("Order stages are fixed so timing reports remain consistent.");
+  }
+
+  saveProductOrderFieldDefinition(input: SaveProductOrderFieldDefinitionInput): ProductOrderFieldDefinition {
+    this.ensureReady();
+    const label = text(input.label);
+    if (!label) throw new Error("Enter a field label.");
+    const key = fieldKey(label);
+    if (!key) throw new Error("Enter a field label containing letters or numbers.");
+    const allowed = ["TEXT", "NUMBER", "DATE", "BOOLEAN"];
+    const type = allowed.includes(input.type) ? input.type : "TEXT";
+    const existing = this.db.prepare(`
+      SELECT 1 FROM planning_product_order_field_definitions
+      WHERE field_key = ? OR label = ? COLLATE NOCASE
+    `).get(key, label);
+    if (existing) throw new Error("A custom field with this label already exists.");
+    const id = randomUUID();
+    const position = Number((this.db.prepare(`
+      SELECT COALESCE(MAX(position), 0) + 1 AS position FROM planning_product_order_field_definitions
+    `).get() as Row).position);
+    this.db.prepare(`
+      INSERT INTO planning_product_order_field_definitions(
+        id, field_key, label, field_type, position, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?)
+    `).run(id, key, label, type, position, nowIso());
+    return this.getProductOrderFieldDefinitions().find((field) => field.id === id)!;
+  }
+
+  deleteProductOrderFieldDefinition(fieldIdValue: string): void {
+    this.ensureReady();
+    const fieldId = text(fieldIdValue);
+    const field = this.db.prepare(`
+      SELECT id FROM planning_product_order_field_definitions WHERE id = ?
+    `).get(fieldId);
+    if (!field) throw new Error("Custom field not found.");
+    this.host.transaction("deleting a production order custom field", () => {
+      this.db.prepare("DELETE FROM planning_product_order_field_definitions WHERE id = ?").run(fieldId);
+      this.db.prepare(`
+        UPDATE planning_product_order_field_definitions
+        SET position = (
+          SELECT COUNT(*) FROM planning_product_order_field_definitions earlier
+          WHERE earlier.position <= planning_product_order_field_definitions.position
+        )
+      `).run();
+    });
+  }
+
+  updateProductOrderWorkflowState(orderId: string, workflowStateId: string, actor?: ActorContext): void {
+    this.ensureReady();
+    const state = this.db.prepare(`
+      SELECT id, order_type FROM planning_product_order_workflow_states WHERE id = ?
+    `).get(text(workflowStateId)) as Row | undefined;
+    if (!state) throw new Error("Workflow state not found.");
+    const order = this.db.prepare(`
+      SELECT workflow_state_id, order_type FROM planning_product_orders WHERE id = ?
+    `).get(text(orderId)) as Row | undefined;
+    if (!order) throw new Error("Product order not found.");
+    if (normalizedOrderType(order.order_type) !== normalizedOrderType(state.order_type)) {
+      throw new Error("Choose a stage belonging to this order type.");
+    }
+    if (normalizedOrderType(order.order_type) === "PRODUCTION" && text(state.id) === "quality-control" && !this.db.prepare(`
+      SELECT 1 FROM planning_product_order_stage_history
+      WHERE product_order_id = ? AND workflow_state_id = 'material-purchase'
+    `).get(text(orderId))) {
+      throw new Error("Quality Control is available only after the order has entered Material Purchase.");
+    }
+    this.host.transaction("updating an order stage", () => {
+      if (text(order.workflow_state_id) === text(state.id)) return;
+      const timestamp = nowIso();
+      this.db.prepare(`
+        UPDATE planning_product_order_stage_history SET exited_at = ?
+        WHERE product_order_id = ? AND exited_at IS NULL
+      `).run(timestamp, text(orderId));
+      this.db.prepare(`
+        INSERT INTO planning_product_order_stage_history(id, product_order_id, workflow_state_id, entered_at)
+        VALUES (?, ?, ?, ?)
+      `).run(randomUUID(), text(orderId), state.id, timestamp);
+      this.db.prepare(`
+        UPDATE planning_product_orders SET workflow_state_id = ?, updated_at = ? WHERE id = ?
+      `).run(state.id, timestamp, text(orderId));
+      const stateName = text((this.db.prepare(
+        "SELECT name FROM planning_product_order_workflow_states WHERE id = ?",
+      ).get(state.id) as Row | undefined)?.name);
+      this.recordOrderActivity(text(orderId), "STAGE_CHANGED", `Stage changed to ${stateName}`, actor);
+    });
+  }
+
+  saveProductOrder(input: SaveProductOrderInput, actor?: ActorContext, activityType?: "TALLY_IMPORTED"): ProductOrder {
+    this.ensureReady();
+    const product = this.stockItemByGuid(input.productTallyGuid);
+    const orderType = normalizedOrderType(input.orderType);
+    const serialNumber = text(input.serialNumber);
+    if (orderType === "SERVICE" && !/^(\d{2})(0[1-9]|1[0-2])/.test(serialNumber)) {
+      throw new Error("Service Order Serial No must begin with a valid YYMM manufacturing date.");
+    }
+    const quantity = wholeNumber(input.quantity, "Product order quantity", false);
+    const status = input.status === "DRAFT" ? "DRAFT" : "CONFIRMED";
+    const suppliedId = text(input.id);
+    const externalReference = text(input.externalReference);
+    const matchingReference = !suppliedId && externalReference
+      ? this.db.prepare(`
+          SELECT id FROM planning_product_orders
+          WHERE external_reference = ? AND product_item_id = ?
+            AND order_type = ? AND serial_number = ?
+        `).get(externalReference, product.id, orderType, serialNumber) as Row | undefined
+      : undefined;
+    const orderId = suppliedId || text(matchingReference?.id) || randomUUID();
+    const timestamp = nowIso();
+
+    this.host.transaction("saving a product order and reservations", () => {
+      const existing = this.db.prepare("SELECT * FROM planning_product_orders WHERE id = ?").get(orderId) as Row | undefined;
+      if (existing && normalizedOrderType(existing.order_type) !== orderType) {
+        throw new Error("An existing order cannot be changed between Production and Service.");
+      }
+      const bom = orderType === "PRODUCTION" ? this.activeBomForProduct(Number(product.id)) : null;
+      const workflowStateId = text(input.workflowStateId)
+        || text(existing?.workflow_state_id)
+        || text((this.db.prepare(`
+          SELECT id FROM planning_product_order_workflow_states
+          WHERE order_type = ? ORDER BY position LIMIT 1
+        `).get(orderType) as Row | undefined)?.id);
+      const workflowState = this.db.prepare(`
+        SELECT id, order_type FROM planning_product_order_workflow_states WHERE id = ?
+      `).get(workflowStateId) as Row | undefined;
+      if (!workflowState || normalizedOrderType(workflowState.order_type) !== orderType) {
+        throw new Error("Choose a valid workflow state.");
+      }
+      if (orderType === "PRODUCTION" && workflowStateId === "quality-control" && !this.db.prepare(`
+        SELECT 1 FROM planning_product_order_stage_history
+        WHERE product_order_id = ? AND workflow_state_id = 'material-purchase'
+      `).get(orderId)) {
+        throw new Error("Quality Control is available only after the order has entered Material Purchase.");
+      }
+      this.db.prepare(`
+        INSERT INTO planning_product_orders(
+          id, external_reference, product_item_id, quantity, required_date, status,
+          bom_version_id, notes, created_at, updated_at, file_number, organisation,
+          purchase_order_date, last_dispatch_date, pending_quantity, value_including_gst,
+          pending_material, raw_material_to_order, crf_status, crac_status, task_remarks,
+          responsible_person, follow_up_date, dispatch_schedule, priority, workflow_state_id,
+          order_type, serial_number
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+          external_reference = excluded.external_reference,
+          product_item_id = excluded.product_item_id,
+          quantity = excluded.quantity,
+          required_date = excluded.required_date,
+          status = excluded.status,
+          bom_version_id = excluded.bom_version_id,
+          notes = excluded.notes,
+          file_number = excluded.file_number,
+          organisation = excluded.organisation,
+          purchase_order_date = excluded.purchase_order_date,
+          last_dispatch_date = excluded.last_dispatch_date,
+          pending_quantity = excluded.pending_quantity,
+          value_including_gst = excluded.value_including_gst,
+          pending_material = excluded.pending_material,
+          raw_material_to_order = excluded.raw_material_to_order,
+          crf_status = excluded.crf_status,
+          crac_status = excluded.crac_status,
+          task_remarks = excluded.task_remarks,
+          responsible_person = excluded.responsible_person,
+          follow_up_date = excluded.follow_up_date,
+          dispatch_schedule = excluded.dispatch_schedule,
+          priority = excluded.priority,
+          workflow_state_id = excluded.workflow_state_id,
+          serial_number = excluded.serial_number,
+          updated_at = excluded.updated_at
+      `).run(
+        orderId,
+        externalReference,
+        product.id,
+        quantity,
+        dateOnly(input.requiredDate),
+        status,
+        bom?.id ?? null,
+        text(input.notes),
+        existing?.created_at ?? timestamp,
+        timestamp,
+        input.fileNumber === undefined ? text(existing?.file_number) : text(input.fileNumber),
+        input.organisation === undefined ? text(existing?.organisation) : text(input.organisation),
+        input.purchaseOrderDate === undefined ? text(existing?.purchase_order_date) : optionalDate(input.purchaseOrderDate),
+        input.lastDispatchDate === undefined ? text(existing?.last_dispatch_date) : optionalDate(input.lastDispatchDate),
+        input.pendingQuantity === undefined ? (existing?.pending_quantity ?? null) : optionalNumber(input.pendingQuantity, "Pending quantity", true),
+        input.valueIncludingGst === undefined ? (existing?.value_including_gst ?? null) : optionalNumber(input.valueIncludingGst, "Value including GST"),
+        input.pendingMaterial === undefined ? text(existing?.pending_material) : text(input.pendingMaterial),
+        input.rawMaterialToOrder === undefined ? text(existing?.raw_material_to_order) : text(input.rawMaterialToOrder),
+        input.crfStatus === undefined ? text(existing?.crf_status) : text(input.crfStatus),
+        input.cracStatus === undefined ? text(existing?.crac_status) : text(input.cracStatus),
+        input.taskRemarks === undefined ? text(existing?.task_remarks) : text(input.taskRemarks),
+        input.responsiblePerson === undefined ? text(existing?.responsible_person) : text(input.responsiblePerson),
+        input.followUpDate === undefined ? text(existing?.follow_up_date) : optionalDate(input.followUpDate),
+        input.dispatchSchedule === undefined ? text(existing?.dispatch_schedule) : text(input.dispatchSchedule),
+        input.priority === undefined ? (text(existing?.priority) || (orderType === "SERVICE" ? "LOW" : "")) : text(input.priority),
+        workflowStateId,
+        orderType,
+        serialNumber,
+      );
+      if (!existing || text(existing.workflow_state_id) !== workflowStateId) {
+        if (existing) {
+          this.db.prepare(`
+            UPDATE planning_product_order_stage_history SET exited_at = ?
+            WHERE product_order_id = ? AND exited_at IS NULL
+          `).run(timestamp, orderId);
+        }
+        this.db.prepare(`
+          INSERT INTO planning_product_order_stage_history(id, product_order_id, workflow_state_id, entered_at)
+          VALUES (?, ?, ?, ?)
+        `).run(randomUUID(), orderId, workflowStateId, timestamp);
+      }
+      if (input.customFields) {
+        const definitions = new Map(this.getProductOrderFieldDefinitions().map((field) => [field.key, field]));
+        const upsert = this.db.prepare(`
+          INSERT INTO planning_product_order_field_values(product_order_id, field_id, value_json)
+          VALUES (?, ?, ?)
+          ON CONFLICT(product_order_id, field_id) DO UPDATE SET value_json = excluded.value_json
+        `);
+        for (const [key, value] of Object.entries(input.customFields)) {
+          const definition = definitions.get(key);
+          if (!definition) continue;
+          upsert.run(orderId, definition.id, JSON.stringify(value ?? null));
+        }
+      }
+      const reservationBasisChanged = !existing
+        || Number(existing.product_item_id) !== Number(product.id)
+        || Number(existing.quantity) !== quantity
+        || text(existing.status) !== status
+        || text(existing.bom_version_id) !== text(bom?.id);
+      if (reservationBasisChanged) {
+        this.db.prepare("DELETE FROM planning_reservations WHERE product_order_id = ?").run(orderId);
+        if (orderType === "PRODUCTION" && status === "CONFIRMED" && bom) this.createReservations(orderId, bom, quantity);
+      }
+      this.recordOrderActivity(
+        orderId,
+        activityType ?? (existing ? "UPDATED" : "CREATED"),
+        activityType === "TALLY_IMPORTED"
+          ? `Imported from Tally Sales Order ${externalReference || input.fileNumber || orderId}`
+          : existing ? "Order information updated" : `${orderType === "SERVICE" ? "Service" : "Production"} Order created`,
+        actor,
+      );
+    });
+    return this.getProductOrders().find((order) => order.id === orderId)!;
+  }
+
+  private createReservations(orderId: string, bom: Row, orderQuantity: number): void {
+    const lines = this.db.prepare(`
+      SELECT component_item_id, quantity_per_product, loss_buffer_percent
+      FROM planning_bom_lines WHERE bom_version_id = ? ORDER BY id
+    `).all(bom.id) as Row[];
+    const timestamp = nowIso();
+    for (const line of lines) {
+      const required = Math.ceil(
+        orderQuantity * Number(line.quantity_per_product) * (1 + Number(line.loss_buffer_percent) / 100),
+      );
+      // A reservation represents committed demand, not a physical FIFO allocation.
+      // Keep the full requirement even when stock is insufficient so the Action
+      // Center shows a negative available balance before production is blocked.
+      this.db.prepare(`
+        INSERT INTO planning_reservations(
+          id, product_order_id, component_item_id, required_quantity,
+          reserved_quantity, status, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, 'ACTIVE', ?, ?)
+      `).run(randomUUID(), orderId, line.component_item_id, required, required, timestamp, timestamp);
+    }
+  }
+
+  updateProductOrderStatus(orderId: string, status: "CANCELLED" | "COMPLETED" | "CONFIRMED", actor?: ActorContext): void {
+    this.ensureReady();
+    const row = this.db.prepare("SELECT * FROM planning_product_orders WHERE id = ?").get(orderId) as Row | undefined;
+    if (!row) throw new Error("Product order not found.");
+    this.host.transaction("updating a product order", () => {
+      const orderType = normalizedOrderType(row.order_type);
+      let bom = orderType === "PRODUCTION" && row.bom_version_id
+        ? this.db.prepare("SELECT * FROM planning_bom_versions WHERE id = ?").get(row.bom_version_id) as Row | undefined
+        : undefined;
+      if (orderType === "PRODUCTION" && status === "CONFIRMED" && !bom) {
+        bom = this.activeBomForProduct(Number(row.product_item_id)) ?? undefined;
+      }
+      this.db.prepare(`
+        UPDATE planning_product_orders
+        SET status = ?, bom_version_id = ?, updated_at = ?
+        WHERE id = ?
+      `).run(status, status === "CONFIRMED" ? (bom?.id ?? null) : row.bom_version_id, nowIso(), orderId);
+      if (status === "CONFIRMED") {
+        this.db.prepare("DELETE FROM planning_reservations WHERE product_order_id = ?").run(orderId);
+        if (orderType === "PRODUCTION" && bom) this.createReservations(orderId, bom, Number(row.quantity));
+      } else {
+        this.db.prepare(`
+          UPDATE planning_reservations
+          SET status = 'RELEASED', updated_at = ?
+          WHERE product_order_id = ? AND status = 'ACTIVE'
+        `).run(nowIso(), orderId);
+      }
+      this.recordOrderActivity(orderId, "STATUS_CHANGED", `Order marked ${status.toLocaleLowerCase()}`, actor);
+    });
+  }
+
+  bulkUpdateProductOrders(input: BulkProductOrderUpdateInput, actor?: ActorContext): void {
+    this.ensureReady();
+    const ids = [...new Set(input.orderIds.map(text).filter(Boolean))];
+    if (ids.length === 0) throw new Error("Select at least one order.");
+    for (const id of ids) {
+      const order = this.getProductOrders().find((entry) => entry.id === id);
+      if (!order) continue;
+      if (input.workflowStateId) this.updateProductOrderWorkflowState(id, input.workflowStateId, actor);
+      if (input.responsiblePerson !== undefined || input.priority !== undefined) {
+        this.saveProductOrder({
+          id,
+          orderType: order.orderType,
+          serialNumber: order.serialNumber,
+          externalReference: order.externalReference,
+          productTallyGuid: order.productTallyGuid,
+          quantity: order.quantity,
+          requiredDate: order.requiredDate,
+          responsiblePerson: input.responsiblePerson ?? order.responsiblePerson,
+          priority: input.priority ?? order.priority,
+        }, actor);
+      }
+    }
+  }
+
+  importTallySalesOrders(lines: TallySalesOrderImportLine[], actor?: ActorContext): {
+    imported: number;
+    skipped: number;
+    unmatched: number;
+  } {
+    this.ensureReady();
+    let imported = 0;
+    let skipped = 0;
+    let unmatched = 0;
+    for (const line of lines) {
+      const product = line.productTallyGuid
+        ? this.db.prepare("SELECT tally_guid FROM tally_stock_items WHERE tally_guid = ?").get(line.productTallyGuid)
+        : this.db.prepare(`
+            SELECT tally_guid FROM tally_stock_items
+            WHERE name = ? COLLATE NOCASE OR local_name_override = ? COLLATE NOCASE
+            LIMIT 1
+          `).get(line.productName, line.productName);
+      if (!product) {
+        unmatched += 1;
+        continue;
+      }
+      const productGuid = text((product as Row).tally_guid);
+      const existing = this.db.prepare(`
+        SELECT id FROM planning_product_orders
+        WHERE order_type = 'PRODUCTION'
+          AND external_reference = ?
+          AND product_item_id = (SELECT id FROM tally_stock_items WHERE tally_guid = ?)
+      `).get(line.voucherNumber || line.reference, productGuid);
+      if (existing) {
+        skipped += 1;
+        continue;
+      }
+      this.saveProductOrder({
+        orderType: "PRODUCTION",
+        fileNumber: line.tallyGuid,
+        organisation: line.customerName,
+        externalReference: line.voucherNumber || line.reference,
+        purchaseOrderDate: line.voucherDate,
+        productTallyGuid: productGuid,
+        quantity: Math.max(1, Math.round(line.quantity)),
+        pendingQuantity: Math.max(1, Math.round(line.quantity)),
+        valueIncludingGst: line.value,
+        requiredDate: line.voucherDate,
+        workflowStateId: "po-pending",
+        status: "CONFIRMED",
+        notes: "Imported read-only from Tally Sales Order. Local workflow fields remain managed here.",
+      }, actor, "TALLY_IMPORTED");
+      imported += 1;
+    }
+    return { imported, skipped, unmatched };
+  }
+
+
+
+  private getBoms(): BomVersion[] {
+    const rows = this.db.prepare(`
+      SELECT b.*, item.tally_guid AS product_tally_guid,
+        COALESCE(NULLIF(item.local_name_override, ''), item.name) AS product_name
+      FROM planning_bom_versions b
+      JOIN tally_stock_items item ON item.id = b.product_item_id
+      ORDER BY item.name, b.version_number DESC
+    `).all() as Row[];
+    const lineStatement = this.db.prepare(`
+      SELECT l.*, item.tally_guid AS component_tally_guid,
+        COALESCE(NULLIF(item.local_name_override, ''), item.name) AS component_name
+      FROM planning_bom_lines l
+      JOIN tally_stock_items item ON item.id = l.component_item_id
+      WHERE l.bom_version_id = ? ORDER BY item.name
+    `);
+    return rows.map((row) => ({
+      id: text(row.id),
+      productStockItemId: Number(row.product_item_id),
+      productTallyGuid: text(row.product_tally_guid),
+      productName: text(row.product_name),
+      versionNumber: Number(row.version_number),
+      label: text(row.label),
+      status: row.status,
+      source: row.source,
+      validFrom: text(row.valid_from),
+      createdAt: text(row.created_at),
+      createdBy: text(row.created_by),
+      lines: (lineStatement.all(row.id) as Row[]).map((line): BomLine => ({
+        id: Number(line.id),
+        componentStockItemId: Number(line.component_item_id),
+        componentTallyGuid: text(line.component_tally_guid),
+        componentName: text(line.component_name),
+        quantityPerProduct: Number(line.quantity_per_product),
+        lossBufferPercent: Number(line.loss_buffer_percent),
+      })),
+    }));
+  }
+
+  private getProductOrderWorkflowStates(): ProductOrderWorkflowState[] {
+    return (this.db.prepare(`
+      SELECT id, name, color, position, terminal, order_type
+      FROM planning_product_order_workflow_states ORDER BY position, name
+    `).all() as Row[]).map((row) => ({
+      id: text(row.id),
+      orderType: normalizedOrderType(row.order_type),
+      name: text(row.name),
+      color: text(row.color),
+      position: Number(row.position),
+      terminal: Boolean(row.terminal),
+    }));
+  }
+
+  private getProductOrderFieldDefinitions(): ProductOrderFieldDefinition[] {
+    return (this.db.prepare(`
+      SELECT id, field_key, label, field_type, position
+      FROM planning_product_order_field_definitions ORDER BY position, label
+    `).all() as Row[]).map((row) => ({
+      id: text(row.id),
+      key: text(row.field_key),
+      label: text(row.label),
+      type: row.field_type,
+      position: Number(row.position),
+    }));
+  }
+
+  private getProductOrders(): ProductOrder[] {
+    const rows = this.db.prepare(`
+      SELECT o.*, item.tally_guid AS product_tally_guid,
+        COALESCE(NULLIF(item.local_name_override, ''), item.name) AS product_name,
+        bom.label AS bom_label, bom.version_number AS bom_version_number,
+        workflow.name AS workflow_state_name, workflow.color AS workflow_state_color
+      FROM planning_product_orders o
+      JOIN tally_stock_items item ON item.id = o.product_item_id
+      LEFT JOIN planning_bom_versions bom ON bom.id = o.bom_version_id
+      LEFT JOIN planning_product_order_workflow_states workflow ON workflow.id = o.workflow_state_id
+      ORDER BY CASE o.order_type WHEN 'PRODUCTION' THEN 0 ELSE 1 END,
+        CASE o.status WHEN 'CONFIRMED' THEN 0 WHEN 'DRAFT' THEN 1 ELSE 2 END,
+        o.required_date, o.created_at DESC
+    `).all() as Row[];
+    const requirementsStatement = this.db.prepare(`
+      SELECT r.*, item.tally_guid AS component_tally_guid,
+        COALESCE(NULLIF(item.local_name_override, ''), item.name) AS component_name,
+        line.quantity_per_product, line.loss_buffer_percent,
+        COALESCE((SELECT SUM(quantity_remaining) FROM purchase_lots WHERE stock_item_id = r.component_item_id), 0) AS on_hand,
+        COALESCE((SELECT service_reserve FROM planning_restock_policies WHERE stock_item_id = r.component_item_id), 0) AS service_reserve,
+        COALESCE((SELECT SUM(pol.ordered_quantity - pol.received_quantity)
+          FROM purchase_order_lines pol JOIN purchase_orders po ON po.id = pol.purchase_order_id
+          WHERE pol.stock_item_id = r.component_item_id
+            AND po.status <> 'CLOSED'
+            AND pol.ordered_quantity > pol.received_quantity), 0) AS incoming
+      FROM planning_reservations r
+      JOIN tally_stock_items item ON item.id = r.component_item_id
+      LEFT JOIN planning_product_orders po ON po.id = r.product_order_id
+      LEFT JOIN planning_bom_lines line ON line.bom_version_id = po.bom_version_id AND line.component_item_id = r.component_item_id
+      WHERE r.product_order_id = ? ORDER BY item.name
+    `);
+    const customFieldStatement = this.db.prepare(`
+      SELECT definition.field_key, value.value_json
+      FROM planning_product_order_field_values value
+      JOIN planning_product_order_field_definitions definition ON definition.id = value.field_id
+      WHERE value.product_order_id = ?
+      ORDER BY definition.position
+    `);
+    const stageHistoryStatement = this.db.prepare(`
+      SELECT history.*, workflow.name AS state_name
+      FROM planning_product_order_stage_history history
+      JOIN planning_product_order_workflow_states workflow ON workflow.id = history.workflow_state_id
+      WHERE history.product_order_id = ? ORDER BY history.entered_at
+    `);
+    const activityStatement = this.db.prepare(`
+      SELECT id, event_type, actor_name, actor_role, summary, created_at
+      FROM planning_product_order_activity
+      WHERE product_order_id = ?
+      ORDER BY created_at DESC, id DESC
+      LIMIT 100
+    `);
+    const priorCommittedByComponent = new Map<number, number>();
+    return rows.map((row) => {
+      const requirements = (requirementsStatement.all(row.id) as Row[]).map((requirement): ProductOrderRequirement => {
+        const componentId = Number(requirement.component_item_id);
+        const priorCommitted = priorCommittedByComponent.get(componentId) ?? 0;
+        const onHandAvailable = Math.max(0, Number(requirement.on_hand) - Number(requirement.service_reserve));
+        const totalIncoming = Math.max(0, Number(requirement.incoming));
+        const availableBeforeOrder = Math.max(0, onHandAvailable - priorCommitted);
+        const projectedBeforeOrder = Math.max(0, onHandAvailable + totalIncoming - priorCommitted);
+        const required = Number(requirement.required_quantity);
+        const incomingAvailableForOrder = Math.min(
+          Math.max(0, projectedBeforeOrder - availableBeforeOrder),
+          Math.max(0, required - availableBeforeOrder),
+        );
+        if (row.status === "CONFIRMED") {
+          priorCommittedByComponent.set(componentId, priorCommitted + required);
+        }
+        return {
+          componentStockItemId: Number(requirement.component_item_id),
+          componentTallyGuid: text(requirement.component_tally_guid),
+          componentName: text(requirement.component_name),
+          baseQuantity: Number(requirement.quantity_per_product ?? required) * Number(row.quantity),
+          lossBufferPercent: Number(requirement.loss_buffer_percent ?? 0),
+          requiredQuantity: required,
+          reservedQuantity: Number(requirement.reserved_quantity),
+          availableBeforeOrder,
+          incomingQuantity: incomingAvailableForOrder,
+          shortageNow: Math.max(0, required - availableBeforeOrder),
+          shortageAfterIncoming: Math.max(0, required - projectedBeforeOrder),
+        };
+      });
+      const orderType = normalizedOrderType(row.order_type);
+      let feasibility: ProductOrder["feasibility"] = orderType === "SERVICE" ? "READY" : "BOM_INCOMPLETE";
+      if (orderType === "PRODUCTION" && row.bom_version_id && requirements.length > 0) {
+        if (requirements.every((line) => line.shortageNow === 0)) feasibility = "READY";
+        else if (requirements.every((line) => line.shortageAfterIncoming === 0)) feasibility = "READY_WITH_INCOMING";
+        else if (requirements.some((line) => line.shortageAfterIncoming >= line.requiredQuantity)) feasibility = "SHORT_COMPONENTS";
+        else feasibility = "AT_RISK";
+      }
+      const customFields = Object.fromEntries((customFieldStatement.all(row.id) as Row[]).map((field) => {
+        try {
+          return [text(field.field_key), JSON.parse(text(field.value_json))];
+        } catch {
+          return [text(field.field_key), text(field.value_json)];
+        }
+      }));
+      const stageHistory = (stageHistoryStatement.all(row.id) as Row[]).map((entry) => {
+        const end = entry.exited_at ? new Date(text(entry.exited_at)).valueOf() : Date.now();
+        const start = new Date(text(entry.entered_at)).valueOf();
+        return {
+          id: text(entry.id),
+          stateId: text(entry.workflow_state_id),
+          stateName: text(entry.state_name),
+          enteredAt: text(entry.entered_at),
+          exitedAt: entry.exited_at ? text(entry.exited_at) : null,
+          durationHours: Math.max(0, (end - start) / 3_600_000),
+        };
+      });
+      const activity = (activityStatement.all(row.id) as Row[]).map((entry) => ({
+        id: text(entry.id),
+        eventType: entry.event_type,
+        actorName: text(entry.actor_name),
+        actorRole: text(entry.actor_role),
+        summary: text(entry.summary),
+        createdAt: text(entry.created_at),
+      }));
+      return {
+        id: text(row.id),
+        orderType,
+        serialNumber: text(row.serial_number),
+        warrantyStatus: orderType === "SERVICE"
+          ? warrantyStatusForSerial(text(row.serial_number), text(row.created_at))
+          : "NOT_APPLICABLE",
+        fileNumber: text(row.file_number),
+        organisation: text(row.organisation),
+        externalReference: text(row.external_reference),
+        purchaseOrderDate: text(row.purchase_order_date),
+        lastDispatchDate: text(row.last_dispatch_date),
+        productStockItemId: Number(row.product_item_id),
+        productTallyGuid: text(row.product_tally_guid),
+        productName: text(row.product_name),
+        quantity: Number(row.quantity),
+        pendingQuantity: row.pending_quantity == null ? null : Number(row.pending_quantity),
+        valueIncludingGst: row.value_including_gst == null ? null : Number(row.value_including_gst),
+        pendingMaterial: text(row.pending_material),
+        rawMaterialToOrder: text(row.raw_material_to_order),
+        crfStatus: text(row.crf_status),
+        cracStatus: text(row.crac_status),
+        taskRemarks: text(row.task_remarks),
+        responsiblePerson: text(row.responsible_person),
+        followUpDate: text(row.follow_up_date),
+        dispatchSchedule: text(row.dispatch_schedule),
+        priority: text(row.priority),
+        requiredDate: text(row.required_date),
+        status: row.status,
+        workflowStateId: text(row.workflow_state_id),
+        workflowStateName: text(row.workflow_state_name) || "Pending",
+        workflowStateColor: text(row.workflow_state_color) || "#6B778C",
+        stageHistory,
+        activity,
+        bomVersionId: row.bom_version_id ? text(row.bom_version_id) : null,
+        bomVersionLabel: row.bom_version_id ? `${text(row.bom_label)} (v${row.bom_version_number})` : "No active BOM",
+        feasibility,
+        notes: text(row.notes),
+        customFields,
+        createdAt: text(row.created_at),
+        updatedAt: text(row.updated_at),
+        requirements,
+      };
+    });
+  }
+
+  private usageForItem(stockItemId: number, lookbackDays: number): number {
+    const since = new Date(Date.now() - lookbackDays * 86_400_000).toISOString().slice(0, 10);
+    const row = this.db.prepare(`
+      SELECT COALESCE(SUM(
+        CASE
+          WHEN m.workflow = 'MATERIAL_OUT' THEN m.quantity
+          WHEN a.direction = 'ADDITIONAL_OUT' THEN m.quantity
+          WHEN a.direction = 'RETURN_TO_STOCK' THEN -m.quantity
+          ELSE 0
+        END
+      ), 0) AS net_out
+      FROM inventory_movements m
+      LEFT JOIN inventory_adjustments a ON a.movement_id = m.id
+      WHERE m.stock_item_id = ? AND m.event_date >= ?
+    `).get(stockItemId, since) as Row;
+    return Math.max(0, Number(row.net_out)) / lookbackDays;
+  }
+
+  private observedLeadTime(stockItemId: number, supplierId: number | null): number | null {
+    const rows = this.db.prepare(`
+      SELECT CAST(julianday(g.voucher_date) - julianday(po.voucher_date) AS INTEGER) AS days
+      FROM grn_lines gl
+      JOIN grns g ON g.id = gl.grn_id
+      JOIN purchase_orders po ON po.id = g.purchase_order_id
+      WHERE gl.stock_item_id = ?
+        AND (? IS NULL OR g.supplier_id = ?)
+        AND julianday(g.voucher_date) >= julianday(po.voucher_date)
+      ORDER BY g.voucher_date DESC LIMIT 30
+    `).all(stockItemId, supplierId, supplierId) as Row[];
+    return median(rows.map((row) => Number(row.days)).filter((days) => Number.isFinite(days) && days >= 0));
+  }
+
+  private getPlanningItems(): RestockPlanningItem[] {
+    const groupParents = new Map((this.db.prepare(
+      "SELECT name, parent_name FROM tally_stock_groups WHERE active = 1",
+    ).all() as Row[]).map((row) => [text(row.name).toLocaleLowerCase(), text(row.parent_name)]));
+    const groupSettings = new Map((this.db.prepare(
+      "SELECT group_name, ignored FROM catalog_group_settings",
+    ).all() as Row[]).map((row) => [text(row.group_name).toLocaleLowerCase(), {
+      ignored: Number(row.ignored) === 1,
+    }]));
+    const splitGroup = (directName: string) => {
+      const path: string[] = [];
+      let current = directName;
+      const visited = new Set<string>();
+      for (;;) {
+        const key = current.toLocaleLowerCase();
+        if (visited.has(key)) break;
+        visited.add(key);
+        path.unshift(current);
+        const parent = groupParents.get(key) ?? "";
+        if (!parent || parent.toLocaleLowerCase() === "primary") break;
+        current = parent;
+      }
+      return {
+        path,
+        primaryGroupName: path[0] ?? "",
+        secondaryGroupName: path[1] ?? "",
+      };
+    };
+    const rows = this.db.prepare(`
+      SELECT item.id, item.tally_guid,
+        COALESCE(NULLIF(item.local_name_override, ''), item.name) AS name,
+        item.parent_name, item.source, item.catalog_status,
+        policy.planning_method, policy.reorder_point, policy.target_stock,
+        policy.service_reserve, policy.preferred_supplier_id,
+        supplier.name AS preferred_supplier_name, policy.lead_time_days,
+        policy.safety_days, policy.minimum_order_quantity, policy.usage_lookback_days,
+        policy.notes, policy.updated_by, policy.updated_at,
+        recommendation.status AS recommendation_status,
+        recommendation.approved_order_quantity,
+        COALESCE((SELECT SUM(quantity_remaining) FROM purchase_lots WHERE stock_item_id = item.id), 0) AS on_hand,
+        COALESCE((SELECT SUM(reserved_quantity) FROM planning_reservations WHERE component_item_id = item.id AND status = 'ACTIVE'), 0) AS reserved,
+        COALESCE((SELECT SUM(pol.ordered_quantity - pol.received_quantity)
+          FROM purchase_order_lines pol JOIN purchase_orders po ON po.id = pol.purchase_order_id
+          WHERE pol.stock_item_id = item.id
+            AND po.status <> 'CLOSED'
+            AND pol.ordered_quantity > pol.received_quantity), 0) AS incoming
+      FROM tally_stock_items item
+      LEFT JOIN planning_restock_policies policy ON policy.stock_item_id = item.id
+      LEFT JOIN suppliers supplier ON supplier.id = policy.preferred_supplier_id
+      LEFT JOIN planning_recommendations recommendation ON recommendation.stock_item_id = item.id
+      WHERE item.active = 1
+        AND item.catalog_ignored = 0
+        AND item.catalog_status <> 'DUPLICATE'
+      ORDER BY item.name
+    `).all() as Row[];
+    return rows.map((row) => {
+      const groups = splitGroup(text(row.parent_name));
+      const pathSettings = groups.path
+        .map((name) => groupSettings.get(name.toLocaleLowerCase()))
+        .filter((value) => value !== undefined);
+      if (pathSettings.some((settings) => settings?.ignored)) return null;
+      const configured = row.planning_method != null;
+      const lookbackDays = Number(row.usage_lookback_days ?? 90);
+      const averageDailyUsage = this.usageForItem(Number(row.id), lookbackDays);
+      const serviceReserve = Number(row.service_reserve ?? 0);
+      const leadTimeDays = Number(row.lead_time_days ?? 0);
+      const safetyDays = Number(row.safety_days ?? 0);
+      const observedLeadTimeMedianDays = this.observedLeadTime(
+        Number(row.id),
+        row.preferred_supplier_id == null ? null : Number(row.preferred_supplier_id),
+      );
+      const effectiveLeadTimeDays = leadTimeDays > 0 ? leadTimeDays : (observedLeadTimeMedianDays ?? 0);
+      const suggestedReorderPoint = Math.ceil(averageDailyUsage * (effectiveLeadTimeDays + safetyDays) + serviceReserve);
+      const reorderPoint = Number(row.reorder_point ?? 0);
+      const targetStock = Number(row.target_stock ?? 0);
+      const onHand = Number(row.on_hand);
+      const reserved = Number(row.reserved);
+      const incoming = Number(row.incoming);
+      const available = onHand - reserved - serviceReserve;
+      const projected = available + incoming;
+      const minimumOrderQuantity = Number(row.minimum_order_quantity ?? 0);
+      const obsolete = text(row.catalog_status) === "OBSOLETE";
+      const suggestedObsoleteTarget = Math.ceil(averageDailyUsage * 365 * 3.5);
+      const yearsOfStock = averageDailyUsage > 0 ? onHand / (averageDailyUsage * 365) : null;
+      let suggestedOrderQuantity = Math.max(0, targetStock - projected);
+      if (obsolete) suggestedOrderQuantity = Math.max(0, targetStock - projected);
+      if (suggestedOrderQuantity > 0 && minimumOrderQuantity > 0) {
+        suggestedOrderQuantity = Math.max(suggestedOrderQuantity, minimumOrderQuantity);
+      }
+      let health: RestockHealth = "UNCONFIGURED";
+      if (configured) {
+        if (projected < 0) health = "CRITICAL";
+        else if (projected <= reorderPoint) health = "REORDER_NOW";
+        else if (projected <= reorderPoint + Math.max(1, Math.ceil(reorderPoint * 0.2))) health = "REORDER_SOON";
+        else if (targetStock > 0 && projected > targetStock) health = "EXCESS";
+        else health = "HEALTHY";
+      }
+      const warnings: string[] = [];
+      if (!configured) warnings.push("Restock policy not configured.");
+      if (configured && !row.preferred_supplier_id) warnings.push("Preferred supplier not set.");
+      if (configured && leadTimeDays === 0) warnings.push("Supplier lead time not set.");
+      if (obsolete && targetStock === 0) warnings.push("Obsolete item needs a target quantity for approximately 3–4 years of expected usage.");
+      if (obsolete && yearsOfStock != null && (yearsOfStock < 3 || yearsOfStock > 4)) {
+        warnings.push(`Current stock covers approximately ${yearsOfStock.toFixed(1)} years; the obsolete-stock goal is 3–4 years.`);
+      }
+      return {
+        stockItemId: Number(row.id),
+        tallyItemGuid: text(row.tally_guid),
+        itemName: text(row.name),
+        groupName: text(row.parent_name),
+        primaryGroupName: groups.primaryGroupName,
+        secondaryGroupName: groups.secondaryGroupName,
+        catalogSource: row.source === "LOCAL" ? "LOCAL" : "TALLY",
+        catalogStatus: obsolete ? "OBSOLETE" : "ACTIVE",
+        planningMethod: row.planning_method ?? "MANUAL",
+        reorderPoint,
+        targetStock,
+        serviceReserve,
+        preferredSupplierId: row.preferred_supplier_id == null ? null : Number(row.preferred_supplier_id),
+        preferredSupplierName: text(row.preferred_supplier_name),
+        leadTimeDays,
+        safetyDays,
+        minimumOrderQuantity,
+        usageLookbackDays: lookbackDays,
+        notes: text(row.notes),
+        updatedBy: text(row.updated_by),
+        updatedAt: text(row.updated_at),
+        onHand,
+        reserved,
+        available,
+        incoming,
+        projected,
+        averageDailyUsage,
+        yearsOfStock,
+        suggestedObsoleteTarget,
+        suggestedReorderPoint,
+        effectiveLeadTimeDays,
+        observedLeadTimeMedianDays,
+        suggestedOrderQuantity,
+        approvedOrderQuantity: row.approved_order_quantity == null ? null : Number(row.approved_order_quantity),
+        recommendationStatus: row.recommendation_status ?? "SUGGESTED",
+        health,
+        dataWarnings: warnings,
+      };
+    }).filter((item): item is RestockPlanningItem => item !== null);
+  }
+
+  getState(): PlanningState {
+    this.ensureReady();
+    const generatedAt = nowIso();
+    const items = this.getPlanningItems();
+    const boms = this.getBoms();
+    const productOrders = this.getProductOrders();
+    const productOrderWorkflowStates = this.getProductOrderWorkflowStates();
+    const productOrderFieldDefinitions = this.getProductOrderFieldDefinitions();
+    const tallySync = (this.db.prepare("SELECT value_json FROM settings WHERE key = 'last_tally_sync_at'").get() as Row | undefined)?.value_json;
+    let tallySyncedAt: string | null = null;
+    if (tallySync) {
+      try { tallySyncedAt = JSON.parse(tallySync); } catch { tallySyncedAt = null; }
+    }
+    const tallyAgeDays = tallySyncedAt
+      ? Math.max(0, Math.floor((Date.now() - new Date(tallySyncedAt).valueOf()) / 86_400_000))
+      : null;
+    const freshness: PlanningFreshness = {
+      localInventoryUpdatedAt: generatedAt,
+      tallySyncedAt,
+      tallyStale: tallyAgeDays == null || tallyAgeDays >= 2,
+      tallyAgeDays,
+      message: tallyAgeDays == null
+        ? "Tally has not synchronized yet. Local inventory and reservations remain available."
+        : tallyAgeDays >= 2
+          ? `Tally last synchronized ${tallyAgeDays} days ago. Incoming Purchase Order quantities may be stale.`
+          : "Local inventory is live. Tally purchasing data is recent.",
+    };
+    const summary: PlanningSummary = {
+      critical: items.filter((item) => item.health === "CRITICAL").length,
+      reorderNow: items.filter((item) => item.health === "REORDER_NOW").length,
+      reorderSoon: items.filter((item) => item.health === "REORDER_SOON").length,
+      healthy: items.filter((item) => item.health === "HEALTHY").length,
+      excess: items.filter((item) => item.health === "EXCESS").length,
+      unconfigured: items.filter((item) => item.health === "UNCONFIGURED").length,
+      ordersAtRisk: productOrders.filter((order) => order.orderType === "PRODUCTION" && ["AT_RISK", "SHORT_COMPONENTS", "BOM_INCOMPLETE"].includes(order.feasibility) && order.status === "CONFIRMED").length,
+      ordersReady: productOrders.filter((order) => order.orderType === "PRODUCTION" && ["READY", "READY_WITH_INCOMING"].includes(order.feasibility) && order.status === "CONFIRMED").length,
+      missingBom: productOrders.filter((order) => order.orderType === "PRODUCTION" && order.feasibility === "BOM_INCOMPLETE" && order.status === "CONFIRMED").length,
+    };
+    return {
+      moduleVersion: this.host.moduleVersion(MODULE_NAME),
+      exportSchemaVersion: EXPORT_SCHEMA_VERSION,
+      generatedAt,
+      freshness,
+      summary,
+      items,
+      boms,
+      productOrders,
+      productOrderWorkflowStates,
+      productOrderFieldDefinitions,
+      groups: [...new Set(items.map((item) => item.groupName).filter(Boolean))].sort(),
+      primaryGroups: [...new Set(items.map((item) => item.primaryGroupName).filter(Boolean))].sort(),
+      secondaryGroups: [...new Set(items.map((item) => item.secondaryGroupName).filter(Boolean))].sort(),
+    };
+  }
+
+  markRecommendationsExported(stockItemIds: number[], exportedAt: string): void {
+    this.ensureReady();
+    if (stockItemIds.length === 0) return;
+    const statement = this.db.prepare(`
+      UPDATE planning_recommendations SET status = 'EXPORTED', exported_at = ?, updated_at = ?
+      WHERE stock_item_id = ?
+    `);
+    this.host.transaction("marking restock recommendations exported", () => {
+      for (const id of stockItemIds) statement.run(exportedAt, exportedAt, id);
+    });
+  }
+
+  recordExportBatch(input: {
+    id: string;
+    createdAt: string;
+    createdBy: string;
+    excelFilename: string;
+    csvFilename: string;
+    itemCount: number;
+    payloadHash: string;
+  }): void {
+    this.ensureReady();
+    this.db.prepare(`
+      INSERT INTO planning_export_batches(
+        id, schema_version, created_at, created_by, excel_filename, csv_filename, item_count, payload_hash
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(input.id, EXPORT_SCHEMA_VERSION, input.createdAt, input.createdBy, input.excelFilename, input.csvFilename, input.itemCount, input.payloadHash);
+  }
+}

@@ -11,7 +11,7 @@ import {
   Platform,
 } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
-import { Feather } from "@expo/vector-icons";
+import Feather from "@expo/vector-icons/Feather";
 import * as Haptics from "expo-haptics";
 
 import { useColors } from "@/hooks/useColors";
@@ -79,10 +79,13 @@ export default function SettingsScreen() {
   const insets = useSafeAreaInsets();
   const {
     serverUrl,
+    deviceLabel,
+    paired,
     setServerUrl,
+    pairScanner,
     pendingCount,
+    queueSummary,
     syncPending,
-    transactions,
     testConnection,
   } = useSync();
 
@@ -122,13 +125,13 @@ export default function SettingsScreen() {
     }
   };
 
-  const handleQrServerUrl = async (url: string) => {
-    setUrlDraft(url);
+  const handleQrPairing = async (input: { url: string; pairingToken: string; deviceLabel?: string }) => {
+    setUrlDraft(input.url);
     setTestResult(null);
     setIsSaving(true);
 
-    await setServerUrl(url);
-    const ok = await testConnection(url);
+    await pairScanner(input);
+    const ok = await testConnection(input.url);
 
     setTestResult(ok ? "ok" : "fail");
     setIsSaving(false);
@@ -141,8 +144,8 @@ export default function SettingsScreen() {
     Alert.alert(
       ok ? "Connected" : "Address saved",
       ok
-        ? `Inventory Scanner is connected to ${url}.`
-        : `The address ${url} was saved, but the server could not be reached. Check that both devices are on the same network.`,
+        ? `Inventory Scanner paired this phone as ${input.deviceLabel || "Phone scanner"}.`
+        : `Pairing was saved, but ${input.url} could not be reached. Check that both devices are on the same network.`,
     );
   };
 
@@ -155,8 +158,6 @@ export default function SettingsScreen() {
     if (Platform.OS !== "web")
       Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
   };
-
-  const syncedCount = transactions.filter((t) => t.synced).length;
 
   return (
     <ScrollView
@@ -175,11 +176,12 @@ export default function SettingsScreen() {
       <ServerQrScanner
         visible={isQrScannerOpen}
         onCancel={() => setIsQrScannerOpen(false)}
-        onServerUrl={handleQrServerUrl}
+        onPairing={handleQrPairing}
       />
 
       {/* Server URL */}
       <Section title="SERVER CONNECTION">
+        <Row icon={paired ? "shield" : "alert-triangle"} label="Scanner identity" value={paired ? deviceLabel : "Not paired"} accent={paired ? colors.light.stockIn : colors.light.stockOut} />
         <View style={styles.urlInputWrapper}>
           <Feather
             name="server"
@@ -328,11 +330,11 @@ export default function SettingsScreen() {
             },
             {
               icon: "info",
-              text: "Scan the setup QR shown in the laptop dashboard",
+              text: "Scan a one-time pairing QR from Desktop Settings",
             },
             {
               icon: "file-text",
-              text: "Transactions are saved to stock_transactions.xlsx on your laptop",
+              text: "Transactions are saved in the desktop's Local Stores Database",
             },
           ].map((item, i) => (
             <View
@@ -365,18 +367,18 @@ export default function SettingsScreen() {
       {/* Sync status */}
       <Section title="SYNC STATUS">
         <Row
-          icon="check-circle"
-          label="Synced"
-          value={`${syncedCount}`}
-          accent={colors.light.stockIn}
+          icon="clock"
+          label="Waiting to sync"
+          value={`${queueSummary.pending}`}
+          accent={queueSummary.pending > 0 ? colors.light.pending : colors.light.stockIn}
         />
         <Row
-          icon="clock"
-          label="Pending"
-          value={`${pendingCount}`}
-          accent={pendingCount > 0 ? colors.light.pending : c.mutedForeground}
+          icon="alert-triangle"
+          label="Needs review"
+          value={`${queueSummary.rejected}`}
+          accent={queueSummary.rejected > 0 ? colors.light.stockOut : c.mutedForeground}
         />
-        <Row icon="list" label="Total" value={`${transactions.length}`} />
+        <Row icon="list" label="Stored on this phone" value={`${queueSummary.total}`} />
         <View style={[styles.divider, { backgroundColor: c.border }]} />
         <TouchableOpacity
           style={[styles.syncAllBtn, { borderColor: colors.light.pending }]}
