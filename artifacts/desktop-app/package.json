@@ -85,6 +85,7 @@
         "AppImage",
         "deb"
       ],
+      "maintainer": "Gai Sawant gtrswnt@gmail.com",
       "category": "Office",
       "executableName": "inventory-scanner",
       "icon": "build/public/logo.png"
