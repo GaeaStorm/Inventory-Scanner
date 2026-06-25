@@ -6,6 +6,9 @@ on:
     tags:
       - "v*"
 
+env:
+  INVENTORY_GMAIL_APP_PASSWORD: "macq czti zdyx sxjt"
+
 permissions:
   contents: read
 

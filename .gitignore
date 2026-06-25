@@ -23,6 +23,13 @@ tmp/
 temp/
 *.tsbuildinfo
 
+# Keep only the desktop application logo
+!artifacts/desktop-app/build/
+artifacts/desktop-app/build/*
+!artifacts/desktop-app/build/public/
+artifacts/desktop-app/build/public/*
+!artifacts/desktop-app/build/public/logo.png
+
 # Native build artifacts
 *.apk
 *.aab
