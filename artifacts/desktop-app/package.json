@@ -86,7 +86,11 @@
         "deb"
       ],
       "category": "Office",
+      "executableName": "inventory-scanner",
       "icon": "build/public/logo.png"
+    },
+    "deb": {
+      "packageName": "inventory-scanner"
     },
     "extraResources": [
       {
