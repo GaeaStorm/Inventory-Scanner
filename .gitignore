@@ -117,7 +117,7 @@ lerna-debug.log*
 # Local editor and AI-tool state
 .cursor/
 .agents/
-.codex-work/
+.codex-work/*
 .codex-ui-preview.html
 .claude/
 

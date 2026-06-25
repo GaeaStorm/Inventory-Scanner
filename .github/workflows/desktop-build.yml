@@ -7,7 +7,7 @@ on:
       - "v*"
 
 env:
-  INVENTORY_GMAIL_APP_PASSWORD: "macq czti zdyx sxjt"
+  INVENTORY_GMAIL_APP_PASSWORD: ${{ secrets.INVENTORY_GMAIL_APP_PASSWORD }}
 
 permissions:
   contents: read
