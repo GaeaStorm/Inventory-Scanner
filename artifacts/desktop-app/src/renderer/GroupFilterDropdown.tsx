@@ -64,6 +64,26 @@ export function groupFilterValueFromNode(path: string[], node?: GroupTreeNode): 
   return { path, groupDepth: node?.groupDepth ?? path.length };
 }
 
+export interface FieldDefinitionLike {
+  key: string;
+  label: string;
+  /** The Stock Group this field belongs to, or "" for the global/Primary scope that applies to every item. */
+  groupName: string;
+  position: number;
+}
+
+/**
+ * An item's effective specification fields are cumulative down its Stock
+ * Group ancestry: the global ("") scope first, then each ancestor group's
+ * own fields in path order, then the item's direct group's own fields.
+ * Mirrors stores/database.ts's effectiveFieldDefinitions.
+ */
+export function effectiveFieldDefinitions<T extends FieldDefinitionLike>(all: T[], groupPath: string[]): T[] {
+  const scopes = ["", ...groupPath].map((scope) => scope.toLocaleLowerCase());
+  return scopes.flatMap((scope) =>
+    all.filter((field) => field.groupName.toLocaleLowerCase() === scope).sort((left, right) => left.position - right.position));
+}
+
 /**
  * Field-aware version of groupPathMatches: a filter path may drill past real
  * groups into specification-field values and finally the item's own display
@@ -73,17 +93,18 @@ export function groupFilterValueFromNode(path: string[], node?: GroupTreeNode): 
 export function itemMatchesFilter(
   filter: GroupFilterValue,
   item: { groupPath: string[]; fieldValues: Record<string, string>; displayName: string },
-  fieldDefinitions: Array<{ key: string }>,
+  fieldDefinitions: FieldDefinitionLike[],
 ): boolean {
   const { path, groupDepth } = filter;
   if (path.length === 0) return true;
   if (!groupPathMatches(path.slice(0, Math.min(groupDepth, path.length)), item.groupPath)) return false;
   if (path.length <= groupDepth) return true;
   if (item.groupPath.length !== groupDepth) return false;
+  const itemFields = effectiveFieldDefinitions(fieldDefinitions, item.groupPath);
   for (let index = groupDepth; index < path.length; index += 1) {
     const fieldIndex = index - groupDepth;
-    const expected = fieldIndex < fieldDefinitions.length
-      ? (item.fieldValues[fieldDefinitions[fieldIndex].key]?.trim() || "X")
+    const expected = fieldIndex < itemFields.length
+      ? (item.fieldValues[itemFields[fieldIndex].key]?.trim() || "X")
       : item.displayName;
     if (path[index].toLocaleLowerCase() !== expected.toLocaleLowerCase()) return false;
   }
@@ -101,7 +122,7 @@ export function itemMatchesFilter(
 export function appendFieldLeaves(
   tree: GroupTreeNode[],
   items: Array<{ groupPath: string[]; fieldValues: Record<string, string>; displayName: string; itemGuid: string }>,
-  fieldDefinitions: Array<{ key: string; label: string }>,
+  fieldDefinitions: FieldDefinitionLike[],
 ): GroupTreeNode[] {
   if (items.length === 0) return tree;
   const findOrCreate = (
@@ -136,7 +157,7 @@ export function appendFieldLeaves(
     let siblings = groupNode.children;
     let prefix = [...item.groupPath];
     const groupDepth = item.groupPath.length;
-    for (const field of fieldDefinitions) {
+    for (const field of effectiveFieldDefinitions(fieldDefinitions, item.groupPath)) {
       const value = item.fieldValues[field.key]?.trim() || "X";
       prefix = [...prefix, value];
       siblings = findOrCreate(siblings, value, prefix, "field", groupDepth).children;
@@ -154,8 +175,12 @@ interface Props {
   allLabel?: string;
 }
 
+const MENU_WIDTH = 240;
+const MENU_MAX_HEIGHT = 320;
+
 export default function GroupFilterDropdown({ ariaLabel, tree, value, onChange, allLabel = "All groups" }: Props) {
   const [open, setOpen] = useState(false);
+  const [menuPosition, setMenuPosition] = useState<{ top: number; left: number } | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -183,21 +208,44 @@ export default function GroupFilterDropdown({ ariaLabel, tree, value, onChange, 
     setOpen(false);
   }
 
+  function toggleOpen() {
+    if (open) {
+      setOpen(false);
+      return;
+    }
+    // Portaled to document.body and positioned from the trigger's own
+    // viewport rect (not a CSS-relative offset), so the menu can never be
+    // clipped by an ancestor card's overflow or run off the screen edge.
+    const rect = containerRef.current?.getBoundingClientRect();
+    if (rect) {
+      const fitsRight = rect.left + MENU_WIDTH <= window.innerWidth;
+      setMenuPosition({
+        top: Math.min(rect.bottom + 4, window.innerHeight - MENU_MAX_HEIGHT),
+        left: fitsRight ? rect.left : Math.max(0, rect.right - MENU_WIDTH),
+      });
+    }
+    setOpen(true);
+  }
+
   return (
     <div className="group-filter-dropdown" ref={containerRef}>
-      <button type="button" className="group-filter-dropdown__trigger" aria-label={ariaLabel} aria-haspopup="true" aria-expanded={open} onClick={() => setOpen((current) => !current)}>
+      <button type="button" className="group-filter-dropdown__trigger" aria-label={ariaLabel} aria-haspopup="true" aria-expanded={open} onClick={toggleOpen}>
         <span>{value.length === 0 ? allLabel : value[value.length - 1]}</span>
         <b className="group-filter-dropdown__caret">▾</b>
       </button>
-      {open && (
-        <div className="group-filter-dropdown__menu">
+      {open && menuPosition && createPortal(
+        <div
+          className="group-filter-dropdown__menu group-filter-dropdown__portal"
+          style={{ position: "fixed", top: menuPosition.top, left: menuPosition.left, width: MENU_WIDTH }}
+        >
           <button type="button" className={`group-filter-dropdown__item ${value.length === 0 ? "group-filter-dropdown__item--selected" : ""}`} onClick={() => choose([])}>
             {allLabel}
           </button>
           {tree.map((node) => (
             <GroupFilterMenuItem key={node.path.join(" ")} node={node} selected={value} onChoose={choose} />
           ))}
-        </div>
+        </div>,
+        document.body,
       )}
     </div>
   );

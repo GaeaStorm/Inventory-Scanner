@@ -617,9 +617,13 @@ function registerIpcHandlers(): void {
     if (!storesService) throw new Error("The Local Stores Database is unavailable.");
     return storesService.deleteItemFieldDefinition(String(fieldId ?? ""), requireActor(token, "CATALOG_MANAGE"));
   });
-  ipcMain.handle("stores:reorder-item-field-definitions", (_event, token: unknown, orderedIds: unknown) => {
+  ipcMain.handle("stores:reorder-item-field-definitions", (_event, token: unknown, orderedIds: unknown, groupName: unknown) => {
     if (!storesService) throw new Error("The Local Stores Database is unavailable.");
-    return storesService.reorderItemFieldDefinitions(Array.isArray(orderedIds) ? orderedIds.map(String) : [], requireActor(token, "CATALOG_MANAGE"));
+    return storesService.reorderItemFieldDefinitions(
+      Array.isArray(orderedIds) ? orderedIds.map(String) : [],
+      String(groupName ?? ""),
+      requireActor(token, "CATALOG_MANAGE"),
+    );
   });
   ipcMain.handle("stores:create-catalog-group", (_event, token: unknown, input: unknown) => {
     if (!storesService) throw new Error("The Local Stores Database is unavailable.");

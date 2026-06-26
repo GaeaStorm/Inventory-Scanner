@@ -1,6 +1,6 @@
 import { useMemo, useState } from "react";
 
-import GroupFilterDropdown, { appendFieldLeaves, buildGroupTree, type GroupTreeNode } from "./GroupFilterDropdown";
+import GroupFilterDropdown, { appendFieldLeaves, buildGroupTree, effectiveFieldDefinitions, type GroupTreeNode } from "./GroupFilterDropdown";
 import InfoTip from "./InfoTip";
 import type { CatalogRole, StoresState } from "./types";
 
@@ -41,19 +41,38 @@ export default function CatalogStatusPanel(props: {
   const [designationNode, setDesignationNode] = useState<GroupTreeNode | null>(null);
   const [designationRole, setDesignationRole] = useState<CatalogRole>("NEITHER");
   const [savingDesignation, setSavingDesignation] = useState(false);
+  const [fieldsGroupPath, setFieldsGroupPath] = useState<string[]>([]);
 
   const fieldDefinitions = props.stores.itemFieldDefinitions;
+  const itemParentPath = props.stores.catalogGroups.find((entry) => entry.name === masterParent)?.path ?? [];
+  const itemFields = masterKind === "ITEM" ? effectiveFieldDefinitions(fieldDefinitions, itemParentPath) : [];
   const missingRequiredField = masterKind === "ITEM"
-    && fieldDefinitions.find((field) => field.required && !itemFieldValues[field.key]?.trim());
+    && itemFields.find((field) => field.required && !itemFieldValues[field.key]?.trim());
   const generatedNamePreview = masterKind === "ITEM" && masterName.trim()
-    ? (fieldDefinitions.length === 0
+    ? (itemFields.length === 0
       ? masterName.trim()
       : [
           masterParent || "…",
-          ...fieldDefinitions.map((field) => normalizeFieldValueForName(itemFieldValues[field.key] ?? "") || "X"),
+          ...itemFields.map((field) => normalizeFieldValueForName(itemFieldValues[field.key] ?? "") || "X"),
           masterName.trim(),
         ].join("_"))
     : "";
+
+  const fieldsGroupName = fieldsGroupPath[fieldsGroupPath.length - 1] ?? "";
+  const fieldsGroupTree = useMemo(
+    () => buildGroupTree(props.stores.catalogGroups.map((entry) => entry.path)),
+    [props.stores.catalogGroups],
+  );
+  const fieldsGroupOwnFields = useMemo(
+    () => fieldDefinitions
+      .filter((field) => field.groupName.toLocaleLowerCase() === fieldsGroupName.toLocaleLowerCase())
+      .sort((left, right) => left.position - right.position),
+    [fieldDefinitions, fieldsGroupName],
+  );
+  const inheritedFields = useMemo(
+    () => effectiveFieldDefinitions(fieldDefinitions, fieldsGroupPath.slice(0, -1)),
+    [fieldDefinitions, fieldsGroupPath],
+  );
 
   const selected = props.stores.stockItems.find((item) => item.tallyGuid === itemGuid) ?? null;
   const editableItems = useMemo(
@@ -122,7 +141,7 @@ export default function CatalogStatusPanel(props: {
     setSavingField(true);
     props.onError("");
     try {
-      props.onChanged(await window.desktop.stores.saveItemFieldDefinition({ label, required: newFieldRequired }));
+      props.onChanged(await window.desktop.stores.saveItemFieldDefinition({ groupName: fieldsGroupName, label, required: newFieldRequired }));
       props.onNotice(`Specification field "${label}" added.`);
       setNewFieldLabel("");
       setNewFieldRequired(false);
@@ -141,13 +160,13 @@ export default function CatalogStatusPanel(props: {
   }
 
   async function moveItemField(fieldId: string, direction: -1 | 1): Promise<void> {
-    const ids = fieldDefinitions.map((field) => field.id);
+    const ids = fieldsGroupOwnFields.map((field) => field.id);
     const index = ids.indexOf(fieldId);
     const swapWith = index + direction;
     if (swapWith < 0 || swapWith >= ids.length) return;
     [ids[index], ids[swapWith]] = [ids[swapWith], ids[index]];
     await run(
-      () => window.desktop.stores.reorderItemFieldDefinitions(ids),
+      () => window.desktop.stores.reorderItemFieldDefinitions(ids, fieldsGroupName),
       "Specification field order updated.",
     );
   }
@@ -273,7 +292,30 @@ export default function CatalogStatusPanel(props: {
               ariaLabel={masterKind === "ITEM" ? "Stock Group" : "Parent"}
               tree={parentTree}
               value={parentPath}
-              onChange={(path) => setMasterParent(path[path.length - 1] ?? "")}
+              onChange={(path, node) => {
+                if (masterKind !== "ITEM" || !node || node.kind === undefined) {
+                  setMasterParent(path[path.length - 1] ?? "");
+                  return;
+                }
+                // Drilling past the real Stock Group into field-value levels (or
+                // all the way to an existing item) pre-fills the new item's
+                // Specification fields up to however far the user navigated,
+                // instead of leaving them all blank for retyping.
+                const groupDepth = node.groupDepth ?? path.length;
+                setMasterParent(path[groupDepth - 1] ?? "");
+                const fieldPath = node.kind === "item" ? path.slice(groupDepth, -1) : path.slice(groupDepth);
+                const fieldsForGroup = effectiveFieldDefinitions(fieldDefinitions, path.slice(0, groupDepth));
+                setItemFieldValues(
+                  Object.fromEntries(fieldsForGroup.map((field, index) => {
+                    const value = fieldPath[index];
+                    // appendFieldLeaves renders a blank optional field's value as the
+                    // literal placeholder "X" so duplicate-named nodes still nest
+                    // correctly in the tree - that placeholder means "blank", not a
+                    // real value to copy into the new item.
+                    return [field.key, value === undefined || value === "X" ? "" : value];
+                  })),
+                );
+              }}
               allLabel={masterKind === "ITEM" ? "Choose group…" : "Primary (top level)"}
             />
           </div>
@@ -289,8 +331,8 @@ export default function CatalogStatusPanel(props: {
           </div>}
           {/* <button className="button" type="button" disabled={busy || !masterName.trim() || (masterKind === "ITEM" && !masterParent) || Boolean(missingRequiredField)} onClick={() => void addMaster()}>Add</button> */}
         </div>
-        {masterKind === "ITEM" && fieldDefinitions.length > 0 && <div className="catalog-edit-row catalog-edit-row--fields">
-          {fieldDefinitions.map((field) => <label key={field.id}>
+        {masterKind === "ITEM" && itemFields.length > 0 && <div className="catalog-edit-row catalog-edit-row--fields">
+          {itemFields.map((field) => <label key={field.id}>
             {field.label}{field.required ? " *" : " (optional)"}
             <input
               value={itemFieldValues[field.key] ?? ""}
@@ -307,17 +349,32 @@ export default function CatalogStatusPanel(props: {
         <div className="heading-with-info">
           <h3>Specification fields</h3>
           <InfoTip>
-            These fields are appended in order to every new Stock Item's generated Tally name, so duplicate display names (e.g. many different "Item010"s) still get a unique underlying name. A blank optional field contributes "X".
+            Every Stock Group has its own specification fields. A subgroup's items get its ancestor groups' fields first, then its own, in that order, appended to the generated Tally name — so duplicate display names (e.g. many different "Item010"s) still get a unique underlying name. A blank optional field contributes "X".
           </InfoTip>
         </div>
-        {fieldDefinitions.length > 0 && <div className="table-scroll">
+        <div className="catalog-edit-row">
+          <div className="catalog-edit-field">
+            <span>Stock Group</span>
+            <GroupFilterDropdown
+              ariaLabel="Stock Group for specification fields"
+              tree={fieldsGroupTree}
+              value={fieldsGroupPath}
+              onChange={(path) => setFieldsGroupPath(path)}
+              allLabel="Primary (global)"
+            />
+          </div>
+        </div>
+        {inheritedFields.length > 0 && <p className="table-footnote">
+          Inherited from {fieldsGroupPath.length === 0 ? "—" : "ancestor groups"}: {inheritedFields.map((field) => field.label).join(", ")}
+        </p>}
+        {fieldsGroupOwnFields.length > 0 && <div className="table-scroll">
           <table><thead><tr><th>Field</th><th>Required</th><th /></tr></thead><tbody>
-            {fieldDefinitions.map((field, index) => <tr key={field.id}>
+            {fieldsGroupOwnFields.map((field, index) => <tr key={field.id}>
               <td>{field.label}</td>
               <td>{field.required ? "Required" : "Optional"}</td>
               <td className="table-actions">
                 <button className="button button--ghost button--small" type="button" disabled={busy || index === 0} onClick={() => void moveItemField(field.id, -1)} aria-label={`Move ${field.label} up`}>▲</button>
-                <button className="button button--ghost button--small" type="button" disabled={busy || index === fieldDefinitions.length - 1} onClick={() => void moveItemField(field.id, 1)} aria-label={`Move ${field.label} down`}>▼</button>
+                <button className="button button--ghost button--small" type="button" disabled={busy || index === fieldsGroupOwnFields.length - 1} onClick={() => void moveItemField(field.id, 1)} aria-label={`Move ${field.label} down`}>▼</button>
                 <button className="button button--ghost button--small" type="button" disabled={busy} onClick={() => void deleteItemField(field.id, field.label)}>Delete</button>
               </td>
             </tr>)}
@@ -326,7 +383,7 @@ export default function CatalogStatusPanel(props: {
         <div className="catalog-edit-row">
           <label>New field label<input value={newFieldLabel} onChange={(event) => setNewFieldLabel(event.target.value)} placeholder="e.g. Pin count, Color" /></label>
           <label className="check-row"><input type="checkbox" checked={newFieldRequired} onChange={(event) => setNewFieldRequired(event.target.checked)} />Required</label>
-          <button className="button button--secondary" type="button" disabled={savingField || !newFieldLabel.trim()} onClick={() => void addItemField()}>+ Add field</button>
+          <button className="button button--secondary" type="button" disabled={savingField || !newFieldLabel.trim()} onClick={() => void addItemField()}>+ Add field to {fieldsGroupName || "Primary (global)"}</button>
         </div>
       </section>
 

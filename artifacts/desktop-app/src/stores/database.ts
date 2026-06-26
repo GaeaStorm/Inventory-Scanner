@@ -133,6 +133,18 @@ function normalizeFieldValueForName(value: string): string {
   return value.trim().replace(/\s+/g, "");
 }
 
+/**
+ * An item's effective specification fields are cumulative down its Stock
+ * Group ancestry: the global ("") scope first, then each ancestor group's
+ * own fields in path order, then the item's direct group's own fields -
+ * mirrored in GroupFilterDropdown.tsx for the renderer side of the same tree.
+ */
+function effectiveFieldDefinitions(all: ItemFieldDefinition[], groupPath: string[]): ItemFieldDefinition[] {
+  const scopes = ["", ...groupPath].map((scope) => scope.toLocaleLowerCase());
+  return scopes.flatMap((scope) =>
+    all.filter((field) => field.groupName.toLocaleLowerCase() === scope).sort((left, right) => left.position - right.position));
+}
+
 function integerQuantity(value: unknown, label = "Quantity"): number {
   const quantity = Number(value);
   if (!Number.isInteger(quantity) || quantity <= 0) {
@@ -923,6 +935,47 @@ export class StoresDatabase {
         this.db.exec("PRAGMA foreign_keys = ON");
       }
     }
+
+    if (current < 15) {
+      // Specification fields move from one global list to per-Stock-Group
+      // ownership, with group_name = '' meaning "applies to every item"
+      // (preserving every existing field's current behavior unchanged).
+      // Label uniqueness moves from global to per-group, but field_key stays
+      // globally unique - that key is what an item's cumulative fieldValues
+      // map is keyed by, so two different ancestor groups' fields can never
+      // collide there. tally_item_field_values.field_id references this
+      // table with ON DELETE CASCADE, so the pragma can only be toggled
+      // outside an active transaction, same as schema 14's recreate.
+      this.db.exec("PRAGMA foreign_keys = OFF");
+      try {
+        this.transaction(() => {
+          this.db.exec(`
+            CREATE TABLE tally_item_field_definitions_new (
+              id TEXT PRIMARY KEY,
+              group_name TEXT NOT NULL DEFAULT '' COLLATE NOCASE,
+              field_key TEXT NOT NULL UNIQUE,
+              label TEXT NOT NULL COLLATE NOCASE,
+              required INTEGER NOT NULL DEFAULT 0 CHECK (required IN (0,1)),
+              position INTEGER NOT NULL,
+              created_at TEXT NOT NULL,
+              UNIQUE(group_name, label)
+            ) STRICT;
+
+            INSERT INTO tally_item_field_definitions_new (
+              id, group_name, field_key, label, required, position, created_at
+            )
+            SELECT id, '', field_key, label, required, position, created_at
+            FROM tally_item_field_definitions;
+
+            DROP TABLE tally_item_field_definitions;
+            ALTER TABLE tally_item_field_definitions_new RENAME TO tally_item_field_definitions;
+          `);
+          this.db.prepare("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)").run(15, nowIso());
+        }, "migrating the Local Stores Database to schema 15");
+      } finally {
+        this.db.exec("PRAGMA foreign_keys = ON");
+      }
+    }
   }
 
   /**
@@ -1342,10 +1395,11 @@ export class StoresDatabase {
 
   listItemFieldDefinitions(): ItemFieldDefinition[] {
     return (this.db.prepare(`
-      SELECT id, field_key, label, required, position
-      FROM tally_item_field_definitions ORDER BY position, label
+      SELECT id, group_name, field_key, label, required, position
+      FROM tally_item_field_definitions ORDER BY group_name, position, label
     `).all() as Row[]).map((row) => ({
       id: text(row.id),
+      groupName: text(row.group_name),
       key: text(row.field_key),
       label: text(row.label),
       required: Number(row.required) === 1,
@@ -1354,44 +1408,54 @@ export class StoresDatabase {
   }
 
   saveItemFieldDefinition(input: SaveItemFieldDefinitionInput): ItemFieldDefinition {
+    const groupName = text(input.groupName);
     const label = text(input.label);
     if (!label) throw new Error("Enter a field label.");
     const key = fieldKey(label);
     if (!key) throw new Error("Enter a field label containing letters or numbers.");
     const existing = this.db.prepare(`
-      SELECT 1 FROM tally_item_field_definitions WHERE field_key = ? OR label = ? COLLATE NOCASE
-    `).get(key, label);
-    if (existing) throw new Error("A specification field with this label already exists.");
+      SELECT 1 FROM tally_item_field_definitions
+      WHERE field_key = ? OR (group_name = ? COLLATE NOCASE AND label = ? COLLATE NOCASE)
+    `).get(key, groupName, label);
+    if (existing) throw new Error("A specification field with this label already exists on this group.");
     const id = randomUUID();
     const position = Number((this.db.prepare(`
-      SELECT COALESCE(MAX(position), 0) + 1 AS position FROM tally_item_field_definitions
-    `).get() as Row).position);
+      SELECT COALESCE(MAX(position), 0) + 1 AS position FROM tally_item_field_definitions WHERE group_name = ? COLLATE NOCASE
+    `).get(groupName) as Row).position);
     this.db.prepare(`
-      INSERT INTO tally_item_field_definitions(id, field_key, label, required, position, created_at)
-      VALUES (?, ?, ?, ?, ?, ?)
-    `).run(id, key, label, input.required ? 1 : 0, position, nowIso());
+      INSERT INTO tally_item_field_definitions(id, group_name, field_key, label, required, position, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run(id, groupName, key, label, input.required ? 1 : 0, position, nowIso());
     return this.listItemFieldDefinitions().find((field) => field.id === id)!;
   }
 
   deleteItemFieldDefinition(fieldIdValue: string): void {
     const fieldId = text(fieldIdValue);
-    const field = this.db.prepare("SELECT id FROM tally_item_field_definitions WHERE id = ?").get(fieldId);
+    const field = this.db.prepare("SELECT id, group_name FROM tally_item_field_definitions WHERE id = ?").get(fieldId) as Row | undefined;
     if (!field) throw new Error("Specification field not found.");
+    const groupName = text(field.group_name);
     this.transaction(() => {
       this.db.prepare("DELETE FROM tally_item_field_definitions WHERE id = ?").run(fieldId);
       this.db.prepare(`
         UPDATE tally_item_field_definitions
         SET position = (
           SELECT COUNT(*) FROM tally_item_field_definitions earlier
-          WHERE earlier.position <= tally_item_field_definitions.position
+          WHERE earlier.group_name = tally_item_field_definitions.group_name
+            AND earlier.position <= tally_item_field_definitions.position
         )
-      `).run();
+        WHERE group_name = ? COLLATE NOCASE
+      `).run(groupName);
     }, "deleting an item specification field");
   }
 
-  /** Rewrites position 1..N to match the given id order. Ids not in the current definition set are ignored. */
-  reorderItemFieldDefinitions(orderedIds: string[]): ItemFieldDefinition[] {
-    const known = new Set(this.listItemFieldDefinitions().map((field) => field.id));
+  /** Rewrites position 1..N to match the given id order, scoped to one group. Ids outside that group or not in the current definition set are ignored. */
+  reorderItemFieldDefinitions(orderedIds: string[], groupNameValue: string): ItemFieldDefinition[] {
+    const groupName = text(groupNameValue);
+    const known = new Set(
+      this.listItemFieldDefinitions()
+        .filter((field) => field.groupName.toLocaleLowerCase() === groupName.toLocaleLowerCase())
+        .map((field) => field.id),
+    );
     const ids = orderedIds.map(text).filter((id) => known.has(id));
     this.transaction(() => {
       const update = this.db.prepare("UPDATE tally_item_field_definitions SET position = ? WHERE id = ?");
@@ -1406,7 +1470,7 @@ export class StoresDatabase {
     const parentName = text(input.parentName) || "Local Components";
     const categoryName = text(input.categoryName);
     const baseUnits = text(input.baseUnits) || "Nos";
-    const fieldDefinitions = this.listItemFieldDefinitions();
+    const fieldDefinitions = effectiveFieldDefinitions(this.listItemFieldDefinitions(), this.resolveGroupPath(parentName));
     return this.transaction(() => {
       const parent = this.db.prepare(`
         SELECT name FROM tally_stock_groups WHERE name = ? COLLATE NOCASE AND active = 1
@@ -3247,7 +3311,12 @@ export class StoresDatabase {
         type: split.path.length <= 1 ? "PRIMARY" as const : "SECONDARY" as const,
         level: Math.max(1, split.path.length),
         path: split.path,
-        source: groupParents.get(name.toLocaleLowerCase())?.source ?? "TALLY",
+        // A group known only because some item's parent_name references it,
+        // with no actual tally_stock_groups row, has no confirmed Tally
+        // master at all - treat it like LOCAL so the catalog exporter emits
+        // a STOCKGROUP master for it too, instead of silently assuming it
+        // already exists.
+        source: groupParents.get(name.toLocaleLowerCase())?.source ?? "LOCAL",
         catalogRole: ownRole,
         effectiveCatalogRole: effectiveRole,
         ignored: effectiveRole === "IGNORED",

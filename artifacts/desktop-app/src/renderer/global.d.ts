@@ -109,9 +109,9 @@ declare global {
         getState: () => Promise<StoresState>;
         createLocalStockItem: (input: CreateLocalStockItemInput) => Promise<StoresState>;
         deleteLocalStockItem: (tallyItemGuid: string) => Promise<StoresState>;
-        saveItemFieldDefinition: (input: { label: string; required: boolean }) => Promise<StoresState>;
+        saveItemFieldDefinition: (input: { groupName?: string; label: string; required: boolean }) => Promise<StoresState>;
         deleteItemFieldDefinition: (fieldId: string) => Promise<StoresState>;
-        reorderItemFieldDefinitions: (orderedIds: string[]) => Promise<StoresState>;
+        reorderItemFieldDefinitions: (orderedIds: string[], groupName: string) => Promise<StoresState>;
         createCatalogGroup: (input: CreateCatalogGroupInput) => Promise<StoresState>;
         deleteCatalogGroup: (name: string) => Promise<StoresState>;
         createStockCategory: (input: CreateStockCategoryInput) => Promise<StoresState>;

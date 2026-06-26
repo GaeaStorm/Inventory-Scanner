@@ -121,8 +121,8 @@ function buildMasterXml(
         </TALLYMESSAGE>`).join("");
   const createMessages = localItems.map((item) => `
         <TALLYMESSAGE xmlns:UDF="TallyUDF">
-          <STOCKITEM NAME="${xml(item.name)}" ACTION="Create">
-            <NAME>${xml(item.name)}</NAME>
+          <STOCKITEM NAME="${xml(item.tallyName)}" ACTION="Create">
+            <NAME>${xml(item.tallyName)}</NAME>
             <PARENT>${xml(item.parentName)}</PARENT>
             ${item.categoryName ? `<CATEGORY>${xml(item.categoryName)}</CATEGORY>` : ""}
             <BASEUNITS>${xml(item.baseUnits || "Nos")}</BASEUNITS>

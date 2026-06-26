@@ -125,9 +125,9 @@ export class StoresService {
     return this.getState();
   }
 
-  reorderItemFieldDefinitions(orderedIds: string[], actor: ActorContext) {
+  reorderItemFieldDefinitions(orderedIds: string[], groupName: string, actor: ActorContext) {
     this.authorize(actor, "CATALOG_MANAGE");
-    this.database.reorderItemFieldDefinitions(orderedIds);
+    this.database.reorderItemFieldDefinitions(orderedIds, groupName);
     return this.getState();
   }
 

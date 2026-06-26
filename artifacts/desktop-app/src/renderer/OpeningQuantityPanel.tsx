@@ -1,5 +1,12 @@
 import { useMemo, useState } from "react";
 
+import GroupFilterDropdown, {
+  appendFieldLeaves,
+  buildGroupTree,
+  groupFilterValueFromNode,
+  itemMatchesFilter,
+  type GroupFilterValue,
+} from "./GroupFilterDropdown";
 import InfoTip from "./InfoTip";
 import { operationalStockItems } from "./stock-item-visibility";
 import type { StoresState } from "./types";
@@ -23,10 +30,28 @@ export default function OpeningQuantityPanel(props: {
   const [reason, setReason] = useState("");
   const [adjustedBy, setAdjustedBy] = useState("");
   const [busy, setBusy] = useState(false);
+  const [search, setSearch] = useState("");
+  const [groupFilter, setGroupFilter] = useState<GroupFilterValue>({ path: [], groupDepth: 0 });
   const selectableItems = useMemo(
     () => operationalStockItems(props.stores.stockItems),
     [props.stores.stockItems],
   );
+  const groupTree = useMemo(() => appendFieldLeaves(
+    buildGroupTree(selectableItems.map((item) => item.groupPath).filter((path) => path.length > 0)),
+    selectableItems.map((item) => ({ groupPath: item.groupPath, fieldValues: item.fieldValues, displayName: item.name, itemGuid: item.tallyGuid })),
+    props.stores.itemFieldDefinitions,
+  ), [selectableItems, props.stores.itemFieldDefinitions]);
+  const filteredItems = useMemo(() => {
+    const query = search.trim().toLocaleLowerCase();
+    return selectableItems.filter((item) => {
+      if (groupFilter.path.length > 0 && !itemMatchesFilter(
+        groupFilter,
+        { groupPath: item.groupPath, fieldValues: item.fieldValues, displayName: item.name },
+        props.stores.itemFieldDefinitions,
+      )) return false;
+      return !query || [item.name, ...item.groupPath, item.tallyGuid].some((value) => value.toLocaleLowerCase().includes(query));
+    });
+  }, [selectableItems, search, groupFilter, props.stores.itemFieldDefinitions]);
 
   async function save(): Promise<void> {
     if (!selected) return;
@@ -72,6 +97,19 @@ export default function OpeningQuantityPanel(props: {
       </div>
       <div className="opening-form-grid">
         <label>
+          Stock Group
+          <GroupFilterDropdown
+            ariaLabel="Filter by Stock Group"
+            tree={groupTree}
+            value={groupFilter.path}
+            onChange={(path, node) => setGroupFilter(groupFilterValueFromNode(path, node))}
+          />
+        </label>
+        <label>
+          Search
+          <input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Item name, group, or GUID" />
+        </label>
+        <label>
           Stock Item
           <select
             value={itemGuid}
@@ -83,7 +121,7 @@ export default function OpeningQuantityPanel(props: {
             }}
           >
             <option value="">Select Stock Item…</option>
-            {selectableItems.map((item) => (
+            {filteredItems.map((item) => (
               <option key={item.tallyGuid} value={item.tallyGuid}>
                 {item.qualifiedName} · local {item.localAvailableQuantity} · Tally {item.tallyClosingQuantity}
               </option>

@@ -38,7 +38,9 @@ export function createStoresRouter(service: StoresService, operations: Operation
   });
   router.post("/catalog/item-fields/reorder", (request, response) => {
     response.json(service.reorderItemFieldDefinitions(
-      Array.isArray(request.body?.orderedIds) ? request.body.orderedIds : [], actor(request, "CATALOG_MANAGE"),
+      Array.isArray(request.body?.orderedIds) ? request.body.orderedIds : [],
+      String(request.body?.groupName ?? ""),
+      actor(request, "CATALOG_MANAGE"),
     ));
   });
   router.post("/catalog/groups", (request, response) => {

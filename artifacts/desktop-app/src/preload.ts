@@ -161,7 +161,7 @@ async function remoteChannelRequest(channel: string, first: unknown, second: unk
     case "stores:delete-local-stock-item": return remoteRequest(`/api/stores/catalog/local-items/${encodeURIComponent(String(first))}`, { method: "DELETE" });
     case "stores:save-item-field-definition": return remoteRequest("/api/stores/catalog/item-fields", jsonBody(first));
     case "stores:delete-item-field-definition": return remoteRequest(`/api/stores/catalog/item-fields/${encodeURIComponent(String(first))}`, { method: "DELETE" });
-    case "stores:reorder-item-field-definitions": return remoteRequest("/api/stores/catalog/item-fields/reorder", jsonBody({ orderedIds: first }));
+    case "stores:reorder-item-field-definitions": return remoteRequest("/api/stores/catalog/item-fields/reorder", jsonBody({ orderedIds: first, groupName: second }));
     case "stores:create-catalog-group": return remoteRequest("/api/stores/catalog/groups", jsonBody(first));
     case "stores:delete-catalog-group": return remoteRequest(`/api/stores/catalog/groups/${encodeURIComponent(String(first))}`, { method: "DELETE" });
     case "stores:create-stock-category": return remoteRequest("/api/stores/catalog/categories", jsonBody(first));
@@ -423,9 +423,9 @@ contextBridge.exposeInMainWorld("desktop", {
     getState: () => authenticatedSession("stores:get-state"),
     createLocalStockItem: (input: unknown) => authenticatedSession("stores:create-local-stock-item", input),
     deleteLocalStockItem: (tallyItemGuid: string) => authenticatedSession("stores:delete-local-stock-item", tallyItemGuid),
-    saveItemFieldDefinition: (input: { label: string; required: boolean }) => authenticatedSession("stores:save-item-field-definition", input),
+    saveItemFieldDefinition: (input: { groupName?: string; label: string; required: boolean }) => authenticatedSession("stores:save-item-field-definition", input),
     deleteItemFieldDefinition: (fieldId: string) => authenticatedSession("stores:delete-item-field-definition", fieldId),
-    reorderItemFieldDefinitions: (orderedIds: string[]) => authenticatedSession("stores:reorder-item-field-definitions", orderedIds),
+    reorderItemFieldDefinitions: (orderedIds: string[], groupName: string) => authenticatedSession("stores:reorder-item-field-definitions", orderedIds, groupName),
     createCatalogGroup: (input: unknown) => authenticatedSession("stores:create-catalog-group", input),
     deleteCatalogGroup: (name: string) => authenticatedSession("stores:delete-catalog-group", name),
     createStockCategory: (input: unknown) => authenticatedSession("stores:create-stock-category", input),

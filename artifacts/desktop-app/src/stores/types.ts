@@ -65,6 +65,8 @@ export interface StoresStockItem {
 /** An admin-defined specification field (e.g. "Pin count", "Color") appended in order to the generated Tally name for new local items. */
 export interface ItemFieldDefinition {
   id: string;
+  /** The Stock Group this field belongs to, or "" for the global/Primary scope that applies to every item. */
+  groupName: string;
   key: string;
   label: string;
   required: boolean;
@@ -72,6 +74,7 @@ export interface ItemFieldDefinition {
 }
 
 export interface SaveItemFieldDefinitionInput {
+  groupName?: string;
   label: string;
   required: boolean;
 }
