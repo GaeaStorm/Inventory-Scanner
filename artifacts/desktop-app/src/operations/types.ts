@@ -152,6 +152,7 @@ export interface LoginInput {
   username: string;
   credential: string;
   deviceLabel?: string;
+  deviceFingerprint?: string;
 }
 
 export interface RequestCredentialRecoveryInput {

@@ -83,6 +83,22 @@ export default function App() {
   const [notice, setNotice] = useState("");
   const [error, setError] = useState("");
   const [requiredEmail, setRequiredEmail] = useState("");
+  const [syncStatus, setSyncStatus] = useState<{ online: boolean; queuedCount: number; reviewable: Array<{ operationId: string; type: string; status: string; createdAt: string }> } | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    const poll = () => {
+      window.desktop.sync.status().then((status) => {
+        if (!cancelled) setSyncStatus(status);
+      }).catch(() => undefined);
+    };
+    poll();
+    const timer = setInterval(poll, 15_000);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, []);
 
   const refresh = useCallback(async () => {
     setNotice("");
@@ -289,6 +305,19 @@ export default function App() {
       </nav>
 
       <main className="content">
+        {syncStatus && !syncStatus.online && (
+          <div className="alert alert--offline">
+            <strong>Production is unreachable.</strong> Material In/Out, returns, counts, and condition/fault entries are
+            being recorded offline and will sync automatically once Production is back.
+            {syncStatus.queuedCount > 0 && <> {syncStatus.queuedCount} queued.</>}
+          </div>
+        )}
+        {syncStatus && syncStatus.reviewable.length > 0 && (
+          <div className="alert alert--error">
+            <strong>{syncStatus.reviewable.length} offline {syncStatus.reviewable.length === 1 ? "entry" : "entries"} need review.</strong>{" "}
+            Production rejected or flagged a conflict on these when they replayed. Check Operations for details.
+          </div>
+        )}
         {error && <div className="alert alert--error">{error}</div>}
         {notice && <div className="alert alert--success">{notice}</div>}
         {stores?.dataMode === "demo" && (

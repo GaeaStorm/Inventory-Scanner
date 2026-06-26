@@ -284,6 +284,12 @@ button {
   color: #22734e;
 }
 
+.alert--offline {
+  border-color: #c8d4f3;
+  background: #eef1ff;
+  color: #2c3a8f;
+}
+
 .summary-strip {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));

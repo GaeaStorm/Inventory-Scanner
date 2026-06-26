@@ -5,6 +5,39 @@ let remoteServerUrl = "";
 let localComputerName = "";
 let deploymentLoaded = false;
 
+const OFFLINE_READ_DOMAINS: Record<string, "stores" | "planning" | "operations"> = {
+  "stores:get-state": "stores",
+  "planning:get-state": "planning",
+  "operations:get-state": "operations",
+};
+
+// The mutation channels offline LAN clients may queue while Production is
+// unreachable. Limited to Material In/Out, returns, counts, and
+// condition/fault observations per the offline-continuity design; everything
+// else stays "Production required" while offline.
+const OFFLINE_QUEUE_TYPES: Record<string, string> = {
+  "stores:bulk-vendor-receipt": "MATERIAL_IN",
+  "operations:issue-production-material": "MATERIAL_OUT",
+  "operations:production-return": "PRODUCTION_RETURN",
+  "operations:supplier-return": "SUPPLIER_RETURN",
+  "operations:initiate-customer-return": "INITIATE_CUSTOMER_RETURN",
+  "operations:receive-customer-return": "RECEIVE_CUSTOMER_RETURN",
+  "operations:record-count": "RECORD_COUNT",
+  "operations:transition-condition": "CONDITION_TRANSITION",
+  "operations:create-fault": "CREATE_FAULT",
+  "operations:resolve-fault": "RESOLVE_FAULT",
+};
+
+function isNetworkFailure(error: unknown): boolean {
+  // fetch() rejects with TypeError ("Failed to fetch" / "fetch failed") when
+  // the connection itself fails, and DOMException("AbortError") on our
+  // timeouts. A response that Production actually answered (even with a 4xx
+  // /5xx) reaches `!response.ok` instead and throws a plain Error there - that
+  // is Production *rejecting* the request, not Production being unreachable,
+  // so it must not fall back to the offline cache/queue.
+  return error instanceof TypeError || (error instanceof Error && error.name === "AbortError");
+}
+
 async function getDeploymentState() {
   const state = await ipcRenderer.invoke("deployment:get-state") as {
     role: "UNCONFIGURED" | "PRODUCTION_SERVER" | "LAN_CLIENT";
@@ -66,10 +99,61 @@ async function remoteRequestText(path: string): Promise<string> {
   return body;
 }
 
+async function offlineFallback(channel: string, payload: unknown): Promise<unknown> {
+  const cacheDomain = OFFLINE_READ_DOMAINS[channel];
+  if (cacheDomain) {
+    const cached = await ipcRenderer.invoke("sync:read-cache", cacheDomain) as { state: unknown; cachedAt: string } | null;
+    if (!cached) throw new Error("Production is unreachable and no cached data is available yet on this computer.");
+    return cached.state;
+  }
+  const queueType = OFFLINE_QUEUE_TYPES[channel];
+  if (queueType) {
+    const actorUserId = sessionToken;
+    const enqueued = await ipcRenderer.invoke("sync:enqueue", {
+      type: queueType,
+      endpoint: channelEndpoint(channel, payload),
+      payload,
+      actorUserId,
+    }) as { queued: boolean; operationId: string; result?: unknown };
+    if (!enqueued.queued) return enqueued.result;
+    return { offlineQueued: true, operationId: enqueued.operationId };
+  }
+  throw new Error("Production is unreachable. This action requires the Production server.");
+}
+
 async function remoteChannel(channel: string, args: unknown[]) {
   const [first, second] = args;
+  try {
+    return await remoteChannelRequest(channel, first, second, args);
+  } catch (error) {
+    if (!isNetworkFailure(error)) throw error;
+    return offlineFallback(channel, first);
+  }
+}
+
+function channelEndpoint(channel: string, _payload: unknown): string {
   switch (channel) {
-    case "stores:get-state": return remoteRequest("/api/stores/state");
+    case "stores:bulk-vendor-receipt": return "/api/stores/vendor-receipts/bulk";
+    case "operations:issue-production-material": return "/api/operations/production/issue";
+    case "operations:production-return": return "/api/operations/returns/production";
+    case "operations:supplier-return": return "/api/operations/returns/supplier";
+    case "operations:initiate-customer-return": return "/api/operations/returns/customer/initiate";
+    case "operations:receive-customer-return": return "/api/operations/returns/customer/receive";
+    case "operations:record-count": return "/api/operations/counts/entries";
+    case "operations:transition-condition": return "/api/operations/conditions/transition";
+    case "operations:create-fault": return "/api/operations/faults";
+    case "operations:resolve-fault": return "/api/operations/faults/resolve";
+    default: throw new Error(`No queueable endpoint mapping for ${channel}.`);
+  }
+}
+
+async function remoteChannelRequest(channel: string, first: unknown, second: unknown, args: unknown[]) {
+  switch (channel) {
+    case "stores:get-state": {
+      const state = await remoteRequest("/api/stores/state");
+      void ipcRenderer.invoke("sync:write-cache", "stores", state);
+      return state;
+    }
     case "scanners:create-pairing": return remoteRequest("/api/scanners/pairing", jsonBody({ label: first }));
     case "scanners:list": return remoteRequest("/api/scanners");
     case "scanners:revoke": return remoteRequest(`/api/scanners/${encodeURIComponent(String(first))}`, { method: "DELETE" });
@@ -102,7 +186,11 @@ async function remoteChannel(channel: string, args: unknown[]) {
     case "stores:choose-folder":
     case "stores:download-generated-file":
       throw new Error("This file operation must be performed on the Production server computer.");
-    case "planning:get-state": return remoteRequest("/api/planning/state");
+    case "planning:get-state": {
+      const state = await remoteRequest("/api/planning/state");
+      void ipcRenderer.invoke("sync:write-cache", "planning", state);
+      return state;
+    }
     case "planning:save-restock-policy": return remoteRequest("/api/planning/restock-policies", jsonBody(first));
     case "planning:recommendation-decision": return remoteRequest("/api/planning/recommendations/decision", jsonBody(first));
     case "planning:save-bom": return remoteRequest("/api/planning/boms", jsonBody(first));
@@ -133,7 +221,11 @@ async function remoteChannel(channel: string, args: unknown[]) {
     case "planning:apply-source-amendment": return remoteRequest(`/api/planning/sales-orders/source-amendments/${encodeURIComponent(String(first))}/apply`, jsonBody({}));
     case "planning:request-crf-reapproval": return remoteRequest(`/api/planning/sales-orders/${encodeURIComponent(String(first))}/request-crf-reapproval`, jsonBody({}));
     case "planning:get-crf-html": return remoteRequestText(`/api/planning/crf-revisions/${encodeURIComponent(String(first))}/html`);
-    case "operations:get-state": return remoteRequest("/api/operations/state");
+    case "operations:get-state": {
+      const state = await remoteRequest("/api/operations/state");
+      void ipcRenderer.invoke("sync:write-cache", "operations", state);
+      return state;
+    }
     case "operations:save-user": return remoteRequest("/api/operations/users", jsonBody(first));
     case "operations:reset-credential": return remoteRequest("/api/operations/users/reset-credential", jsonBody(first));
     case "operations:list-roles": return remoteRequest("/api/operations/roles");
@@ -168,9 +260,65 @@ async function remoteChannel(channel: string, args: unknown[]) {
   }
 }
 
-function rememberSession<T extends { token?: string }>(session: T): T {
-  if (session?.token) sessionToken = session.token;
+interface RememberableSession {
+  token?: string;
+  expiresAt?: string;
+  user?: { userId: string; displayName: string; role: string };
+  permissions?: string[];
+}
+
+function rememberSession<T>(session: T): T {
+  const candidate = session as unknown as RememberableSession;
+  if (candidate?.token) {
+    sessionToken = candidate.token;
+    if (remoteServerUrl) {
+      void ipcRenderer.invoke("sync:set-session", sessionToken);
+      void saveOfflinePermissionSnapshot(candidate);
+    }
+  }
   return session;
+}
+
+async function saveOfflinePermissionSnapshot(session: RememberableSession): Promise<void> {
+  if (!session.user || !session.permissions || !session.expiresAt || !sessionToken) return;
+  const deviceFingerprint = await ipcRenderer.invoke("sync:device-id") as string;
+  await ipcRenderer.invoke("sync:save-permission-snapshot", {
+    sessionToken,
+    deviceFingerprint,
+    userId: session.user.userId,
+    displayName: session.user.displayName,
+    role: session.user.role,
+    permissions: session.permissions,
+    expiresAt: session.expiresAt,
+  });
+}
+
+async function offlineAuthFallback(token: string): Promise<unknown> {
+  const deviceFingerprint = await ipcRenderer.invoke("sync:device-id") as string;
+  const snapshot = await ipcRenderer.invoke("sync:read-permission-snapshot") as {
+    sessionToken: string;
+    deviceFingerprint: string;
+    userId: string;
+    displayName: string;
+    role: string;
+    permissions: string[];
+    expiresAt: string;
+  } | null;
+  if (
+    !snapshot
+    || snapshot.sessionToken !== token
+    || snapshot.deviceFingerprint !== deviceFingerprint
+    || snapshot.expiresAt <= new Date().toISOString()
+  ) {
+    throw new Error("Production is unreachable and no valid offline session was found on this computer. Reconnect to Production to sign in.");
+  }
+  return {
+    token,
+    expiresAt: snapshot.expiresAt,
+    user: { userId: snapshot.userId, displayName: snapshot.displayName, role: snapshot.role },
+    permissions: snapshot.permissions,
+    offline: true,
+  };
 }
 
 contextBridge.exposeInMainWorld("desktop", {
@@ -188,9 +336,13 @@ contextBridge.exposeInMainWorld("desktop", {
   auth: {
     state: async (token?: string) => {
       await ensureDeploymentLoaded();
-      return remoteServerUrl
-        ? remoteRequest("/api/operations/auth/state", { headers: token ? { "X-Inventory-Session": token } : undefined })
-        : ipcRenderer.invoke("auth:state", token ?? sessionToken);
+      if (!remoteServerUrl) return ipcRenderer.invoke("auth:state", token ?? sessionToken);
+      try {
+        return await remoteRequest("/api/operations/auth/state", { headers: token ? { "X-Inventory-Session": token } : undefined });
+      } catch (error) {
+        if (!isNetworkFailure(error) || !(token ?? sessionToken)) throw error;
+        return offlineAuthFallback(token ?? sessionToken);
+      }
     },
     bootstrap: async (input: unknown) => {
       await ensureDeploymentLoaded();
@@ -225,17 +377,37 @@ contextBridge.exposeInMainWorld("desktop", {
     resume: async (token: string) => {
       await ensureDeploymentLoaded();
       sessionToken = token;
-      return rememberSession(remoteServerUrl
-        ? await remoteRequest("/api/operations/auth/resume", jsonBody({ token }))
-        : await ipcRenderer.invoke("auth:resume", token));
+      if (!remoteServerUrl) return rememberSession(await ipcRenderer.invoke("auth:resume", token));
+      try {
+        return rememberSession(await remoteRequest("/api/operations/auth/resume", jsonBody({ token })));
+      } catch (error) {
+        if (!isNetworkFailure(error)) throw error;
+        void ipcRenderer.invoke("sync:set-session", token);
+        return offlineAuthFallback(token);
+      }
     },
     logout: async () => {
       await ensureDeploymentLoaded();
-      if (remoteServerUrl) await remoteRequest("/api/operations/auth/logout", { method: "POST" });
-      else await ipcRenderer.invoke("auth:logout", sessionToken);
+      if (remoteServerUrl) {
+        try {
+          await remoteRequest("/api/operations/auth/logout", { method: "POST" });
+        } catch (error) {
+          if (!isNetworkFailure(error)) throw error;
+        }
+        void ipcRenderer.invoke("sync:clear-permission-snapshot");
+      } else {
+        await ipcRenderer.invoke("auth:logout", sessionToken);
+      }
       sessionToken = "";
     },
     token: () => sessionToken,
+  },
+  sync: {
+    status: async () => {
+      await ensureDeploymentLoaded();
+      if (!remoteServerUrl) return { online: true, queuedCount: 0, reviewable: [] };
+      return ipcRenderer.invoke("sync:status");
+    },
   },
   printHtml: (html: string) => authenticatedSession("desktop:print-html", html),
   chooseWorkbookFolder: (currentWorkbookPath?: string) => authenticatedSession("desktop:choose-workbook-folder", currentWorkbookPath),

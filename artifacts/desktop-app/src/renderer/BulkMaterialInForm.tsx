@@ -241,6 +241,11 @@ export default function BulkMaterialInForm({ stores, onChanged, onNotice, onErro
         nonPoException,
         lines,
       });
+      if ((result as { offlineQueued?: boolean }).offlineQueued) {
+        setChallanNumber("");
+        onNotice("Recorded offline — pending validation. This Material In entry will be sent to Production automatically once it is reachable again.");
+        return;
+      }
       const next = await window.desktop.stores.getState();
       onChanged(next);
       setChallanNumber("");

@@ -72,6 +72,13 @@ declare global {
         save: (input: SaveDeploymentInput) => Promise<DeploymentState>;
       };
       getInfo: () => Promise<DesktopInfo>;
+      sync: {
+        status: () => Promise<{
+          online: boolean;
+          queuedCount: number;
+          reviewable: Array<{ operationId: string; type: string; status: string; result: unknown; createdAt: string }>;
+        }>;
+      };
       auth: {
         state: (token?: string) => Promise<AuthState>;
         bootstrap: (input: BootstrapAdminInput) => Promise<AuthSession>;

@@ -61,7 +61,7 @@ import { allPermissions, defaultPermissionsByRole, permissionsForRole, requirePe
 import { formatQualifiedItemName } from "../stores/item-family";
 
 const MODULE_NAME = "operations";
-const SESSION_HOURS = 12;
+const SESSION_HOURS = 72;
 const EXPIRING_SOON_DAYS = 30;
 const SHARED_PHONE_USER_ID = "SYSTEM:SHARED_PHONE";
 
@@ -770,6 +770,15 @@ const migrations: ApplicationDatabaseMigration[] = [
       `);
     },
   },
+  {
+    version: 10,
+    description: "Record a device fingerprint per session so an offline LAN client can validate a cached permission snapshot against the device it was issued to",
+    up(database: DatabaseSync) {
+      database.exec(`
+        ALTER TABLE ops_sessions ADD COLUMN device_fingerprint TEXT NOT NULL DEFAULT '';
+      `);
+    },
+  },
 ];
 
 export class OperationsDatabase {
@@ -897,20 +906,20 @@ export class OperationsDatabase {
       `).run(userId, displayName, username, hashed.hash, hashed.salt, credentialType, `ADMIN:${username}`, email, timestamp, timestamp);
       const actor: ActorContext = { userId, username, displayName, auditIdentity: `ADMIN:${username}`, role: "ADMIN" };
       this.audit(actor, "BOOTSTRAP_ADMIN", "USER", userId, { username });
-      return this.createSession(userId, text(input.username) ? "Initial desktop" : "", computerName);
+      return this.createSession(userId, text(input.username) ? "Initial desktop" : "", "", computerName);
     });
   }
 
-  private createSession(userId: string, deviceLabel: string, computerName = ""): AuthSession {
+  private createSession(userId: string, deviceLabel: string, deviceFingerprint: string, computerName = ""): AuthSession {
     const row = this.db.prepare("SELECT * FROM ops_users WHERE id = ? AND active = 1").get(userId) as Row | undefined;
     if (!row) throw new Error("The user account is inactive or unavailable.");
     const token = randomBytes(32).toString("base64url");
     const createdAt = nowIso();
     const expiresAt = new Date(Date.now() + SESSION_HOURS * 60 * 60 * 1000).toISOString();
     this.db.prepare(`
-      INSERT INTO ops_sessions(token_hash, user_id, device_label, created_at, expires_at, last_seen_at)
-      VALUES (?, ?, ?, ?, ?, ?)
-    `).run(hashToken(token), userId, deviceLabel, createdAt, expiresAt, createdAt);
+      INSERT INTO ops_sessions(token_hash, user_id, device_label, device_fingerprint, created_at, expires_at, last_seen_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run(hashToken(token), userId, deviceLabel, deviceFingerprint, createdAt, expiresAt, createdAt);
     this.db.prepare("UPDATE ops_users SET last_login = ?, updated_at = ? WHERE id = ?").run(createdAt, createdAt, userId);
     const user = this.mapUser({ ...row, last_login: createdAt, updated_at: createdAt });
     return { token, expiresAt, user, permissions: resolveActorPermissions(this.db, user.role, computerName) };
@@ -923,7 +932,7 @@ export class OperationsDatabase {
       if (!row || Number(row.active) !== 1 || !verifyCredential(String(input.credential ?? ""), text(row.credential_salt), text(row.credential_hash))) {
         throw new Error("Invalid username or credential.");
       }
-      return this.createSession(text(row.id), text(input.deviceLabel), computerName);
+      return this.createSession(text(row.id), text(input.deviceLabel), text(input.deviceFingerprint), computerName);
     });
   }
 

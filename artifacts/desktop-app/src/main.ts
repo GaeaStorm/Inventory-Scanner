@@ -37,6 +37,9 @@ import {
   type DeploymentConfig,
   type DeploymentRole,
 } from "./deployment";
+import { ClientCacheDatabase, type CacheDomain } from "./sync/cache-database";
+import { readOrCreateDeviceId } from "./sync/device";
+import { SyncService } from "./sync/service";
 
 interface DesktopInfo {
   appVersion: string;
@@ -50,6 +53,8 @@ interface DesktopInfo {
   port: number;
   scannerUrls: string[];
 }
+
+app.setName("Inventory Scanner");
 
 const DEFAULT_PORT = 5000;
 const AUTOMATIC_BACKUP_INTERVAL_MS = 2 * 60 * 60 * 1000;
@@ -75,6 +80,7 @@ let planningService: PlanningService | null = null;
 let operationsService: OperationsService | null = null;
 let applicationDatabase: ApplicationDatabase | null = null;
 let automaticBackupTimer: NodeJS.Timeout | null = null;
+let syncService: SyncService | null = null;
 
 function preferredPort(): number {
   const configured = Number(deploymentConfig?.inventoryPort ?? process.env.INVENTORY_SCANNER_PORT ?? DEFAULT_PORT);
@@ -951,6 +957,27 @@ function registerIpcHandlers(): void {
   operation("operations:review-manual-tally", "TALLY_REVIEW", (input, actor) => operationsService!.reviewManualTally(input, actor));
 }
 
+function registerSyncIpcHandlers(cache: ClientCacheDatabase, sync: SyncService, deviceId: string): void {
+  ipcMain.handle("sync:set-session", (_event, token: unknown) => {
+    sync.setSessionToken(String(token ?? ""));
+  });
+  ipcMain.handle("sync:device-id", () => deviceId);
+  ipcMain.handle("sync:status", () => ({ ...sync.status(), deviceId }));
+  ipcMain.handle("sync:read-cache", (_event, domain: unknown) => sync.cachedState(domain as CacheDomain));
+  ipcMain.handle("sync:write-cache", (_event, domain: unknown, state: unknown) => {
+    sync.cacheState(domain as CacheDomain, state);
+  });
+  ipcMain.handle("sync:enqueue", (_event, input: unknown) =>
+    sync.enqueue(input as Parameters<SyncService["enqueue"]>[0]));
+  ipcMain.handle("sync:save-permission-snapshot", (_event, input: unknown) => {
+    cache.saveOfflinePermissionSnapshot(input as Parameters<ClientCacheDatabase["saveOfflinePermissionSnapshot"]>[0]);
+  });
+  ipcMain.handle("sync:read-permission-snapshot", () => cache.readOfflinePermissionSnapshot());
+  ipcMain.handle("sync:clear-permission-snapshot", () => {
+    cache.clearOfflinePermissionSnapshot();
+  });
+}
+
 function registerRemoteClientIpcHandlers(): void {
   ipcMain.handle("desktop:get-info", () => {
     if (!desktopInfo) throw new Error("The Production server address is unavailable.");
@@ -1083,6 +1110,12 @@ async function bootstrap(): Promise<void> {
       port: deploymentConfig.inventoryPort,
       scannerUrls: [remoteServerUrl],
     };
+    const deviceId = readOrCreateDeviceId(app.getPath("userData"));
+    const cacheDatabase = new ClientCacheDatabase(app.getPath("userData"));
+    syncService = new SyncService(cacheDatabase, deviceId, remoteServerUrl);
+    syncService.setComputerName(desktopInfo.computerName);
+    registerSyncIpcHandlers(cacheDatabase, syncService, deviceId);
+    syncService.start();
     registerRemoteClientIpcHandlers();
     await createWindow();
     return;
