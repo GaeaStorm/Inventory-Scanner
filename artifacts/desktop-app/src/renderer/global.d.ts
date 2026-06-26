@@ -16,7 +16,6 @@ import type {
   ReviewDecisionInput,
   SaveBoxInput,
   SetCatalogStatusInput,
-  SetCatalogVisibilityInput,
   GeneratedExportFile,
   StoresBackupResult,
   StoresRestoreResult,
@@ -103,12 +102,16 @@ declare global {
         getState: () => Promise<StoresState>;
         createLocalStockItem: (input: CreateLocalStockItemInput) => Promise<StoresState>;
         deleteLocalStockItem: (tallyItemGuid: string) => Promise<StoresState>;
+        saveItemFieldDefinition: (input: { label: string; required: boolean }) => Promise<StoresState>;
+        deleteItemFieldDefinition: (fieldId: string) => Promise<StoresState>;
+        reorderItemFieldDefinitions: (orderedIds: string[]) => Promise<StoresState>;
         createCatalogGroup: (input: CreateCatalogGroupInput) => Promise<StoresState>;
         deleteCatalogGroup: (name: string) => Promise<StoresState>;
         createStockCategory: (input: CreateStockCategoryInput) => Promise<StoresState>;
         deleteStockCategory: (name: string) => Promise<StoresState>;
         setCatalogStatus: (input: SetCatalogStatusInput) => Promise<StoresState>;
-        setCatalogVisibility: (input: SetCatalogVisibilityInput) => Promise<StoresState>;
+        setGroupCatalogRole: (input: { groupName: string; role: string }) => Promise<StoresState>;
+        setCatalogRole: (input: { tallyItemGuid: string; role: string | null }) => Promise<StoresState>;
         renameStockItem: (input: RenameStockItemInput) => Promise<StoresState>;
         exportCatalogCleanup: () => Promise<CatalogCleanupExportResult>;
         saveBox: (input: SaveBoxInput) => Promise<StoresBox>;
@@ -140,7 +143,7 @@ declare global {
         saveProductOrder: (input: SaveProductOrderInput) => Promise<PlanningState>;
         updateProductOrderStatus: (
           orderId: string,
-          status: "CANCELLED" | "COMPLETED" | "CONFIRMED",
+          status: "CANCELLED" | "COMPLETED" | "CONFIRMED" | "ON_HOLD",
         ) => Promise<PlanningState>;
         updateProductOrderWorkflowState: (orderId: string, workflowStateId: string) => Promise<PlanningState>;
         bulkUpdateProductOrders: (input: import("../planning/types").BulkProductOrderUpdateInput) => Promise<PlanningState>;
@@ -149,11 +152,35 @@ declare global {
         saveProductOrderFieldDefinition: (input: SaveProductOrderFieldDefinitionInput) => Promise<PlanningState>;
         deleteProductOrderFieldDefinition: (fieldId: string) => Promise<PlanningState>;
         exportRestock: (input: PlanningExportInput) => Promise<PlanningExportResult>;
+        addSalesOrderFulfilmentLine: (input: import("../planning/types").SaveSalesOrderFulfilmentLineInput) => Promise<PlanningState>;
+        advanceFulfilmentLineStage: (fulfilmentLineId: string, targetStage: string) => Promise<PlanningState>;
+        assignResaleSupplier: (fulfilmentLineId: string, supplierId: number) => Promise<PlanningState>;
+        setFulfilmentLineServiceDone: (fulfilmentLineId: string, done: boolean) => Promise<PlanningState>;
+        requestPoApproval: (salesOrderId: string) => Promise<PlanningState>;
+        setSalesOrderDueDate: (salesOrderId: string, dueDate: string) => Promise<PlanningState>;
+        setSalesOrderHoldStatus: (salesOrderId: string, holdStatus: "NONE" | "ON_HOLD" | "CANCELLED") => Promise<PlanningState>;
+        setFulfilmentLineHoldStatus: (fulfilmentLineId: string, holdStatus: "NONE" | "ON_HOLD" | "CANCELLED") => Promise<PlanningState>;
+        submitCrfForApproval: (salesOrderId: string) => Promise<PlanningState>;
+        decideApproval: (requestId: string, decision: "APPROVE" | "REJECT", comment: string) => Promise<PlanningState>;
+        saveChecklistTemplate: (input: import("../planning/types").SaveChecklistTemplateInput) => Promise<PlanningState>;
+        waiveChecklistRequirement: (salesOrderId: string, requirementId: string, reason: string) => Promise<PlanningState>;
+        getChecklistResultsForOrder: (salesOrderId: string) => Promise<import("../planning/types").ChecklistResult[]>;
+        advanceSalesOrderStage: (orderId: string, targetStage: import("../planning/types").SalesOrderStage) => Promise<PlanningState>;
+        applySourceAmendment: (amendmentId: string) => Promise<PlanningState>;
+        requestCrfReapproval: (salesOrderId: string) => Promise<PlanningState>;
+        getCrfHtml: (revisionId: string) => Promise<string>;
+        printCrfToPdf: (html: string, suggestedName: string) => Promise<{ savedPath: string | null }>;
       };
       operations: {
         getState: () => Promise<OperationsState>;
         saveUser: (input: SaveUserInput) => Promise<import("../operations/types").AuthUser>;
         resetCredential: (input: ResetCredentialInput) => Promise<void>;
+        listRoles: () => Promise<Array<{ name: string; isSystem: boolean }>>;
+        createRole: (name: string) => Promise<Array<{ name: string; isSystem: boolean }>>;
+        getRolePermissions: () => Promise<Array<{ roleName: string; permission: string; enabled: boolean }>>;
+        setRolePermission: (input: { roleName: string; permission: string; enabled: boolean }) => Promise<Array<{ roleName: string; permission: string; enabled: boolean }>>;
+        getComputerRestrictions: () => Promise<Array<{ permission: string; computerNames: string[] }>>;
+        setComputerRestriction: (input: { permission: string; computerNames: string[] }) => Promise<Array<{ permission: string; computerNames: string[] }>>;
         transitionCondition: (input: ConditionTransitionInput) => Promise<import("../operations/types").OperationsMovement>;
         createFault: (input: CreateFaultInput) => Promise<import("../operations/types").SupplierFaultRecord>;
         resolveFault: (input: ResolveFaultInput) => Promise<import("../operations/types").SupplierFaultRecord>;

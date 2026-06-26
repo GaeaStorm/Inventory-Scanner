@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import {
   copyFileSync,
   existsSync,
@@ -12,12 +12,15 @@ import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
 import { ApplicationDatabase } from "../database/application-database";
+import { payloadHash } from "../database/hash";
+import { formatQualifiedItemName, findQualifiedNameCollisions } from "./item-family";
 import type { TallyStoresSnapshot } from "../tally/types";
 import type {
   AdjustmentContext,
   AdjustmentInput,
   BulkVendorReceiptInput,
   BulkVendorReceiptResult,
+  CatalogRole,
   ConfirmImportInput,
   CreateCatalogGroupInput,
   CreateLocalStockItemInput,
@@ -26,12 +29,15 @@ import type {
   DeleteStockCategoryInput,
   DeleteStockItemInput,
   ExportBatchInput,
+  ItemFieldDefinition,
   MaterialOutInput,
   OpeningQuantityInput,
   RenameStockItemInput,
   ReviewDecisionInput,
   SaveBoxInput,
-  SetCatalogVisibilityInput,
+  SaveItemFieldDefinitionInput,
+  SetCatalogRoleInput,
+  SetGroupRoleInput,
   SetCatalogStatusInput,
   StoresBackupInfo,
   StoresBackupResult,
@@ -52,7 +58,7 @@ import type {
   VendorReceiptInput,
 } from "./types";
 
-const SCHEMA_VERSION = 11;
+const SCHEMA_VERSION = 14;
 const LEGACY_SUPPLIER_NAME = "Opening Legacy Stock";
 const LEGACY_SUPPLIER_GUID = "LOCAL:LEGACY_OPENING";
 
@@ -114,6 +120,19 @@ function text(value: unknown): string {
   return String(value ?? "").trim();
 }
 
+function fieldKey(value: unknown): string {
+  return text(value)
+    .toLocaleLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .slice(0, 60);
+}
+
+/** Strips whitespace only (for the generated Tally name) — keeps hyphens, case, and other characters as typed. */
+function normalizeFieldValueForName(value: string): string {
+  return value.trim().replace(/\s+/g, "");
+}
+
 function integerQuantity(value: unknown, label = "Quantity"): number {
   const quantity = Number(value);
   if (!Number.isInteger(quantity) || quantity <= 0) {
@@ -143,23 +162,6 @@ function json(value: unknown): string {
   return JSON.stringify(value ?? null);
 }
 
-function stableValue(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(stableValue);
-  if (value && typeof value === "object") {
-    return Object.fromEntries(
-      Object.entries(value as Record<string, unknown>)
-        .sort(([left], [right]) => left.localeCompare(right))
-        .map(([key, entry]) => [key, stableValue(entry)]),
-    );
-  }
-  return value;
-}
-
-function payloadHash(value: unknown): string {
-  return createHash("sha256")
-    .update(JSON.stringify(stableValue(value)))
-    .digest("hex");
-}
 
 function sqlValue(value: unknown): string | number | bigint | null | Uint8Array {
   if (value === undefined || value === null) return null;
@@ -177,6 +179,11 @@ function parseJson<T>(value: unknown, fallback: T): T {
   }
 }
 
+// Tally always supplies a GUID for real stock items, so this name-based
+// fallback only fires for malformed/legacy export rows. It is a latent
+// collision source now that duplicate item names are legal (distinguished by
+// Stock Group instead) — it is deliberately left in place only as a
+// best-effort match for genuinely GUID-less rows, never as the primary path.
 function itemIdentity(guid: string, name: string): string {
   return guid || `NAME:${name.toLocaleLowerCase()}`;
 }
@@ -751,6 +758,223 @@ export class StoresDatabase {
         this.db.prepare("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)").run(11, nowIso());
       }, "adding local-first Stock Group, Stock Category, and Stock Item masters");
     }
+
+    if (current < 12) {
+      // SQLite cannot drop a column-level UNIQUE constraint with ALTER TABLE,
+      // so the table is recreated. Foreign keys reference this table by name
+      // (not by an internal identity), so other tables' REFERENCES clauses
+      // keep working once the new table takes over the original name; the
+      // pragma can only be toggled outside an active transaction.
+      this.db.exec("PRAGMA foreign_keys = OFF");
+      try {
+        this.transaction(() => {
+          this.db.exec(`
+            CREATE TABLE tally_stock_items_new (
+              id INTEGER PRIMARY KEY,
+              tally_guid TEXT NOT NULL UNIQUE,
+              name TEXT NOT NULL COLLATE NOCASE,
+              parent_name TEXT NOT NULL DEFAULT '',
+              has_bom INTEGER NOT NULL DEFAULT 0 CHECK (has_bom IN (0,1)),
+              tally_closing_quantity INTEGER NOT NULL DEFAULT 0,
+              active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0,1)),
+              synced_at TEXT NOT NULL,
+              source TEXT NOT NULL DEFAULT 'TALLY' CHECK (source IN ('TALLY','LOCAL')),
+              catalog_status TEXT NOT NULL DEFAULT 'ACTIVE' CHECK (catalog_status IN ('ACTIVE','DUPLICATE','OBSOLETE')),
+              duplicate_of_item_id INTEGER REFERENCES tally_stock_items_new(id),
+              catalog_updated_at TEXT,
+              local_name_override TEXT,
+              catalog_role_override TEXT CHECK (catalog_role_override IS NULL OR catalog_role_override IN ('FINISHED_PRODUCT','COMPONENT','ACCESSORY','PACKAGING','OTHER')),
+              catalog_ignored INTEGER NOT NULL DEFAULT 0 CHECK (catalog_ignored IN (0,1)),
+              category_name TEXT NOT NULL DEFAULT '',
+              base_units TEXT NOT NULL DEFAULT 'Nos'
+            ) STRICT;
+
+            INSERT INTO tally_stock_items_new (
+              id, tally_guid, name, parent_name, has_bom, tally_closing_quantity, active, synced_at,
+              source, catalog_status, duplicate_of_item_id, catalog_updated_at, local_name_override,
+              catalog_role_override, catalog_ignored, category_name, base_units
+            )
+            SELECT
+              id, tally_guid, name, parent_name, has_bom, tally_closing_quantity, active, synced_at,
+              source, catalog_status, duplicate_of_item_id, catalog_updated_at, local_name_override,
+              catalog_role_override, catalog_ignored, category_name, base_units
+            FROM tally_stock_items;
+
+            DROP TABLE tally_stock_items;
+            ALTER TABLE tally_stock_items_new RENAME TO tally_stock_items;
+
+            CREATE INDEX idx_stock_items_source ON tally_stock_items(source, active, name);
+            CREATE INDEX idx_stock_items_catalog_status ON tally_stock_items(catalog_status, duplicate_of_item_id, active, name);
+            CREATE INDEX idx_stock_items_local_name_override ON tally_stock_items(local_name_override COLLATE NOCASE);
+            CREATE INDEX idx_stock_items_name ON tally_stock_items(name COLLATE NOCASE, active);
+
+            ALTER TABLE inventory_movements ADD COLUMN item_name_snapshot TEXT NOT NULL DEFAULT '';
+            ALTER TABLE inventory_movements ADD COLUMN item_qualified_name_snapshot TEXT NOT NULL DEFAULT '';
+            ALTER TABLE inventory_movements ADD COLUMN item_group_path_snapshot TEXT NOT NULL DEFAULT '[]';
+          `);
+          this.backfillInventoryMovementSnapshots();
+          this.db.prepare("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)").run(12, nowIso());
+        }, "migrating the Local Stores Database to schema 12");
+      } finally {
+        this.db.exec("PRAGMA foreign_keys = ON");
+      }
+    }
+
+    if (current < 13) {
+      this.transaction(() => {
+        this.db.exec(`
+          CREATE TABLE tally_item_field_definitions (
+            id TEXT PRIMARY KEY,
+            field_key TEXT NOT NULL UNIQUE,
+            label TEXT NOT NULL UNIQUE COLLATE NOCASE,
+            required INTEGER NOT NULL DEFAULT 0 CHECK (required IN (0,1)),
+            position INTEGER NOT NULL,
+            created_at TEXT NOT NULL
+          ) STRICT;
+
+          CREATE TABLE tally_item_field_values (
+            item_id INTEGER NOT NULL REFERENCES tally_stock_items(id) ON DELETE CASCADE,
+            field_id TEXT NOT NULL REFERENCES tally_item_field_definitions(id) ON DELETE CASCADE,
+            value TEXT NOT NULL DEFAULT '',
+            PRIMARY KEY(item_id, field_id)
+          ) STRICT;
+        `);
+        this.db.prepare("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)").run(13, nowIso());
+      }, "migrating the Local Stores Database to schema 13");
+    }
+
+    if (current < 14) {
+      // Unifies two previously separate, half-wired concepts (a 5-value
+      // "catalog role" that was never read, and a separate ignored boolean)
+      // into one designation per group or item: PRODUCT, SERVICE, NEITHER
+      // (the default), or IGNORED. Recreating both tables is required since
+      // SQLite cannot widen a CHECK constraint or drop a column in place;
+      // foreign_keys must be off for the tally_stock_items recreate (other
+      // tables reference it), and can only be toggled outside a transaction.
+      this.db.exec("PRAGMA foreign_keys = OFF");
+      try {
+      this.transaction(() => {
+        this.db.exec(`
+          CREATE TABLE catalog_group_settings_new (
+            group_name TEXT PRIMARY KEY COLLATE NOCASE,
+            catalog_role TEXT NOT NULL DEFAULT 'NEITHER'
+              CHECK (catalog_role IN ('PRODUCT','SERVICE','NEITHER','IGNORED')),
+            updated_at TEXT NOT NULL
+          ) STRICT;
+          INSERT INTO catalog_group_settings_new (group_name, catalog_role, updated_at)
+          SELECT group_name,
+            CASE
+              WHEN ignored = 1 THEN 'IGNORED'
+              WHEN catalog_role = 'FINISHED_PRODUCT' THEN 'PRODUCT'
+              ELSE 'NEITHER'
+            END,
+            updated_at
+          FROM catalog_group_settings;
+          DROP TABLE catalog_group_settings;
+          ALTER TABLE catalog_group_settings_new RENAME TO catalog_group_settings;
+
+          CREATE TABLE tally_stock_items_new (
+            id INTEGER PRIMARY KEY,
+            tally_guid TEXT NOT NULL UNIQUE,
+            name TEXT NOT NULL COLLATE NOCASE,
+            parent_name TEXT NOT NULL DEFAULT '',
+            has_bom INTEGER NOT NULL DEFAULT 0 CHECK (has_bom IN (0,1)),
+            tally_closing_quantity INTEGER NOT NULL DEFAULT 0,
+            active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0,1)),
+            synced_at TEXT NOT NULL,
+            source TEXT NOT NULL DEFAULT 'TALLY' CHECK (source IN ('TALLY','LOCAL')),
+            catalog_status TEXT NOT NULL DEFAULT 'ACTIVE' CHECK (catalog_status IN ('ACTIVE','DUPLICATE','OBSOLETE')),
+            duplicate_of_item_id INTEGER REFERENCES tally_stock_items_new(id),
+            catalog_updated_at TEXT,
+            local_name_override TEXT,
+            catalog_role_override TEXT CHECK (catalog_role_override IS NULL OR catalog_role_override IN ('PRODUCT','SERVICE','NEITHER','IGNORED')),
+            category_name TEXT NOT NULL DEFAULT '',
+            base_units TEXT NOT NULL DEFAULT 'Nos'
+          ) STRICT;
+
+          INSERT INTO tally_stock_items_new (
+            id, tally_guid, name, parent_name, has_bom, tally_closing_quantity, active, synced_at,
+            source, catalog_status, duplicate_of_item_id, catalog_updated_at, local_name_override,
+            catalog_role_override, category_name, base_units
+          )
+          SELECT
+            id, tally_guid, name, parent_name, has_bom, tally_closing_quantity, active, synced_at,
+            source, catalog_status, duplicate_of_item_id, catalog_updated_at, local_name_override,
+            CASE
+              WHEN catalog_ignored = 1 THEN 'IGNORED'
+              WHEN catalog_role_override = 'FINISHED_PRODUCT' THEN 'PRODUCT'
+              WHEN catalog_role_override IS NULL THEN NULL
+              ELSE 'NEITHER'
+            END,
+            category_name, base_units
+          FROM tally_stock_items;
+
+          DROP TABLE tally_stock_items;
+          ALTER TABLE tally_stock_items_new RENAME TO tally_stock_items;
+
+          CREATE INDEX idx_stock_items_source ON tally_stock_items(source, active, name);
+          CREATE INDEX idx_stock_items_catalog_status ON tally_stock_items(catalog_status, duplicate_of_item_id, active, name);
+          CREATE INDEX idx_stock_items_local_name_override ON tally_stock_items(local_name_override COLLATE NOCASE);
+          CREATE INDEX idx_stock_items_name ON tally_stock_items(name COLLATE NOCASE, active);
+        `);
+        this.db.prepare("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)").run(14, nowIso());
+      }, "migrating the Local Stores Database to schema 14");
+      } finally {
+        this.db.exec("PRAGMA foreign_keys = ON");
+      }
+    }
+  }
+
+  /**
+   * Walks tally_stock_groups.parent_name up to "Primary", matching the same
+   * algorithm getState() uses inline for its catalogue path computation.
+   */
+  private resolveGroupPath(directName: string): string[] {
+    const direct = text(directName);
+    if (!direct) return [];
+    const groupRows = this.db.prepare("SELECT name, parent_name FROM tally_stock_groups").all() as Row[];
+    const parents = new Map(groupRows.map((row) => [text(row.name).toLocaleLowerCase(), text(row.parent_name)]));
+    const result: string[] = [];
+    let current = direct;
+    const visited = new Set<string>();
+    for (;;) {
+      const key = current.toLocaleLowerCase();
+      if (visited.has(key)) break;
+      visited.add(key);
+      result.unshift(current);
+      const parent = parents.get(key) ?? "";
+      if (!parent || parent.toLocaleLowerCase() === "primary") break;
+      current = parent;
+    }
+    return result;
+  }
+
+  /** Computes the name/qualified-name/group-path snapshot for one item at write time. */
+  private itemSnapshot(stockItemId: number): { name: string; qualifiedName: string; groupPath: string[] } {
+    const row = this.db.prepare("SELECT name, parent_name FROM tally_stock_items WHERE id = ?").get(stockItemId) as Row | undefined;
+    if (!row) return { name: "", qualifiedName: "", groupPath: [] };
+    const name = text(row.name);
+    const groupPath = this.resolveGroupPath(text(row.parent_name));
+    return { name, qualifiedName: formatQualifiedItemName(groupPath, name), groupPath };
+  }
+
+  /**
+   * One-time backfill for movements recorded before snapshotting existed.
+   * Uses each item's *current* name/group as a best-effort approximation —
+   * there is no rename/regroup history to protect retroactively.
+   */
+  private backfillInventoryMovementSnapshots(): void {
+    const items = this.db.prepare("SELECT id, name, parent_name FROM tally_stock_items").all() as Row[];
+    const update = this.db.prepare(`
+      UPDATE inventory_movements
+      SET item_name_snapshot = ?, item_qualified_name_snapshot = ?, item_group_path_snapshot = ?
+      WHERE stock_item_id = ?
+    `);
+    for (const item of items) {
+      const name = text(item.name);
+      const groupPath = this.resolveGroupPath(text(item.parent_name));
+      update.run(name, formatQualifiedItemName(groupPath, name), json(groupPath), item.id);
+    }
   }
 
   transaction<T>(work: () => T, operation = "updating inventory"): T {
@@ -1051,11 +1275,18 @@ export class StoresDatabase {
   private upsertStockItem(item: TallyStoresSnapshot["stockItems"][number], syncedAt: string): number {
     const guid = itemIdentity(item.guid, item.name);
     const closingQuantity = Number.isInteger(item.closingQuantity) ? item.closingQuantity ?? 0 : 0;
-    const localByName = this.db.prepare(`
+    // Matching requires the same name AND the same Stock Group, now that
+    // duplicate item names are legal — two LOCAL items with the same name in
+    // different groups are genuinely different items and must not collapse
+    // into one promotion. If more than one LOCAL candidate matches, skip
+    // auto-promotion and leave it for manual reconciliation.
+    const localByNameMatches = this.db.prepare(`
       SELECT id FROM tally_stock_items
       WHERE COALESCE(NULLIF(local_name_override, ''), name) = ? COLLATE NOCASE
+        AND parent_name = ? COLLATE NOCASE
         AND source = 'LOCAL'
-    `).get(item.name) as Row | undefined;
+    `).all(item.name, item.parent) as Row[];
+    const localByName = localByNameMatches.length === 1 ? localByNameMatches[0] : undefined;
     if (localByName) {
       // A locally introduced component can be promoted to its real Tally
       // identity later without changing any foreign-key relationships.
@@ -1093,12 +1324,89 @@ export class StoresDatabase {
     return Number(row.id);
   }
 
+  /**
+   * Active items whose parent_name does not resolve to an active row in
+   * tally_stock_groups — a data-quality sweep for the "every active item
+   * belongs to a real Stock Group" requirement, surfaced for manual review
+   * rather than blocking sync on dirty historical data.
+   */
+  findItemsWithoutRealGroup(): StoresStockItem[] {
+    const groupNames = new Set(
+      (this.db.prepare("SELECT name FROM tally_stock_groups WHERE active = 1").all() as Row[])
+        .map((row) => text(row.name).toLocaleLowerCase()),
+    );
+    return this.getState().stockItems.filter((item) =>
+      item.active && (!item.parentName || !groupNames.has(item.parentName.toLocaleLowerCase())),
+    );
+  }
+
+  listItemFieldDefinitions(): ItemFieldDefinition[] {
+    return (this.db.prepare(`
+      SELECT id, field_key, label, required, position
+      FROM tally_item_field_definitions ORDER BY position, label
+    `).all() as Row[]).map((row) => ({
+      id: text(row.id),
+      key: text(row.field_key),
+      label: text(row.label),
+      required: Number(row.required) === 1,
+      position: Number(row.position),
+    }));
+  }
+
+  saveItemFieldDefinition(input: SaveItemFieldDefinitionInput): ItemFieldDefinition {
+    const label = text(input.label);
+    if (!label) throw new Error("Enter a field label.");
+    const key = fieldKey(label);
+    if (!key) throw new Error("Enter a field label containing letters or numbers.");
+    const existing = this.db.prepare(`
+      SELECT 1 FROM tally_item_field_definitions WHERE field_key = ? OR label = ? COLLATE NOCASE
+    `).get(key, label);
+    if (existing) throw new Error("A specification field with this label already exists.");
+    const id = randomUUID();
+    const position = Number((this.db.prepare(`
+      SELECT COALESCE(MAX(position), 0) + 1 AS position FROM tally_item_field_definitions
+    `).get() as Row).position);
+    this.db.prepare(`
+      INSERT INTO tally_item_field_definitions(id, field_key, label, required, position, created_at)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `).run(id, key, label, input.required ? 1 : 0, position, nowIso());
+    return this.listItemFieldDefinitions().find((field) => field.id === id)!;
+  }
+
+  deleteItemFieldDefinition(fieldIdValue: string): void {
+    const fieldId = text(fieldIdValue);
+    const field = this.db.prepare("SELECT id FROM tally_item_field_definitions WHERE id = ?").get(fieldId);
+    if (!field) throw new Error("Specification field not found.");
+    this.transaction(() => {
+      this.db.prepare("DELETE FROM tally_item_field_definitions WHERE id = ?").run(fieldId);
+      this.db.prepare(`
+        UPDATE tally_item_field_definitions
+        SET position = (
+          SELECT COUNT(*) FROM tally_item_field_definitions earlier
+          WHERE earlier.position <= tally_item_field_definitions.position
+        )
+      `).run();
+    }, "deleting an item specification field");
+  }
+
+  /** Rewrites position 1..N to match the given id order. Ids not in the current definition set are ignored. */
+  reorderItemFieldDefinitions(orderedIds: string[]): ItemFieldDefinition[] {
+    const known = new Set(this.listItemFieldDefinitions().map((field) => field.id));
+    const ids = orderedIds.map(text).filter((id) => known.has(id));
+    this.transaction(() => {
+      const update = this.db.prepare("UPDATE tally_item_field_definitions SET position = ? WHERE id = ?");
+      ids.forEach((id, index) => update.run(index + 1, id));
+    }, "reordering item specification fields");
+    return this.listItemFieldDefinitions();
+  }
+
   createLocalStockItem(input: CreateLocalStockItemInput): StoresStockItem {
-    const name = text(input.name);
-    if (!name) throw new Error("Local Stock Item name is required.");
+    const displayName = text(input.name);
+    if (!displayName) throw new Error("Local Stock Item name is required.");
     const parentName = text(input.parentName) || "Local Components";
     const categoryName = text(input.categoryName);
     const baseUnits = text(input.baseUnits) || "Nos";
+    const fieldDefinitions = this.listItemFieldDefinitions();
     return this.transaction(() => {
       const parent = this.db.prepare(`
         SELECT name FROM tally_stock_groups WHERE name = ? COLLATE NOCASE AND active = 1
@@ -1110,28 +1418,57 @@ export class StoresDatabase {
         `).get(categoryName) as Row | undefined;
         if (!category) throw new Error("Choose an existing Stock Category.");
       }
+      const fieldValues = fieldDefinitions.map((field) => {
+        const value = text(input.fieldValues?.[field.key]);
+        if (field.required && !value) throw new Error(`Enter a value for the required field "${field.label}".`);
+        return { field, value };
+      });
+      // The generated name (parent group + every specification field value, in
+      // order, "X" filling a blank optional field) is what makes the actual
+      // Tally master name unique even when the display name is intentionally
+      // duplicated across the catalog (e.g. many different "Item010"s).
+      const generatedName = fieldDefinitions.length === 0
+        ? displayName
+        : [parentName, ...fieldValues.map(({ value }) => normalizeFieldValueForName(value) || "X"), displayName].join("_");
+      // Scoped to the generated name AND group: with fields in play, the same
+      // display name under the same group but different field values is a
+      // genuinely different item; without fields, this falls back to the
+      // original (display name, group) dedupe scope.
       const existing = this.db.prepare(`
-        SELECT tally_guid, source FROM tally_stock_items WHERE name = ? COLLATE NOCASE
-      `).get(name) as Row | undefined;
+        SELECT tally_guid, source FROM tally_stock_items
+        WHERE name = ? COLLATE NOCASE AND parent_name = ? COLLATE NOCASE
+      `).get(generatedName, parentName) as Row | undefined;
+      let resolvedGuid: string;
+      const localNameOverride = fieldDefinitions.length === 0 ? null : displayName;
       if (!existing) {
+        resolvedGuid = `LOCAL:${randomUUID()}`;
         this.db.prepare(`
           INSERT INTO tally_stock_items(
             tally_guid, name, parent_name, has_bom, tally_closing_quantity,
-            active, synced_at, source, category_name, base_units
-          ) VALUES (?, ?, ?, 0, 0, 1, ?, 'LOCAL', ?, ?)
-        `).run(`LOCAL:${randomUUID()}`, name, parentName, nowIso(), categoryName, baseUnits);
+            active, synced_at, source, category_name, base_units, local_name_override
+          ) VALUES (?, ?, ?, 0, 0, 1, ?, 'LOCAL', ?, ?, ?)
+        `).run(resolvedGuid, generatedName, parentName, nowIso(), categoryName, baseUnits, localNameOverride);
       } else {
         if (text(existing.source) !== "LOCAL") {
-          throw new Error("A Tally-synchronized Stock Item already uses that name.");
+          throw new Error("A Tally-synchronized Stock Item already uses that name in that Stock Group.");
         }
+        resolvedGuid = text(existing.tally_guid);
         this.db.prepare(`
           UPDATE tally_stock_items
-          SET active = 1, parent_name = ?, category_name = ?, base_units = ?
+          SET active = 1, parent_name = ?, category_name = ?, base_units = ?, local_name_override = ?
           WHERE tally_guid = ?
-        `).run(parentName, categoryName, baseUnits, existing.tally_guid);
+        `).run(parentName, categoryName, baseUnits, localNameOverride, resolvedGuid);
+      }
+      if (fieldValues.length > 0) {
+        const itemId = Number((this.db.prepare("SELECT id FROM tally_stock_items WHERE tally_guid = ?").get(resolvedGuid) as Row).id);
+        const upsert = this.db.prepare(`
+          INSERT INTO tally_item_field_values(item_id, field_id, value) VALUES (?, ?, ?)
+          ON CONFLICT(item_id, field_id) DO UPDATE SET value = excluded.value
+        `);
+        for (const { field, value } of fieldValues) upsert.run(itemId, field.id, value);
       }
       if (this.getDataMode() === "empty") this.setDataMode("local");
-      return this.getState().stockItems.find((item) => item.name.toLocaleLowerCase() === name.toLocaleLowerCase())!;
+      return this.getState().stockItems.find((item) => item.tallyGuid === resolvedGuid)!;
     }, "creating a local Stores Catalog item");
   }
 
@@ -1293,6 +1630,10 @@ export class StoresDatabase {
     let referenceCount = 0;
     for (const table of tables) {
       const tableName = text(table.name);
+      // Pure descriptive metadata about this item, not a real inventory/
+      // planning record — it cascades away with the item, so it must never
+      // block deletion the way an actual movement/lot/BOM reference should.
+      if (tableName === "tally_item_field_values") continue;
       const safeTable = tableName.replaceAll('"', '""');
       const foreignKeys = this.db.prepare(`PRAGMA foreign_key_list("${safeTable}")`).all() as Row[];
       for (const foreignKey of foreignKeys) {
@@ -1370,21 +1711,45 @@ export class StoresDatabase {
     }, "updating the local Stock Item catalog");
   }
 
-  setCatalogVisibility(input: SetCatalogVisibilityInput): void {
+  private static readonly CATALOG_ROLES: CatalogRole[] = ["PRODUCT", "SERVICE", "NEITHER", "IGNORED"];
+
+  /**
+   * Designates a Stock Group as containing Products, Services, or Neither
+   * (the default), or marks it Ignored — the primary way to classify the
+   * catalog, since tagging whole groups is far faster than tagging every
+   * item. An item under this group inherits this unless it has its own
+   * override (setCatalogRole). The nearest explicit ancestor wins when
+   * groups are nested.
+   */
+  setGroupCatalogRole(input: SetGroupRoleInput): void {
     const groupName = text(input.groupName);
     if (!groupName) throw new Error("Choose a Stock Group.");
     const group = this.db.prepare(`
       SELECT name FROM tally_stock_groups WHERE name = ? COLLATE NOCASE AND active = 1
     `).get(groupName) as Row | undefined;
     if (!group) throw new Error("The selected Stock Group is no longer available.");
+    const role = StoresDatabase.CATALOG_ROLES.includes(input.role) ? input.role : "NEITHER";
     this.db.prepare(`
-      INSERT INTO catalog_group_settings(group_name, catalog_role, ignored, updated_at)
-      VALUES (?, 'OTHER', ?, ?)
-      ON CONFLICT(group_name) DO UPDATE SET
-        catalog_role = 'OTHER',
-        ignored = excluded.ignored,
-        updated_at = excluded.updated_at
-    `).run(groupName, input.ignored ? 1 : 0, nowIso());
+      INSERT INTO catalog_group_settings(group_name, catalog_role, updated_at)
+      VALUES (?, ?, ?)
+      ON CONFLICT(group_name) DO UPDATE SET catalog_role = excluded.catalog_role, updated_at = excluded.updated_at
+    `).run(groupName, role, nowIso());
+  }
+
+  /**
+   * Manually designates one Stock Item as a Product, Service, or Neither, or
+   * marks it Ignored — overriding whatever its Stock Group resolves to (or,
+   * for Product, the automatic has-a-BOM detection). Pass null to clear the
+   * override so the item inherits from its group again.
+   */
+  setCatalogRole(input: SetCatalogRoleInput): void {
+    const guid = text(input.tallyItemGuid);
+    const item = this.db.prepare(`
+      SELECT id FROM tally_stock_items WHERE tally_guid = ? AND active = 1
+    `).get(guid) as Row | undefined;
+    if (!item) throw new Error("The selected Stock Item is no longer available.");
+    const role = input.role && StoresDatabase.CATALOG_ROLES.includes(input.role) ? input.role : null;
+    this.db.prepare("UPDATE tally_stock_items SET catalog_role_override = ? WHERE id = ?").run(role, item.id);
   }
 
   renameStockItem(input: RenameStockItemInput): void {
@@ -1928,10 +2293,11 @@ export class StoresDatabase {
         `).run(line.stockItemId, supplier.id, grnLineId, localGrnGuid, eventDate, poNumber, grnNumber, eventDate, challanNumber, challanDate, acceptedQuantity, acceptedQuantity, sqlValue(rate), sqlValue(acceptedValue), timestamp);
 
         const movementId = `MOV-${randomUUID()}`;
+        const snapshot = this.itemSnapshot(line.stockItemId);
         this.db.prepare(`
-          INSERT INTO inventory_movements(id, client_transaction_id, workflow, event_date, box_id, stock_item_id, quantity, supplier_id, purchase_order_id, grn_id, status, created_at)
-          VALUES (?, ?, 'VENDOR_MATERIAL_IN', ?, '', ?, ?, ?, ?, ?, 'PENDING', ?)
-        `).run(movementId, `${clientTransactionId}:${index + 1}`, eventDate, line.stockItemId, line.quantity, supplier.id, sqlValue(poId), grnId, timestamp);
+          INSERT INTO inventory_movements(id, client_transaction_id, workflow, event_date, box_id, stock_item_id, quantity, supplier_id, purchase_order_id, grn_id, status, created_at, item_name_snapshot, item_qualified_name_snapshot, item_group_path_snapshot)
+          VALUES (?, ?, 'VENDOR_MATERIAL_IN', ?, '', ?, ?, ?, ?, ?, 'PENDING', ?, ?, ?, ?)
+        `).run(movementId, `${clientTransactionId}:${index + 1}`, eventDate, line.stockItemId, line.quantity, supplier.id, sqlValue(poId), grnId, timestamp, snapshot.name, snapshot.qualifiedName, json(snapshot.groupPath));
         this.db.prepare(
           "INSERT INTO movement_lines(movement_id, stock_item_id, quantity, direction) VALUES (?, ?, ?, 'IN')",
         ).run(movementId, line.stockItemId, line.quantity);
@@ -2024,10 +2390,11 @@ export class StoresDatabase {
         INSERT INTO purchase_lots(stock_item_id, supplier_id, grn_line_id, source_type, source_voucher_guid, source_voucher_date, po_number, grn_number, receipt_date, challan_number, challan_date, quantity_received, quantity_remaining, rate, value, created_at)
         VALUES (?, ?, ?, 'LOCAL_GRN', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(stockItemId, supplier.id, grnLineId, localGrnGuid, eventDate, poNumber, grnNumber, eventDate, challanNumber, challanDate, quantity, quantity, sqlValue(rate), sqlValue(value), timestamp);
+      const recordVendorReceiptSnapshot = this.itemSnapshot(stockItemId);
       this.db.prepare(`
-        INSERT INTO inventory_movements(id, client_transaction_id, workflow, event_date, box_id, stock_item_id, quantity, supplier_id, purchase_order_id, grn_id, status, created_at)
-        VALUES (?, ?, 'VENDOR_MATERIAL_IN', ?, ?, ?, ?, ?, ?, ?, 'PENDING', ?)
-      `).run(movementId, input.clientTransactionId, eventDate, text(input.boxId), stockItemId, quantity, supplier.id, sqlValue(poId), grnId, timestamp);
+        INSERT INTO inventory_movements(id, client_transaction_id, workflow, event_date, box_id, stock_item_id, quantity, supplier_id, purchase_order_id, grn_id, status, created_at, item_name_snapshot, item_qualified_name_snapshot, item_group_path_snapshot)
+        VALUES (?, ?, 'VENDOR_MATERIAL_IN', ?, ?, ?, ?, ?, ?, ?, 'PENDING', ?, ?, ?, ?)
+      `).run(movementId, input.clientTransactionId, eventDate, text(input.boxId), stockItemId, quantity, supplier.id, sqlValue(poId), grnId, timestamp, recordVendorReceiptSnapshot.name, recordVendorReceiptSnapshot.qualifiedName, json(recordVendorReceiptSnapshot.groupPath));
       this.db.prepare("INSERT INTO movement_lines(movement_id, stock_item_id, quantity, direction) VALUES (?, ?, ?, 'IN')").run(movementId, stockItemId, quantity);
       if (poId) {
         this.db.prepare("UPDATE purchase_order_lines SET received_quantity = received_quantity + ? WHERE purchase_order_id = ? AND stock_item_id = ?").run(quantity, poId, stockItemId);
@@ -2078,12 +2445,14 @@ export class StoresDatabase {
           quantity_received, quantity_remaining, created_at
         ) VALUES (?, ?, ?, 'LOCAL_GRN', ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(stockItemId, supplierId, grnLineId, localGrnGuid, eventDate, grnNumber, eventDate, text(input.note), eventDate, quantity, quantity, timestamp);
+      const materialInCorrectionSnapshot = this.itemSnapshot(stockItemId);
       this.db.prepare(`
         INSERT INTO inventory_movements(
           id, client_transaction_id, workflow, event_date, box_id,
-          stock_item_id, quantity, supplier_id, grn_id, status, created_at
-        ) VALUES (?, ?, 'VENDOR_MATERIAL_IN', ?, ?, ?, ?, ?, ?, 'PENDING', ?)
-      `).run(movementId, input.clientTransactionId, eventDate, text(input.boxId), stockItemId, quantity, supplierId, grnId, timestamp);
+          stock_item_id, quantity, supplier_id, grn_id, status, created_at,
+          item_name_snapshot, item_qualified_name_snapshot, item_group_path_snapshot
+        ) VALUES (?, ?, 'VENDOR_MATERIAL_IN', ?, ?, ?, ?, ?, ?, 'PENDING', ?, ?, ?, ?)
+      `).run(movementId, input.clientTransactionId, eventDate, text(input.boxId), stockItemId, quantity, supplierId, grnId, timestamp, materialInCorrectionSnapshot.name, materialInCorrectionSnapshot.qualifiedName, json(materialInCorrectionSnapshot.groupPath));
       this.db.prepare(`
         INSERT INTO movement_lines(movement_id, stock_item_id, quantity, direction)
         VALUES (?, ?, ?, 'IN')
@@ -2126,10 +2495,11 @@ export class StoresDatabase {
 
       const movementId = `MOV-${randomUUID()}`;
       const timestamp = nowIso();
+      const materialOutSnapshot = this.itemSnapshot(stockItemId);
       this.db.prepare(`
-        INSERT INTO inventory_movements(id, client_transaction_id, workflow, event_date, box_id, stock_item_id, quantity, destination_item_id, status, created_at)
-        VALUES (?, ?, 'MATERIAL_OUT', ?, ?, ?, ?, ?, 'PENDING', ?)
-      `).run(movementId, input.clientTransactionId, eventDate, text(input.boxId), stockItemId, quantity, destinationItemId, timestamp);
+        INSERT INTO inventory_movements(id, client_transaction_id, workflow, event_date, box_id, stock_item_id, quantity, destination_item_id, status, created_at, item_name_snapshot, item_qualified_name_snapshot, item_group_path_snapshot)
+        VALUES (?, ?, 'MATERIAL_OUT', ?, ?, ?, ?, ?, 'PENDING', ?, ?, ?, ?)
+      `).run(movementId, input.clientTransactionId, eventDate, text(input.boxId), stockItemId, quantity, destinationItemId, timestamp, materialOutSnapshot.name, materialOutSnapshot.qualifiedName, json(materialOutSnapshot.groupPath));
       this.db.prepare("INSERT INTO movement_lines(movement_id, stock_item_id, quantity, direction) VALUES (?, ?, ?, 'OUT')").run(movementId, stockItemId, quantity);
 
       let remaining = quantity;
@@ -2177,8 +2547,8 @@ export class StoresDatabase {
     const inserted = this.db.prepare(`
       INSERT INTO tally_stock_items(
         tally_guid, name, parent_name, has_bom, tally_closing_quantity,
-        active, synced_at, source, catalog_ignored
-      ) VALUES (?, ?, 'System destinations', 0, 0, 1, ?, 'LOCAL', 1)
+        active, synced_at, source, catalog_role_override
+      ) VALUES (?, ?, 'System destinations', 0, 0, 1, ?, 'LOCAL', 'IGNORED')
     `).run(guid, label, nowIso());
     return { id: Number(inserted.lastInsertRowid), tallyGuid: guid };
   }
@@ -2416,11 +2786,13 @@ export class StoresDatabase {
 
       const movementId = `MOV-${randomUUID()}`;
       const timestamp = nowIso();
+      const returnUnusedSnapshot = this.itemSnapshot(stockItemId);
       this.db.prepare(`
         INSERT INTO inventory_movements(
           id, client_transaction_id, workflow, event_date, box_id,
-          stock_item_id, quantity, destination_item_id, status, created_at
-        ) VALUES (?, ?, 'RETURN_UNUSED', ?, ?, ?, ?, ?, 'PENDING', ?)
+          stock_item_id, quantity, destination_item_id, status, created_at,
+          item_name_snapshot, item_qualified_name_snapshot, item_group_path_snapshot
+        ) VALUES (?, ?, 'RETURN_UNUSED', ?, ?, ?, ?, ?, 'PENDING', ?, ?, ?, ?)
       `).run(
         movementId,
         input.clientTransactionId,
@@ -2430,6 +2802,9 @@ export class StoresDatabase {
         quantity,
         destinationItemId,
         timestamp,
+        returnUnusedSnapshot.name,
+        returnUnusedSnapshot.qualifiedName,
+        json(returnUnusedSnapshot.groupPath),
       );
       this.db.prepare(`
         INSERT INTO inventory_adjustments(
@@ -2547,11 +2922,13 @@ export class StoresDatabase {
   ): string {
     const movementId = `MOV-${randomUUID()}`;
     const timestamp = nowIso();
+    const adjustmentExceptionSnapshot = this.itemSnapshot(stockItemId);
     this.db.prepare(`
       INSERT INTO inventory_movements(
         id, client_transaction_id, workflow, event_date, box_id,
-        stock_item_id, quantity, destination_item_id, status, created_at
-      ) VALUES (?, ?, 'RETURN_UNUSED', ?, ?, ?, ?, ?, 'EXCEPTION', ?)
+        stock_item_id, quantity, destination_item_id, status, created_at,
+        item_name_snapshot, item_qualified_name_snapshot, item_group_path_snapshot
+      ) VALUES (?, ?, 'RETURN_UNUSED', ?, ?, ?, ?, ?, 'EXCEPTION', ?, ?, ?, ?)
     `).run(
       movementId,
       input.clientTransactionId,
@@ -2561,6 +2938,9 @@ export class StoresDatabase {
       quantity,
       destinationItemId,
       timestamp,
+      adjustmentExceptionSnapshot.name,
+      adjustmentExceptionSnapshot.qualifiedName,
+      json(adjustmentExceptionSnapshot.groupPath),
     );
     this.db.prepare(`
       INSERT INTO inventory_adjustments(
@@ -2721,10 +3101,20 @@ export class StoresDatabase {
       source: text(row.source) === "LOCAL" ? "LOCAL" as const : "TALLY" as const,
     }]));
     const groupSettings = new Map((this.db.prepare(`
-      SELECT group_name, ignored FROM catalog_group_settings
-    `).all() as Row[]).map((row) => [text(row.group_name).toLocaleLowerCase(), {
-      ignored: Number(row.ignored) === 1,
-    }]));
+      SELECT group_name, catalog_role FROM catalog_group_settings
+    `).all() as Row[]).map((row) => [text(row.group_name).toLocaleLowerCase(), text(row.catalog_role) as CatalogRole]));
+    // Nearest explicit ancestor wins, walking from the most specific group up
+    // to Primary. Returns null (not "NEITHER") when nothing in the path was
+    // ever explicitly designated, so callers can tell "never touched" (where
+    // automatic BOM-based product detection still applies) apart from an
+    // explicit, deliberate "Neither" choice (a hard override, no fallback).
+    const resolveGroupRole = (path: string[]): CatalogRole | null => {
+      for (let index = path.length - 1; index >= 0; index -= 1) {
+        const role = groupSettings.get(path[index].toLocaleLowerCase());
+        if (role) return role;
+      }
+      return null;
+    };
     const masterPath = (
       directName: string,
       parents: Map<string, { name: string; parentName: string }>,
@@ -2780,18 +3170,36 @@ export class StoresDatabase {
           SELECT product_item_id AS id FROM planning_product_orders
         `).all() as Row[]).map((row) => Number(row.id))
       : []);
+    const fieldDefinitions = this.listItemFieldDefinitions();
+    const fieldValuesByItem = new Map<number, Record<string, string>>();
+    if (fieldDefinitions.length > 0) {
+      const fieldLabelById = new Map(fieldDefinitions.map((field) => [field.id, field.key]));
+      for (const row of this.db.prepare("SELECT item_id, field_id, value FROM tally_item_field_values").all() as Row[]) {
+        const key = fieldLabelById.get(text(row.field_id));
+        if (!key) continue;
+        const itemId = Number(row.item_id);
+        const values = fieldValuesByItem.get(itemId) ?? {};
+        values[key] = text(row.value);
+        fieldValuesByItem.set(itemId, values);
+      }
+    }
     const stockItems: StoresStockItem[] = stockRows.map((row) => {
       const groups = splitGroup(text(row.parent_name));
-      const pathSettings = groups.path
-        .map((name) => groupSettings.get(name.toLocaleLowerCase()))
-        .filter((value) => value !== undefined);
-      const itemIgnored = Number(row.catalog_ignored) === 1;
-      const groupIgnored = pathSettings.some((settings) => settings?.ignored);
+      const itemOverride: CatalogRole | null = row.catalog_role_override ? text(row.catalog_role_override) as CatalogRole : null;
+      // An explicit choice anywhere (the item itself, or the nearest ancestor
+      // group that has one) is a hard override — including an explicit
+      // "Neither", which must suppress automatic BOM-based product detection
+      // rather than fall back to it. Only a true absence of any explicit
+      // choice leaves room for that fallback.
+      const explicitRole: CatalogRole | null = itemOverride ?? resolveGroupRole(groups.path);
+      const isProduct = explicitRole === "PRODUCT"
+        || (explicitRole === null && (Number(row.has_bom) === 1 || productItemIds.has(Number(row.id))));
       return {
       id: Number(row.id),
       tallyGuid: text(row.tally_guid),
       tallyName: text(row.name),
       name: text(row.local_name_override) || text(row.name),
+      qualifiedName: formatQualifiedItemName(groups.path, text(row.local_name_override) || text(row.name)),
       parentName: text(row.parent_name),
       groupPath: groups.path,
       categoryName: text(row.category_name),
@@ -2811,12 +3219,14 @@ export class StoresDatabase {
       catalogStatus: ["DUPLICATE", "OBSOLETE"].includes(text(row.catalog_status))
         ? text(row.catalog_status) as StoresStockItem["catalogStatus"]
         : "ACTIVE",
-      isProduct: Number(row.has_bom) === 1 || productItemIds.has(Number(row.id)),
-      itemIgnored,
-      groupIgnored,
-      ignored: itemIgnored || groupIgnored,
+      isProduct,
+      isService: explicitRole === "SERVICE",
+      catalogRoleOverride: itemOverride,
+      effectiveCatalogRole: explicitRole ?? "NEITHER",
+      ignored: explicitRole === "IGNORED",
       duplicateOfTallyGuid: row.duplicate_of_tally_guid == null ? null : text(row.duplicate_of_tally_guid),
       duplicateOfName: row.duplicate_of_name == null ? null : text(row.duplicate_of_name),
+      fieldValues: fieldValuesByItem.get(Number(row.id)) ?? {},
     }});
 
     const suppliers: StoresSupplier[] = (this.db.prepare("SELECT id, tally_guid, name FROM suppliers WHERE name <> ? ORDER BY name").all(LEGACY_SUPPLIER_NAME) as Row[]).map((row) => ({
@@ -2828,7 +3238,8 @@ export class StoresDatabase {
     }
     const catalogGroups = [...knownGroupNames].map((name) => {
       const split = splitGroup(name);
-      const settings = groupSettings.get(name.toLocaleLowerCase());
+      const ownRole = groupSettings.get(name.toLocaleLowerCase()) ?? "NEITHER";
+      const effectiveRole = resolveGroupRole(split.path) ?? "NEITHER";
       return {
         name,
         parentName: groupParents.get(name.toLocaleLowerCase())?.parentName ?? "",
@@ -2837,7 +3248,9 @@ export class StoresDatabase {
         level: Math.max(1, split.path.length),
         path: split.path,
         source: groupParents.get(name.toLocaleLowerCase())?.source ?? "TALLY",
-        ignored: Boolean(settings?.ignored || split.path.some((part) => groupSettings.get(part.toLocaleLowerCase())?.ignored)),
+        catalogRole: ownRole,
+        effectiveCatalogRole: effectiveRole,
+        ignored: effectiveRole === "IGNORED",
         itemCount: stockItems.filter((item) =>
           item.groupPath.some((part) => part.toLocaleLowerCase() === name.toLocaleLowerCase())
         ).length,
@@ -3032,8 +3445,12 @@ export class StoresDatabase {
       openingQuantityAdjustments,
       catalogGroups,
       stockCategories,
+      qualifiedNameCollisions: findQualifiedNameCollisions(
+        stockItems.filter((item) => item.active).map((item) => ({ id: item.id, name: item.name, groupPath: item.groupPath })),
+      ),
       exportSchemaVersion: "1.0",
       materialOutXmlConfigured: this.getSetting<boolean>("material_out_xml_configured") === true,
+      itemFieldDefinitions: fieldDefinitions,
     };
   }
 

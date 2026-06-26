@@ -3,7 +3,7 @@ import path from "node:path";
 import type { TallyStoresSnapshot } from "../tally/types";
 import type { OperationsService } from "../operations/service";
 import type { ActorContext, Permission } from "../operations/types";
-import { hasPermission, requirePermission } from "../operations/permissions";
+import { requirePermission } from "../operations/permissions";
 import { ApplicationDatabase, DatabaseBusyError } from "../database/application-database";
 import { createDemoStoresSnapshot } from "./demo-data";
 import { CatalogExporter } from "./catalog-exporter";
@@ -25,8 +25,10 @@ import type {
   RenameStockItemInput,
   ReviewDecisionInput,
   SaveBoxInput,
+  SaveItemFieldDefinitionInput,
+  SetCatalogRoleInput,
   SetCatalogStatusInput,
-  SetCatalogVisibilityInput,
+  SetGroupRoleInput,
   StoresOfflineBatchInput,
   StoresOfflineBatchResult,
   VendorReceiptInput,
@@ -111,6 +113,24 @@ export class StoresService {
     return this.getState();
   }
 
+  saveItemFieldDefinition(input: SaveItemFieldDefinitionInput, actor: ActorContext) {
+    this.authorize(actor, "CATALOG_MANAGE");
+    this.database.saveItemFieldDefinition(input);
+    return this.getState();
+  }
+
+  deleteItemFieldDefinition(fieldId: string, actor: ActorContext) {
+    this.authorize(actor, "CATALOG_MANAGE");
+    this.database.deleteItemFieldDefinition(fieldId);
+    return this.getState();
+  }
+
+  reorderItemFieldDefinitions(orderedIds: string[], actor: ActorContext) {
+    this.authorize(actor, "CATALOG_MANAGE");
+    this.database.reorderItemFieldDefinitions(orderedIds);
+    return this.getState();
+  }
+
   createCatalogGroup(input: CreateCatalogGroupInput, actor: ActorContext) {
     this.authorize(actor, "CATALOG_MANAGE");
     this.database.createCatalogGroup(input);
@@ -147,9 +167,15 @@ export class StoresService {
     return this.getState();
   }
 
-  setCatalogVisibility(input: SetCatalogVisibilityInput, actor: ActorContext) {
+  setGroupCatalogRole(input: SetGroupRoleInput, actor: ActorContext) {
     this.authorize(actor, "CATALOG_MANAGE");
-    this.database.setCatalogVisibility(input);
+    this.database.setGroupCatalogRole(input);
+    return this.getState();
+  }
+
+  setCatalogRole(input: SetCatalogRoleInput, actor: ActorContext) {
+    this.authorize(actor, "CATALOG_MANAGE");
+    this.database.setCatalogRole(input);
     return this.getState();
   }
 
@@ -160,7 +186,7 @@ export class StoresService {
   }
 
   exportCatalogCleanup(actor: ActorContext) {
-    if (!hasPermission(actor.role, "CATALOG_MANAGE") && !hasPermission(actor.role, "TALLY_REVIEW")) {
+    if (!actor.permissions?.includes("CATALOG_MANAGE") && !actor.permissions?.includes("TALLY_REVIEW")) {
       throw new Error(`${actor.role} does not have permission to generate Tally master files.`);
     }
     return this.catalogExporter.generate();

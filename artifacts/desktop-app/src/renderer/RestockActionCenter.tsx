@@ -1,6 +1,12 @@
 import { useMemo, useState, type ChangeEvent } from "react";
 
-import GroupFilterDropdown, { buildGroupTree, groupPathMatches } from "./GroupFilterDropdown";
+import GroupFilterDropdown, {
+  appendFieldLeaves,
+  buildGroupTree,
+  groupFilterValueFromNode,
+  itemMatchesFilter,
+  type GroupFilterValue,
+} from "./GroupFilterDropdown";
 import InfoTip from "./InfoTip";
 
 import type {
@@ -56,7 +62,7 @@ export default function RestockActionCenter({
   const [productGuid, setProductGuid] = useState("");
   const [health, setHealth] = useState("");
   const [obsoleteOnly, setObsoleteOnly] = useState(false);
-  const [groupFilter, setGroupFilter] = useState<string[]>([]);
+  const [groupFilter, setGroupFilter] = useState<GroupFilterValue>({ path: [], groupDepth: 0 });
   const [categoryFilter, setCategoryFilter] = useState("");
   const [selectedGuid, setSelectedGuid] = useState(planning.items[0]?.tallyItemGuid ?? "");
   const [busy, setBusy] = useState(false);
@@ -82,12 +88,17 @@ export default function RestockActionCenter({
     () => new Map(stores.stockItems.map((item) => [item.tallyGuid, item])),
     [stores.stockItems],
   );
-  const groupTree = useMemo(
-    () => buildGroupTree(planning.items
-      .map((item) => catalogByGuid.get(item.tallyItemGuid)?.groupPath)
-      .filter((path): path is string[] => Boolean(path && path.length > 0))),
+  const planningCatalogItems = useMemo(
+    () => planning.items
+      .map((item) => catalogByGuid.get(item.tallyItemGuid))
+      .filter((entry): entry is NonNullable<typeof entry> => Boolean(entry)),
     [planning.items, catalogByGuid],
   );
+  const groupTree = useMemo(() => appendFieldLeaves(
+    buildGroupTree(planningCatalogItems.map((item) => item.groupPath).filter((path) => path.length > 0)),
+    planningCatalogItems.map((item) => ({ groupPath: item.groupPath, fieldValues: item.fieldValues, displayName: item.name, itemGuid: item.tallyGuid })),
+    stores.itemFieldDefinitions,
+  ), [planningCatalogItems, stores.itemFieldDefinitions]);
   const categoryOptions = useMemo(
     () => [...new Set(planning.items
       .map((item) => catalogByGuid.get(item.tallyItemGuid)?.categoryName)
@@ -103,7 +114,11 @@ export default function RestockActionCenter({
       if (health && item.health !== health) return false;
       if (obsoleteOnly && !(item.catalogStatus === "OBSOLETE" && item.targetStock === 0)) return false;
       const catalogItem = catalogByGuid.get(item.tallyItemGuid);
-      if (groupFilter.length > 0 && !groupPathMatches(groupFilter, catalogItem?.groupPath ?? [])) return false;
+      if (groupFilter.path.length > 0 && !(catalogItem && itemMatchesFilter(
+        groupFilter,
+        { groupPath: catalogItem.groupPath, fieldValues: catalogItem.fieldValues, displayName: catalogItem.name },
+        stores.itemFieldDefinitions,
+      ))) return false;
       if (categoryFilter && catalogItem?.categoryName !== categoryFilter) return false;
       return true;
     });
@@ -115,7 +130,7 @@ export default function RestockActionCenter({
         : String(a ?? "").localeCompare(String(b ?? ""), undefined, { numeric: true });
       return sort.direction === "asc" ? comparison : -comparison;
     });
-  }, [planning.items, productGuid, selectedBom, search, health, obsoleteOnly, groupFilter, categoryFilter, catalogByGuid, sort]);
+  }, [planning.items, productGuid, selectedBom, search, health, obsoleteOnly, groupFilter, categoryFilter, catalogByGuid, sort, stores.itemFieldDefinitions]);
 
   function toggleSort(key: keyof RestockPlanningItem) {
     setSort((current) => current.key === key
@@ -173,10 +188,10 @@ export default function RestockActionCenter({
   const obsoleteNeedsRestock = planning.items.filter((item) => item.catalogStatus === "OBSOLETE" && item.targetStock === 0).length;
   return (
     <div className="planning-section-stack">
-      <div className={`freshness-banner ${planning.freshness.tallyStale ? "freshness-banner--warning" : ""}`}>
+      {/* <div className={`freshness-banner ${planning.freshness.tallyStale ? "freshness-banner--warning" : ""}`}>
         <strong>{planning.freshness.tallyStale ? "Cached Tally data" : "Planning data current"}</strong>
         <span>{planning.freshness.message}</span>
-      </div>
+      </div> */}
 
       <section className="action-card-grid">
         <button className="action-card action-card--critical" type="button" onClick={() => setHealth("CRITICAL")}><span>Critical shortages</span><strong>{planning.summary.critical}</strong></button>
@@ -197,21 +212,21 @@ export default function RestockActionCenter({
             const bom = planning.boms.find((entry) => entry.productTallyGuid === guid && entry.status === "ACTIVE");
             const first = planning.items.find((item) => item.tallyItemGuid === bom?.lines[0]?.componentTallyGuid);
             if (first) choose(first);
-          }}><option value="">Choose a Finished Product…</option>{finishedProducts.map((item) => <option key={item.tallyGuid} value={item.tallyGuid}>{item.name} · {[item.primaryGroupName, item.secondaryGroupName].filter(Boolean).join(" › ") || "Ungrouped"}</option>)}</select>
+          }}><option value="">Choose a Finished Product…</option>{finishedProducts.map((item) => <option key={item.tallyGuid} value={item.tallyGuid}>{item.qualifiedName}</option>)}</select>
           <select aria-label="Filter by status" value={health} onChange={(event) => { setHealth(event.target.value); setObsoleteOnly(false); }}><option value="">All statuses</option>{Object.entries(healthLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select>
-          <GroupFilterDropdown ariaLabel="Filter by Stock Group" tree={groupTree} value={groupFilter} onChange={setGroupFilter} />
+          <GroupFilterDropdown ariaLabel="Filter by Stock Group" tree={groupTree} value={groupFilter.path} onChange={(path, node) => setGroupFilter(groupFilterValueFromNode(path, node))} />
           <select aria-label="Filter by Stock Category" value={categoryFilter} onChange={(event) => setCategoryFilter(event.target.value)}>
             <option value="">All Stock Categories</option>
             {categoryOptions.map((name) => <option key={name} value={name}>{name}</option>)}
           </select>
-          <button className="button button--secondary" type="button" onClick={() => { setSearch(""); setProductGuid(""); setHealth(""); setObsoleteOnly(false); setGroupFilter([]); setCategoryFilter(""); }}>Clear filters</button>
+          <button className="button button--secondary" type="button" onClick={() => { setSearch(""); setProductGuid(""); setHealth(""); setObsoleteOnly(false); setGroupFilter({ path: [], groupDepth: 0 }); setCategoryFilter(""); }}>Clear filters</button>
         </div>
         <div className="table-scroll planning-restock-table"><table>
           <thead><tr><th>{sortLabel("Status", "health")}</th><th className="stock-item-column">{sortLabel("Stock Item", "itemName")}</th><th className="numeric">{sortLabel("Currently In Bin", "onHand")}</th><th className="numeric">{sortLabel("Available to Use", "available")}</th><th className="numeric">{sortLabel("Incoming", "incoming")}</th><th className="numeric">{sortLabel("Reserved", "reserved")}</th><th className="numeric">{sortLabel("Service", "serviceReserve")}</th><th className="numeric">{sortLabel("Projected", "projected")}</th><th className="numeric">{sortLabel("Reorder", "reorderPoint")}</th><th className="numeric">{sortLabel("Target", "targetStock")}</th><th className="numeric">{sortLabel("Suggested order", "suggestedOrderQuantity")}</th></tr></thead>
           <tbody>
             {filtered.map((item) => <tr key={item.tallyItemGuid} className={selectedGuid === item.tallyItemGuid ? "selected-row" : ""} onClick={() => choose(item)}>
               <td><span className={`planning-health planning-health--${item.health.toLocaleLowerCase().replaceAll("_", "-")}`}>{healthLabels[item.health]}</span></td>
-              <td className="stock-item-column"><strong>{item.itemName}</strong><small className="table-subtext">{[item.primaryGroupName, item.secondaryGroupName].filter(Boolean).join(" › ") || "No group"}{item.catalogSource === "LOCAL" ? " · Local-only" : ""}</small></td>
+              <td className="stock-item-column"><strong>{item.itemName}</strong><small className="table-subtext">{item.groupPath.join(" › ") || "No group"}{item.catalogSource === "LOCAL" ? " · Local-only" : ""}</small></td>
               <td className="numeric">{item.onHand}</td>
               <td className="numeric">{item.available}</td>
               <td className="numeric">{item.incoming}</td>

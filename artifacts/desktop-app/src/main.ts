@@ -31,6 +31,7 @@ import {
   normalizeSaveDeploymentInput,
   productionServerUrl,
   readDeploymentConfig,
+  renameComputer,
   saveDeploymentConfig,
   testProductionServer,
   type DeploymentConfig,
@@ -54,6 +55,10 @@ const DEFAULT_PORT = 5000;
 const AUTOMATIC_BACKUP_INTERVAL_MS = 2 * 60 * 60 * 1000;
 const developmentRendererUrl = process.env.ELECTRON_RENDERER_URL;
 let deploymentConfig: DeploymentConfig | null = null;
+
+function currentComputerName(): string {
+  return deploymentConfig?.computerName || os.hostname();
+}
 
 function applicationIconPath(): string {
   return app.isPackaged
@@ -186,7 +191,8 @@ async function startApi(): Promise<DesktopInfo> {
       const token = String(request.header("x-inventory-session") ?? request.header("authorization") ?? "")
         .replace(/^Bearer\s+/i, "")
         .trim();
-      operationsService?.requireActor(token, permission);
+      const computerName = String(request.header("x-inventory-computer-name") ?? "").trim();
+      operationsService?.requireActor(token, permission, computerName);
       next();
     } catch (error) {
       next(error);
@@ -204,25 +210,25 @@ async function startApi(): Promise<DesktopInfo> {
       String(request.body?.deviceLabel ?? ""),
     ));
   });
-  desktopApi.post("/api/scanners/pairing", requireHttpPermission("SETTINGS_MANAGE"), (request, response) => {
+  desktopApi.post("/api/scanners/pairing", requireHttpPermission("SCANNER_PAIRING_MANAGE"), (request, response) => {
     response.status(201).json(operationsService!.createScannerPairing(
       String(request.body?.label ?? ""),
       operationsService!.requireActor(
         String(request.header("x-inventory-session") ?? "").trim(),
-        "SETTINGS_MANAGE",
+        "SCANNER_PAIRING_MANAGE",
       ),
     ));
   });
-  desktopApi.get("/api/scanners", requireHttpPermission("SETTINGS_MANAGE"), (request, response) => {
+  desktopApi.get("/api/scanners", requireHttpPermission("SCANNER_PAIRING_MANAGE"), (request, response) => {
     response.json(operationsService!.listScannerDevices(operationsService!.requireActor(
       String(request.header("x-inventory-session") ?? "").trim(),
-      "SETTINGS_MANAGE",
+      "SCANNER_PAIRING_MANAGE",
     )));
   });
-  desktopApi.delete("/api/scanners/:deviceId", requireHttpPermission("SETTINGS_MANAGE"), (request, response) => {
+  desktopApi.delete("/api/scanners/:deviceId", requireHttpPermission("SCANNER_PAIRING_MANAGE"), (request, response) => {
     operationsService!.revokeScannerDevice(String(request.params.deviceId ?? ""), operationsService!.requireActor(
       String(request.header("x-inventory-session") ?? "").trim(),
-      "SETTINGS_MANAGE",
+      "SCANNER_PAIRING_MANAGE",
     ));
     response.status(204).end();
   });
@@ -271,6 +277,7 @@ async function startApi(): Promise<DesktopInfo> {
     }
     const summary = storesService.sync(snapshot);
     const orderImport = planningService!.importTallySalesOrders(snapshot.salesOrders ?? [], actor);
+    planningService!.importTallySalesOrderAggregates(snapshot.salesOrders ?? [], actor);
     operationsService?.database.reconcileLegacyLots();
     response.json({ snapshot, summary, orderImport, state: storesService.getState() });
   });
@@ -347,7 +354,7 @@ async function startApi(): Promise<DesktopInfo> {
   return {
     appVersion: app.getVersion(),
     apiBaseUrl: `http://127.0.0.1:${port}`,
-    computerName: os.hostname(),
+    computerName: deploymentConfig?.computerName || os.hostname(),
     deploymentRole: "PRODUCTION_SERVER",
     tallyComputerHost: deploymentConfig?.tallyHost || process.env.INVENTORY_TALLY_HOST?.trim() || "accounts",
     dataDirectory,
@@ -428,10 +435,45 @@ async function printHtmlDocument(html: string): Promise<PrintResult> {
   }
 }
 
+/** Same offscreen-BrowserWindow lifecycle as printHtmlDocument(), but renders to a PDF the user saves instead of sending to a printer. */
+async function printHtmlToPdf(html: string, suggestedName: string): Promise<{ savedPath: string | null }> {
+  const saveDialog = await dialog.showSaveDialog(mainWindow ?? undefined as never, {
+    title: "Save as PDF",
+    defaultPath: suggestedName.endsWith(".pdf") ? suggestedName : `${suggestedName}.pdf`,
+    filters: [{ name: "PDF", extensions: ["pdf"] }],
+  });
+  if (saveDialog.canceled || !saveDialog.filePath) return { savedPath: null };
+
+  const temporaryDirectory = await mkdtemp(path.join(os.tmpdir(), "inventory-scanner-pdf-"));
+  const sourceFilePath = path.join(temporaryDirectory, "document.html");
+  await writeFile(sourceFilePath, html, "utf8");
+
+  const pdfWindow = new BrowserWindow({
+    show: false,
+    parent: mainWindow ?? undefined,
+    webPreferences: {
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true,
+      javascript: false,
+    },
+  });
+
+  try {
+    await pdfWindow.loadFile(sourceFilePath);
+    const pdfBuffer = await pdfWindow.webContents.printToPDF({ printBackground: true });
+    await writeFile(saveDialog.filePath, pdfBuffer);
+    return { savedPath: saveDialog.filePath };
+  } finally {
+    if (!pdfWindow.isDestroyed()) pdfWindow.destroy();
+    await rm(temporaryDirectory, { recursive: true, force: true });
+  }
+}
+
 function registerIpcHandlers(): void {
   const requireActor = (token: unknown, permission?: Permission) => {
     if (!operationsService) throw new Error("The inventory operations service is unavailable.");
-    return operationsService.requireActor(String(token ?? ""), permission);
+    return operationsService.requireActor(String(token ?? ""), permission, currentComputerName());
   };
 
   ipcMain.handle("desktop:get-info", () => {
@@ -441,15 +483,15 @@ function registerIpcHandlers(): void {
 
   ipcMain.handle("auth:state", (_event, token: unknown) => {
     if (!operationsService) throw new Error("The inventory operations service is unavailable.");
-    return operationsService.authState(String(token ?? ""));
+    return operationsService.authState(String(token ?? ""), currentComputerName());
   });
   ipcMain.handle("auth:bootstrap", (_event, input: unknown) => {
     if (!operationsService) throw new Error("The inventory operations service is unavailable.");
-    return operationsService.bootstrapAdmin(input as never);
+    return operationsService.bootstrapAdmin(input as never, currentComputerName());
   });
   ipcMain.handle("auth:login", (_event, input: unknown) => {
     if (!operationsService) throw new Error("The inventory operations service is unavailable.");
-    return operationsService.login(input as never);
+    return operationsService.login(input as never, currentComputerName());
   });
   ipcMain.handle("auth:update-email", (_event, token: unknown, input: unknown) => {
     if (!operationsService) throw new Error("The inventory operations service is unavailable.");
@@ -465,7 +507,7 @@ function registerIpcHandlers(): void {
   });
   ipcMain.handle("auth:resume", (_event, token: unknown) => {
     if (!operationsService) throw new Error("The inventory operations service is unavailable.");
-    return operationsService.resume(String(token ?? ""));
+    return operationsService.resume(String(token ?? ""), currentComputerName());
   });
   ipcMain.handle("auth:logout", (_event, token: unknown) => {
     if (!operationsService) throw new Error("The inventory operations service is unavailable.");
@@ -473,15 +515,15 @@ function registerIpcHandlers(): void {
   });
   ipcMain.handle("scanners:create-pairing", (_event, token: unknown, label: unknown) => {
     if (!operationsService) throw new Error("Scanner pairing is unavailable.");
-    return operationsService.createScannerPairing(String(label ?? ""), requireActor(token, "SETTINGS_MANAGE"));
+    return operationsService.createScannerPairing(String(label ?? ""), requireActor(token, "SCANNER_PAIRING_MANAGE"));
   });
   ipcMain.handle("scanners:list", (_event, token: unknown) => {
     if (!operationsService) throw new Error("Scanner pairing is unavailable.");
-    return operationsService.listScannerDevices(requireActor(token, "SETTINGS_MANAGE"));
+    return operationsService.listScannerDevices(requireActor(token, "SCANNER_PAIRING_MANAGE"));
   });
   ipcMain.handle("scanners:revoke", (_event, token: unknown, deviceId: unknown) => {
     if (!operationsService) throw new Error("Scanner pairing is unavailable.");
-    operationsService.revokeScannerDevice(String(deviceId ?? ""), requireActor(token, "SETTINGS_MANAGE"));
+    operationsService.revokeScannerDevice(String(deviceId ?? ""), requireActor(token, "SCANNER_PAIRING_MANAGE"));
   });
 
   ipcMain.handle("desktop:print-html", async (_event, token: unknown, html: unknown) => {
@@ -543,6 +585,7 @@ function registerIpcHandlers(): void {
     const summary = storesService.sync(snapshot, actor);
     const orderImport = planningService?.importTallySalesOrders(snapshot.salesOrders ?? [], actor)
       ?? { imported: 0, skipped: 0, unmatched: 0 };
+    planningService?.importTallySalesOrderAggregates(snapshot.salesOrders ?? [], actor);
     operationsService?.database.reconcileLegacyLots();
     return { snapshot, summary, orderImport, state: storesService.getState() };
   });
@@ -559,6 +602,18 @@ function registerIpcHandlers(): void {
   ipcMain.handle("stores:delete-local-stock-item", (_event, token: unknown, tallyItemGuid: unknown) => {
     if (!storesService) throw new Error("The Local Stores Database is unavailable.");
     return storesService.deleteStockItem({ tallyItemGuid: String(tallyItemGuid ?? "") }, requireActor(token, "CATALOG_MANAGE"));
+  });
+  ipcMain.handle("stores:save-item-field-definition", (_event, token: unknown, input: unknown) => {
+    if (!storesService) throw new Error("The Local Stores Database is unavailable.");
+    return storesService.saveItemFieldDefinition(input as never, requireActor(token, "CATALOG_MANAGE"));
+  });
+  ipcMain.handle("stores:delete-item-field-definition", (_event, token: unknown, fieldId: unknown) => {
+    if (!storesService) throw new Error("The Local Stores Database is unavailable.");
+    return storesService.deleteItemFieldDefinition(String(fieldId ?? ""), requireActor(token, "CATALOG_MANAGE"));
+  });
+  ipcMain.handle("stores:reorder-item-field-definitions", (_event, token: unknown, orderedIds: unknown) => {
+    if (!storesService) throw new Error("The Local Stores Database is unavailable.");
+    return storesService.reorderItemFieldDefinitions(Array.isArray(orderedIds) ? orderedIds.map(String) : [], requireActor(token, "CATALOG_MANAGE"));
   });
   ipcMain.handle("stores:create-catalog-group", (_event, token: unknown, input: unknown) => {
     if (!storesService) throw new Error("The Local Stores Database is unavailable.");
@@ -580,9 +635,13 @@ function registerIpcHandlers(): void {
     if (!storesService) throw new Error("The Local Stores Database is unavailable.");
     return storesService.setCatalogStatus(input as never, requireActor(token, "CATALOG_MANAGE"));
   });
-  ipcMain.handle("stores:set-catalog-visibility", (_event, token: unknown, input: unknown) => {
+  ipcMain.handle("stores:set-group-catalog-role", (_event, token: unknown, input: unknown) => {
     if (!storesService) throw new Error("The Local Stores Database is unavailable.");
-    return storesService.setCatalogVisibility(input as never, requireActor(token, "CATALOG_MANAGE"));
+    return storesService.setGroupCatalogRole(input as never, requireActor(token, "CATALOG_MANAGE"));
+  });
+  ipcMain.handle("stores:set-catalog-role", (_event, token: unknown, input: unknown) => {
+    if (!storesService) throw new Error("The Local Stores Database is unavailable.");
+    return storesService.setCatalogRole(input as never, requireActor(token, "CATALOG_MANAGE"));
   });
   ipcMain.handle("stores:rename-stock-item", (_event, token: unknown, input: unknown) => {
     if (!storesService) throw new Error("The Local Stores Database is unavailable.");
@@ -759,10 +818,112 @@ function registerIpcHandlers(): void {
     if (!planningService) throw new Error("The Planning service is unavailable.");
     return planningService.exportRestock(input as never, requireActor(token, "RESTOCK_MANAGE"));
   });
+  ipcMain.handle("planning:add-sales-order-fulfilment-line", (_event, token: unknown, input: unknown) => {
+    if (!planningService) throw new Error("The Planning service is unavailable.");
+    return planningService.addSalesOrderFulfilmentLine(input as never, requireActor(token, "SALES_ORDER_EDIT_CRF"));
+  });
+  ipcMain.handle("planning:advance-fulfilment-line-stage", (_event, token: unknown, fulfilmentLineId: unknown, targetStage: unknown) => {
+    if (!planningService) throw new Error("The Planning service is unavailable.");
+    return planningService.advanceFulfilmentLineStage(String(fulfilmentLineId ?? ""), String(targetStage ?? ""), requireActor(token, "SALES_ORDER_LINE_PROGRESS"));
+  });
+  ipcMain.handle("planning:assign-resale-supplier", (_event, token: unknown, fulfilmentLineId: unknown, supplierId: unknown) => {
+    if (!planningService) throw new Error("The Planning service is unavailable.");
+    return planningService.assignResaleSupplier(String(fulfilmentLineId ?? ""), Number(supplierId), requireActor(token, "SALES_ORDER_EDIT_CRF"));
+  });
+  ipcMain.handle("planning:set-fulfilment-line-service-done", (_event, token: unknown, fulfilmentLineId: unknown, done: unknown) => {
+    if (!planningService) throw new Error("The Planning service is unavailable.");
+    return planningService.setFulfilmentLineServiceDone(String(fulfilmentLineId ?? ""), Boolean(done), requireActor(token, "SALES_ORDER_LINE_PROGRESS"));
+  });
+  ipcMain.handle("planning:request-po-approval", (_event, token: unknown, salesOrderId: unknown) => {
+    if (!planningService) throw new Error("The Planning service is unavailable.");
+    return planningService.requestPoApproval(String(salesOrderId ?? ""), requireActor(token, "SALES_ORDER_APPROVE_PO"));
+  });
+  ipcMain.handle("planning:set-sales-order-due-date", (_event, token: unknown, salesOrderId: unknown, dueDate: unknown) => {
+    if (!planningService) throw new Error("The Planning service is unavailable.");
+    return planningService.setSalesOrderDueDate(String(salesOrderId ?? ""), String(dueDate ?? ""), requireActor(token, "SALES_ORDER_EDIT_CRF"));
+  });
+  ipcMain.handle("planning:set-sales-order-hold-status", (_event, token: unknown, salesOrderId: unknown, holdStatus: unknown) => {
+    if (!planningService) throw new Error("The Planning service is unavailable.");
+    return planningService.setSalesOrderHoldStatus(String(salesOrderId ?? ""), holdStatus as never, requireActor(token, "SALES_ORDER_EDIT_CRF"));
+  });
+  ipcMain.handle("planning:set-fulfilment-line-hold-status", (_event, token: unknown, fulfilmentLineId: unknown, holdStatus: unknown) => {
+    if (!planningService) throw new Error("The Planning service is unavailable.");
+    return planningService.setFulfilmentLineHoldStatus(String(fulfilmentLineId ?? ""), holdStatus as never, requireActor(token, "SALES_ORDER_LINE_PROGRESS"));
+  });
+  ipcMain.handle("planning:submit-crf-for-approval", (_event, token: unknown, salesOrderId: unknown) => {
+    if (!planningService) throw new Error("The Planning service is unavailable.");
+    return planningService.submitCrfForApproval(String(salesOrderId ?? ""), requireActor(token, "SALES_ORDER_SUBMIT_CRF"));
+  });
+  ipcMain.handle("planning:decide-approval", (_event, token: unknown, requestId: unknown, decision: unknown, comment: unknown) => {
+    if (!planningService) throw new Error("The Planning service is unavailable.");
+    return planningService.decideApproval(String(requestId ?? ""), decision as "APPROVE" | "REJECT", String(comment ?? ""), requireActor(token));
+  });
+  ipcMain.handle("planning:save-checklist-template", (_event, token: unknown, input: unknown) => {
+    if (!planningService) throw new Error("The Planning service is unavailable.");
+    return planningService.saveChecklistTemplate(input as never, requireActor(token, "SALES_ORDER_CHECKLIST_CONFIGURE"));
+  });
+  ipcMain.handle("planning:waive-checklist-requirement", (_event, token: unknown, salesOrderId: unknown, requirementId: unknown, reason: unknown) => {
+    if (!planningService) throw new Error("The Planning service is unavailable.");
+    return planningService.waiveChecklistRequirement(String(salesOrderId ?? ""), String(requirementId ?? ""), String(reason ?? ""), requireActor(token, "SALES_ORDER_CHECKLIST_WAIVE"));
+  });
+  ipcMain.handle("planning:get-checklist-results-for-order", (_event, token: unknown, salesOrderId: unknown) => {
+    if (!planningService) throw new Error("The Planning service is unavailable.");
+    return planningService.getChecklistResultsForOrder(String(salesOrderId ?? ""), requireActor(token, "SALES_ORDER_VIEW"));
+  });
+  ipcMain.handle("planning:advance-sales-order-stage", (_event, token: unknown, orderId: unknown, targetStage: unknown) => {
+    if (!planningService) throw new Error("The Planning service is unavailable.");
+    return planningService.advanceSalesOrderStage(String(orderId ?? ""), targetStage as never, requireActor(token, "SALES_ORDER_EDIT_CRF"));
+  });
+  ipcMain.handle("planning:get-crf-html", (_event, token: unknown, revisionId: unknown) => {
+    if (!planningService) throw new Error("The Planning service is unavailable.");
+    return planningService.getCrfHtml(String(revisionId ?? ""), requireActor(token, "SALES_ORDER_PRINT_CRF"));
+  });
+  ipcMain.handle("planning:apply-source-amendment", (_event, token: unknown, amendmentId: unknown) => {
+    if (!planningService) throw new Error("The Planning service is unavailable.");
+    return planningService.applySourceAmendment(String(amendmentId ?? ""), requireActor(token, "SALES_ORDER_APPROVE_PO"));
+  });
+  ipcMain.handle("planning:request-crf-reapproval", (_event, token: unknown, salesOrderId: unknown) => {
+    if (!planningService) throw new Error("The Planning service is unavailable.");
+    return planningService.requestCrfReapproval(String(salesOrderId ?? ""), requireActor(token, "SALES_ORDER_SUBMIT_CRF"));
+  });
+  ipcMain.handle("desktop:print-html-to-pdf", async (_event, token: unknown, html: unknown, suggestedName: unknown) => {
+    requireActor(token, "SALES_ORDER_PRINT_CRF");
+    return printHtmlToPdf(printableHtml(html), String(suggestedName ?? "CRF.pdf"));
+  });
 
   ipcMain.handle("operations:get-state", (_event, token: unknown) => {
     if (!operationsService) throw new Error("The inventory operations service is unavailable.");
     return operationsService.getState(requireActor(token, "INVENTORY_VIEW"));
+  });
+  ipcMain.handle("operations:list-roles", () => {
+    if (!operationsService) throw new Error("The inventory operations service is unavailable.");
+    return operationsService.listRoles();
+  });
+  ipcMain.handle("operations:create-role", (_event, token: unknown, name: unknown) => {
+    if (!operationsService) throw new Error("The inventory operations service is unavailable.");
+    return operationsService.createRole(String(name ?? ""), requireActor(token, "AUTH_MANAGE_USERS"));
+  });
+  ipcMain.handle("operations:get-role-permissions", (_event, token: unknown) => {
+    if (!operationsService) throw new Error("The inventory operations service is unavailable.");
+    return operationsService.getRolePermissions(requireActor(token, "AUTH_MANAGE_USERS"));
+  });
+  ipcMain.handle("operations:set-role-permission", (_event, token: unknown, input: unknown) => {
+    if (!operationsService) throw new Error("The inventory operations service is unavailable.");
+    const { roleName, permission, enabled } = (input ?? {}) as { roleName?: unknown; permission?: unknown; enabled?: unknown };
+    return operationsService.setRolePermission(
+      String(roleName ?? ""), permission as Permission, Boolean(enabled), requireActor(token, "AUTH_MANAGE_USERS"),
+    );
+  });
+  ipcMain.handle("operations:get-computer-restrictions", (_event, token: unknown) => {
+    if (!operationsService) throw new Error("The inventory operations service is unavailable.");
+    return operationsService.getComputerRestrictions(requireActor(token, "AUTH_MANAGE_USERS"));
+  });
+  ipcMain.handle("operations:set-computer-restriction", (_event, token: unknown, input: unknown) => {
+    if (!operationsService) throw new Error("The inventory operations service is unavailable.");
+    const { permission, computerNames } = (input ?? {}) as { permission?: unknown; computerNames?: unknown };
+    return operationsService.setComputerRestriction(
+      permission as Permission, Array.isArray(computerNames) ? computerNames.map(String) : [], requireActor(token, "AUTH_MANAGE_USERS"),
+    );
   });
   const operation = (channel: string, permission: Permission | undefined, action: (input: never, actor: ReturnType<typeof requireActor>) => unknown) => {
     ipcMain.handle(channel, (_event, token: unknown, input: unknown) => action(input as never, requireActor(token, permission)));
@@ -811,6 +972,7 @@ function registerDeploymentIpcHandlers(): void {
   ipcMain.handle("deployment:test-production", (_event, input: unknown) => testProductionServer(input));
   ipcMain.handle("deployment:save", async (_event, value: unknown) => {
     const input = normalizeSaveDeploymentInput(value);
+    if (input.computerName) await renameComputer(input.computerName);
     if (input.configureWindowsFirewall) await configureWindowsFirewall(input);
     deploymentConfig = await saveDeploymentConfig(app.getPath("userData"), input);
     app.relaunch();
@@ -894,7 +1056,7 @@ async function bootstrap(): Promise<void> {
     desktopInfo = {
       appVersion: app.getVersion(),
       apiBaseUrl: "",
-      computerName: os.hostname(),
+      computerName: deploymentConfig?.computerName || os.hostname(),
       deploymentRole: "UNCONFIGURED",
       tallyComputerHost: deploymentConfig.tallyHost,
       dataDirectory: "",
@@ -912,7 +1074,7 @@ async function bootstrap(): Promise<void> {
     desktopInfo = {
       appVersion: app.getVersion(),
       apiBaseUrl: remoteServerUrl,
-      computerName: os.hostname(),
+      computerName: deploymentConfig?.computerName || os.hostname(),
       deploymentRole: "LAN_CLIENT",
       tallyComputerHost: deploymentConfig.tallyHost,
       dataDirectory: "",

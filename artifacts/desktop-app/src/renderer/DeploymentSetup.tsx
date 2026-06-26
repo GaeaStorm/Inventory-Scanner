@@ -11,6 +11,7 @@ export default function DeploymentSetup({ state, onCancel }: Props) {
   const [role, setRole] = useState<SaveDeploymentInput["role"]>(
     state.role === "LAN_CLIENT" ? "LAN_CLIENT" : "PRODUCTION_SERVER",
   );
+  const [computerName, setComputerName] = useState(state.computerName || "");
   const [productionHost, setProductionHost] = useState(state.productionHost || "production");
   const [inventoryPort, setInventoryPort] = useState(state.inventoryPort || 5000);
   const [tallyHost, setTallyHost] = useState(state.tallyHost || "accounts");
@@ -28,6 +29,7 @@ export default function DeploymentSetup({ state, onCancel }: Props) {
 
   const input: SaveDeploymentInput = {
     role,
+    computerName,
     productionHost,
     inventoryPort,
     tallyHost,
@@ -78,6 +80,15 @@ export default function DeploymentSetup({ state, onCancel }: Props) {
 
         {error && <div className="alert alert--error">{error}</div>}
         {notice && <div className="alert alert--success">{notice}</div>}
+
+        <div className="settings-form-grid deployment-form">
+          <label>This computer&rsquo;s name on the LAN
+            <input value={computerName} onChange={(event) => setComputerName(event.target.value)} placeholder={state.computerName || "production"} />
+          </label>
+        </div>
+        {computerName.trim() && computerName.trim().toLocaleLowerCase() !== state.computerName.toLocaleLowerCase() && (
+          <p className="table-footnote">Changing this renames the Windows computer itself, so other computers can find it on the LAN by this name &mdash; the same way the Production/Tally computer name fields below work. Windows will ask for Administrator approval, and the computer needs a restart before the new name is visible on the network.</p>
+        )}
 
         <div className="deployment-role-grid">
           <button className={`deployment-role ${role === "PRODUCTION_SERVER" ? "deployment-role--selected" : ""}`} type="button" onClick={() => setRole("PRODUCTION_SERVER")}>

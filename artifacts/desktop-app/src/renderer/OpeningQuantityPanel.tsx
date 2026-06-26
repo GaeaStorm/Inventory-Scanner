@@ -85,7 +85,7 @@ export default function OpeningQuantityPanel(props: {
             <option value="">Select Stock Item…</option>
             {selectableItems.map((item) => (
               <option key={item.tallyGuid} value={item.tallyGuid}>
-                {item.name} · local {item.localAvailableQuantity} · Tally {item.tallyClosingQuantity}
+                {item.qualifiedName} · local {item.localAvailableQuantity} · Tally {item.tallyClosingQuantity}
               </option>
             ))}
           </select>

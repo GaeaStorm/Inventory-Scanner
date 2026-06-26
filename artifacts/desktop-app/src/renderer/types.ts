@@ -1,4 +1,4 @@
-export type AppTab = "tracker" | "operations" | "dashboard" | "administration" | "qr" | "settings" | "tally";
+export type AppTab = "operations" | "dashboard" | "administration" | "settings" | "tally";
 
 export interface DesktopInfo {
   appVersion: string;
@@ -18,6 +18,7 @@ export type DeploymentRole = "UNCONFIGURED" | "PRODUCTION_SERVER" | "LAN_CLIENT"
 export interface DeploymentState {
   configured: boolean;
   role: DeploymentRole;
+  computerName: string;
   productionHost: string;
   inventoryPort: number;
   tallyHost: string;
@@ -29,6 +30,7 @@ export interface DeploymentState {
 
 export interface SaveDeploymentInput {
   role: Exclude<DeploymentRole, "UNCONFIGURED">;
+  computerName: string;
   productionHost: string;
   inventoryPort: number;
   tallyHost: string;
@@ -79,6 +81,7 @@ export type {
   BulkVendorReceiptInput,
   BulkVendorReceiptLineInput,
   BulkVendorReceiptResult,
+  CatalogRole,
   ConfirmImportInput,
   CreateLocalStockItemInput,
   CreateCatalogGroupInput,
@@ -91,7 +94,8 @@ export type {
   ReviewDecisionInput,
   SaveBoxInput,
   SetCatalogStatusInput,
-  SetCatalogVisibilityInput,
+  SetCatalogRoleInput,
+  SetGroupRoleInput,
   GeneratedExportFile,
   StoresBackupResult,
   StoresBox,
@@ -124,6 +128,24 @@ export type {
   SaveProductOrderWorkflowStateInput,
   PlanningExportInput,
   PlanningExportResult,
+  SalesOrder,
+  SalesOrderSourceLine,
+  SalesOrderFulfilmentLine,
+  SalesOrderStage,
+  SalesOrderSourceAmendment,
+  ItemFamily,
+  FulfilmentConsumptionMode,
+  SaveSalesOrderFulfilmentLineInput,
+  ApprovalRequest,
+  ApprovalDecision,
+  ApprovalEntityType,
+  ApprovalRequestStatus,
+  ChecklistTemplate,
+  ChecklistResult,
+  ChecklistRequirementStatus,
+  SaveChecklistTemplateInput,
+  CrfPayload,
+  CrfRevision,
 } from "../planning/types";
 
 export type {

@@ -1,4 +1,10 @@
-export type UserRole = "STORE" | "ACCOUNTS" | "PRODUCTION" | "SALES" | "ADMIN";
+/**
+ * Admin-creatable, validated against the ops_roles table at write time
+ * (saveUser/createRole) rather than a fixed union — the 5 original names
+ * ("STORE" | "ACCOUNTS" | "PRODUCTION" | "SALES" | "ADMIN") still exist as
+ * seeded system roles, but custom roles are equally valid here.
+ */
+export type UserRole = string;
 
 export type Permission =
   | "AUTH_MANAGE_USERS"
@@ -14,6 +20,7 @@ export type Permission =
   | "SCRAP_STOCK"
   | "SYNC_EXCEPTION_RESOLVE"
   | "QR_MANAGE"
+  | "SCANNER_PAIRING_MANAGE"
   | "PURCHASING_MANAGE"
   | "TALLY_REVIEW"
   | "RESTOCK_VIEW"
@@ -25,7 +32,17 @@ export type Permission =
   | "CUSTOMER_RETURN_RECEIVE"
   | "TRANSACTION_REVERSE"
   | "SETTINGS_MANAGE"
-  | "INVENTORY_VIEW";
+  | "INVENTORY_VIEW"
+  | "SALES_ORDER_VIEW"
+  | "SALES_ORDER_APPROVE_PO"
+  | "SALES_ORDER_EDIT_CRF"
+  | "SALES_ORDER_SUBMIT_CRF"
+  | "SALES_ORDER_APPROVE_CRF_ACCOUNTS"
+  | "SALES_ORDER_APPROVE_CRF_SALES"
+  | "SALES_ORDER_CHECKLIST_CONFIGURE"
+  | "SALES_ORDER_CHECKLIST_WAIVE"
+  | "SALES_ORDER_LINE_PROGRESS"
+  | "SALES_ORDER_PRINT_CRF";
 
 export type StockCondition =
   | "AVAILABLE"
@@ -92,6 +109,10 @@ export interface ActorContext {
   displayName: string;
   auditIdentity: string;
   role: UserRole;
+  /** Resolved from the admin-configurable ops_role_permissions table at session/actor-resolution time. Absent only for actors never passed to requirePermission (e.g. audit-only contexts). */
+  permissions?: Permission[];
+  /** The configured LAN name of the computer the request originated from — the Production server's own name for local IPC, or the calling LAN client's name from a request header. Used to enforce per-computer permission restrictions. */
+  computerName?: string;
 }
 
 export interface AuthUser extends ActorContext {

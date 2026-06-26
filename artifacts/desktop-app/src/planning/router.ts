@@ -9,10 +9,14 @@ function tokenFrom(request: Request): string {
   return header.replace(/^Bearer\s+/i, "").trim();
 }
 
+function computerNameFrom(request: Request): string {
+  return (request.header("x-inventory-computer-name") ?? "").trim();
+}
+
 export function createPlanningRouter(service: PlanningService, operations: OperationsService): Router {
   const router = Router();
   const actor = (request: Request, permission?: Parameters<OperationsService["requireActor"]>[1]) =>
-    operations.requireActor(tokenFrom(request), permission);
+    operations.requireActor(tokenFrom(request), permission, computerNameFrom(request));
 
   router.get("/state", (request, response) => response.json(service.getState(actor(request, "RESTOCK_VIEW"))));
   router.post("/restock-policies", (request, response) => response.json(service.saveRestockPolicy(request.body, actor(request, "RESTOCK_MANAGE"))));
@@ -42,6 +46,58 @@ export function createPlanningRouter(service: PlanningService, operations: Opera
     service.deleteProductOrderFieldDefinition(request.params.fieldId, actor(request, "PRODUCT_ORDER_MANAGE")),
   ));
   router.post("/export", (request, response) => response.json(service.exportRestock(request.body, actor(request, "RESTOCK_MANAGE"))));
+
+  router.post("/sales-orders/fulfilment-lines", (request, response) => response.status(201).json(
+    service.addSalesOrderFulfilmentLine(request.body, actor(request, "SALES_ORDER_EDIT_CRF")),
+  ));
+  router.post("/sales-orders/fulfilment-lines/:fulfilmentLineId/stage", (request, response) => response.json(
+    service.advanceFulfilmentLineStage(request.params.fulfilmentLineId, request.body.stage, actor(request, "SALES_ORDER_LINE_PROGRESS")),
+  ));
+  router.post("/sales-orders/fulfilment-lines/:fulfilmentLineId/supplier", (request, response) => response.json(
+    service.assignResaleSupplier(request.params.fulfilmentLineId, Number(request.body.supplierId), actor(request, "SALES_ORDER_EDIT_CRF")),
+  ));
+  router.post("/sales-orders/fulfilment-lines/:fulfilmentLineId/service-done", (request, response) => response.json(
+    service.setFulfilmentLineServiceDone(request.params.fulfilmentLineId, Boolean(request.body.done), actor(request, "SALES_ORDER_LINE_PROGRESS")),
+  ));
+  router.post("/sales-orders/:orderId/stage", (request, response) => response.json(
+    service.advanceSalesOrderStage(request.params.orderId, request.body.stage, actor(request, "SALES_ORDER_EDIT_CRF")),
+  ));
+  router.post("/sales-orders/:orderId/request-po-approval", (request, response) => response.json(
+    service.requestPoApproval(request.params.orderId, actor(request, "SALES_ORDER_APPROVE_PO")),
+  ));
+  router.post("/sales-orders/:orderId/due-date", (request, response) => response.json(
+    service.setSalesOrderDueDate(request.params.orderId, request.body.dueDate ?? "", actor(request, "SALES_ORDER_EDIT_CRF")),
+  ));
+  router.post("/sales-orders/:orderId/hold-status", (request, response) => response.json(
+    service.setSalesOrderHoldStatus(request.params.orderId, request.body.holdStatus, actor(request, "SALES_ORDER_EDIT_CRF")),
+  ));
+  router.post("/sales-orders/fulfilment-lines/:fulfilmentLineId/hold-status", (request, response) => response.json(
+    service.setFulfilmentLineHoldStatus(request.params.fulfilmentLineId, request.body.holdStatus, actor(request, "SALES_ORDER_LINE_PROGRESS")),
+  ));
+  router.post("/sales-orders/:orderId/submit-crf", (request, response) => response.json(
+    service.submitCrfForApproval(request.params.orderId, actor(request, "SALES_ORDER_SUBMIT_CRF")),
+  ));
+  router.post("/approval-requests/:requestId/decisions", (request, response) => response.json(
+    service.decideApproval(request.params.requestId, request.body.decision, request.body.comment ?? "", actor(request)),
+  ));
+  router.post("/checklist-templates", (request, response) => response.status(201).json(
+    service.saveChecklistTemplate(request.body, actor(request, "SALES_ORDER_CHECKLIST_CONFIGURE")),
+  ));
+  router.post("/sales-orders/:orderId/checklist/:requirementId/waive", (request, response) => response.json(
+    service.waiveChecklistRequirement(request.params.orderId, request.params.requirementId, request.body.reason ?? "", actor(request, "SALES_ORDER_CHECKLIST_WAIVE")),
+  ));
+  router.get("/sales-orders/:orderId/checklist", (request, response) => response.json(
+    service.getChecklistResultsForOrder(request.params.orderId, actor(request, "SALES_ORDER_VIEW")),
+  ));
+  router.get("/crf-revisions/:revisionId/html", (request, response) => {
+    response.type("html").send(service.getCrfHtml(request.params.revisionId, actor(request, "SALES_ORDER_PRINT_CRF")));
+  });
+  router.post("/sales-orders/source-amendments/:amendmentId/apply", (request, response) => response.json(
+    service.applySourceAmendment(request.params.amendmentId, actor(request, "SALES_ORDER_APPROVE_PO")),
+  ));
+  router.post("/sales-orders/:orderId/request-crf-reapproval", (request, response) => response.json(
+    service.requestCrfReapproval(request.params.orderId, actor(request, "SALES_ORDER_SUBMIT_CRF")),
+  ));
 
   router.use((error: unknown, _request: Request, response: Response, _next: NextFunction) => {
     if (error instanceof DatabaseBusyError) {

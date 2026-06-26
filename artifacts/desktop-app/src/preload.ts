@@ -2,14 +2,17 @@ import { contextBridge, ipcRenderer } from "electron";
 
 let sessionToken = "";
 let remoteServerUrl = "";
+let localComputerName = "";
 let deploymentLoaded = false;
 
 async function getDeploymentState() {
   const state = await ipcRenderer.invoke("deployment:get-state") as {
     role: "UNCONFIGURED" | "PRODUCTION_SERVER" | "LAN_CLIENT";
     productionUrl: string;
+    computerName: string;
   };
   remoteServerUrl = state.role === "LAN_CLIENT" ? state.productionUrl.replace(/\/+$/, "") : "";
+  localComputerName = state.computerName ?? "";
   deploymentLoaded = true;
   return state;
 }
@@ -20,7 +23,7 @@ async function ensureDeploymentLoaded(): Promise<void> {
 
 async function authenticatedSession(channel: string, ...args: unknown[]) {
   await ensureDeploymentLoaded();
-  if (remoteServerUrl && channel === "desktop:print-html") {
+  if (remoteServerUrl && (channel === "desktop:print-html" || channel === "desktop:print-html-to-pdf")) {
     return ipcRenderer.invoke(channel, sessionToken, ...args);
   }
   if (remoteServerUrl) return remoteChannel(channel, args);
@@ -35,6 +38,7 @@ async function remoteRequest(path: string, init?: RequestInit) {
     headers: {
       "Content-Type": "application/json",
       ...(sessionToken ? { "X-Inventory-Session": sessionToken } : {}),
+      ...(localComputerName ? { "X-Inventory-Computer-Name": localComputerName } : {}),
       ...init?.headers,
     },
   });
@@ -48,6 +52,20 @@ function jsonBody(value: unknown): RequestInit {
   return { method: "POST", body: JSON.stringify(value ?? {}) };
 }
 
+async function remoteRequestText(path: string): Promise<string> {
+  await ensureDeploymentLoaded();
+  if (!remoteServerUrl) throw new Error("This computer is not configured as a LAN client.");
+  const response = await fetch(`${remoteServerUrl}${path}`, {
+    headers: {
+      ...(sessionToken ? { "X-Inventory-Session": sessionToken } : {}),
+      ...(localComputerName ? { "X-Inventory-Computer-Name": localComputerName } : {}),
+    },
+  });
+  const body = await response.text();
+  if (!response.ok) throw new Error(`Production server returned ${response.status}.`);
+  return body;
+}
+
 async function remoteChannel(channel: string, args: unknown[]) {
   const [first, second] = args;
   switch (channel) {
@@ -57,12 +75,16 @@ async function remoteChannel(channel: string, args: unknown[]) {
     case "scanners:revoke": return remoteRequest(`/api/scanners/${encodeURIComponent(String(first))}`, { method: "DELETE" });
     case "stores:create-local-stock-item": return remoteRequest("/api/stores/catalog/local-items", jsonBody(first));
     case "stores:delete-local-stock-item": return remoteRequest(`/api/stores/catalog/local-items/${encodeURIComponent(String(first))}`, { method: "DELETE" });
+    case "stores:save-item-field-definition": return remoteRequest("/api/stores/catalog/item-fields", jsonBody(first));
+    case "stores:delete-item-field-definition": return remoteRequest(`/api/stores/catalog/item-fields/${encodeURIComponent(String(first))}`, { method: "DELETE" });
+    case "stores:reorder-item-field-definitions": return remoteRequest("/api/stores/catalog/item-fields/reorder", jsonBody({ orderedIds: first }));
     case "stores:create-catalog-group": return remoteRequest("/api/stores/catalog/groups", jsonBody(first));
     case "stores:delete-catalog-group": return remoteRequest(`/api/stores/catalog/groups/${encodeURIComponent(String(first))}`, { method: "DELETE" });
     case "stores:create-stock-category": return remoteRequest("/api/stores/catalog/categories", jsonBody(first));
     case "stores:delete-stock-category": return remoteRequest(`/api/stores/catalog/categories/${encodeURIComponent(String(first))}`, { method: "DELETE" });
     case "stores:set-catalog-status": return remoteRequest("/api/stores/catalog/status", jsonBody(first));
-    case "stores:set-catalog-visibility": return remoteRequest("/api/stores/catalog/visibility", jsonBody(first));
+    case "stores:set-group-catalog-role": return remoteRequest("/api/stores/catalog/group-role", jsonBody(first));
+    case "stores:set-catalog-role": return remoteRequest("/api/stores/catalog/role", jsonBody(first));
     case "stores:rename-stock-item": return remoteRequest("/api/stores/catalog/rename", jsonBody(first));
     case "stores:export-catalog-cleanup": return remoteRequest("/api/stores/catalog/export-cleanup", jsonBody({}));
     case "stores:save-box": return remoteRequest("/api/stores/boxes", jsonBody(first));
@@ -94,9 +116,32 @@ async function remoteChannel(channel: string, args: unknown[]) {
     case "planning:save-product-order-field-definition": return remoteRequest("/api/planning/product-order-fields", jsonBody(first));
     case "planning:delete-product-order-field-definition": return remoteRequest(`/api/planning/product-order-fields/${encodeURIComponent(String(first))}`, { method: "DELETE" });
     case "planning:export-restock": return remoteRequest("/api/planning/export", jsonBody(first));
+    case "planning:add-sales-order-fulfilment-line": return remoteRequest("/api/planning/sales-orders/fulfilment-lines", jsonBody(first));
+    case "planning:advance-fulfilment-line-stage": return remoteRequest(`/api/planning/sales-orders/fulfilment-lines/${encodeURIComponent(String(first))}/stage`, jsonBody({ stage: second }));
+    case "planning:assign-resale-supplier": return remoteRequest(`/api/planning/sales-orders/fulfilment-lines/${encodeURIComponent(String(first))}/supplier`, jsonBody({ supplierId: second }));
+    case "planning:set-fulfilment-line-service-done": return remoteRequest(`/api/planning/sales-orders/fulfilment-lines/${encodeURIComponent(String(first))}/service-done`, jsonBody({ done: second }));
+    case "planning:request-po-approval": return remoteRequest(`/api/planning/sales-orders/${encodeURIComponent(String(first))}/request-po-approval`, jsonBody({}));
+    case "planning:set-sales-order-due-date": return remoteRequest(`/api/planning/sales-orders/${encodeURIComponent(String(first))}/due-date`, jsonBody({ dueDate: second }));
+    case "planning:set-sales-order-hold-status": return remoteRequest(`/api/planning/sales-orders/${encodeURIComponent(String(first))}/hold-status`, jsonBody({ holdStatus: second }));
+    case "planning:set-fulfilment-line-hold-status": return remoteRequest(`/api/planning/sales-orders/fulfilment-lines/${encodeURIComponent(String(first))}/hold-status`, jsonBody({ holdStatus: second }));
+    case "planning:submit-crf-for-approval": return remoteRequest(`/api/planning/sales-orders/${encodeURIComponent(String(first))}/submit-crf`, jsonBody({}));
+    case "planning:decide-approval": return remoteRequest(`/api/planning/approval-requests/${encodeURIComponent(String(first))}/decisions`, jsonBody({ decision: second, comment: args[2] }));
+    case "planning:save-checklist-template": return remoteRequest("/api/planning/checklist-templates", jsonBody(first));
+    case "planning:waive-checklist-requirement": return remoteRequest(`/api/planning/sales-orders/${encodeURIComponent(String(first))}/checklist/${encodeURIComponent(String(second))}/waive`, jsonBody({ reason: args[2] }));
+    case "planning:get-checklist-results-for-order": return remoteRequest(`/api/planning/sales-orders/${encodeURIComponent(String(first))}/checklist`);
+    case "planning:advance-sales-order-stage": return remoteRequest(`/api/planning/sales-orders/${encodeURIComponent(String(first))}/stage`, jsonBody({ stage: second }));
+    case "planning:apply-source-amendment": return remoteRequest(`/api/planning/sales-orders/source-amendments/${encodeURIComponent(String(first))}/apply`, jsonBody({}));
+    case "planning:request-crf-reapproval": return remoteRequest(`/api/planning/sales-orders/${encodeURIComponent(String(first))}/request-crf-reapproval`, jsonBody({}));
+    case "planning:get-crf-html": return remoteRequestText(`/api/planning/crf-revisions/${encodeURIComponent(String(first))}/html`);
     case "operations:get-state": return remoteRequest("/api/operations/state");
     case "operations:save-user": return remoteRequest("/api/operations/users", jsonBody(first));
     case "operations:reset-credential": return remoteRequest("/api/operations/users/reset-credential", jsonBody(first));
+    case "operations:list-roles": return remoteRequest("/api/operations/roles");
+    case "operations:create-role": return remoteRequest("/api/operations/roles", jsonBody({ name: first }));
+    case "operations:get-role-permissions": return remoteRequest("/api/operations/role-permissions");
+    case "operations:set-role-permission": return remoteRequest("/api/operations/role-permissions", jsonBody(first));
+    case "operations:get-computer-restrictions": return remoteRequest("/api/operations/computer-restrictions");
+    case "operations:set-computer-restriction": return remoteRequest("/api/operations/computer-restrictions", jsonBody(first));
     case "operations:transition-condition": return remoteRequest("/api/operations/conditions/transition", jsonBody(first));
     case "operations:create-fault": return remoteRequest("/api/operations/faults", jsonBody(first));
     case "operations:resolve-fault": return remoteRequest("/api/operations/faults/resolve", jsonBody(first));
@@ -206,12 +251,16 @@ contextBridge.exposeInMainWorld("desktop", {
     getState: () => authenticatedSession("stores:get-state"),
     createLocalStockItem: (input: unknown) => authenticatedSession("stores:create-local-stock-item", input),
     deleteLocalStockItem: (tallyItemGuid: string) => authenticatedSession("stores:delete-local-stock-item", tallyItemGuid),
+    saveItemFieldDefinition: (input: { label: string; required: boolean }) => authenticatedSession("stores:save-item-field-definition", input),
+    deleteItemFieldDefinition: (fieldId: string) => authenticatedSession("stores:delete-item-field-definition", fieldId),
+    reorderItemFieldDefinitions: (orderedIds: string[]) => authenticatedSession("stores:reorder-item-field-definitions", orderedIds),
     createCatalogGroup: (input: unknown) => authenticatedSession("stores:create-catalog-group", input),
     deleteCatalogGroup: (name: string) => authenticatedSession("stores:delete-catalog-group", name),
     createStockCategory: (input: unknown) => authenticatedSession("stores:create-stock-category", input),
     deleteStockCategory: (name: string) => authenticatedSession("stores:delete-stock-category", name),
     setCatalogStatus: (input: unknown) => authenticatedSession("stores:set-catalog-status", input),
-    setCatalogVisibility: (input: unknown) => authenticatedSession("stores:set-catalog-visibility", input),
+    setGroupCatalogRole: (input: { groupName: string; role: string }) => authenticatedSession("stores:set-group-catalog-role", input),
+    setCatalogRole: (input: { tallyItemGuid: string; role: string | null }) => authenticatedSession("stores:set-catalog-role", input),
     renameStockItem: (input: unknown) => authenticatedSession("stores:rename-stock-item", input),
     exportCatalogCleanup: () => authenticatedSession("stores:export-catalog-cleanup"),
     saveBox: (input: unknown) => authenticatedSession("stores:save-box", input),
@@ -249,11 +298,35 @@ contextBridge.exposeInMainWorld("desktop", {
     saveProductOrderFieldDefinition: (input: unknown) => authenticatedSession("planning:save-product-order-field-definition", input),
     deleteProductOrderFieldDefinition: (fieldId: string) => authenticatedSession("planning:delete-product-order-field-definition", fieldId),
     exportRestock: (input: unknown) => authenticatedSession("planning:export-restock", input),
+    addSalesOrderFulfilmentLine: (input: unknown) => authenticatedSession("planning:add-sales-order-fulfilment-line", input),
+    advanceFulfilmentLineStage: (fulfilmentLineId: string, targetStage: string) => authenticatedSession("planning:advance-fulfilment-line-stage", fulfilmentLineId, targetStage),
+    assignResaleSupplier: (fulfilmentLineId: string, supplierId: number) => authenticatedSession("planning:assign-resale-supplier", fulfilmentLineId, supplierId),
+    setFulfilmentLineServiceDone: (fulfilmentLineId: string, done: boolean) => authenticatedSession("planning:set-fulfilment-line-service-done", fulfilmentLineId, done),
+    requestPoApproval: (salesOrderId: string) => authenticatedSession("planning:request-po-approval", salesOrderId),
+    setSalesOrderDueDate: (salesOrderId: string, dueDate: string) => authenticatedSession("planning:set-sales-order-due-date", salesOrderId, dueDate),
+    setSalesOrderHoldStatus: (salesOrderId: string, holdStatus: "NONE" | "ON_HOLD" | "CANCELLED") => authenticatedSession("planning:set-sales-order-hold-status", salesOrderId, holdStatus),
+    setFulfilmentLineHoldStatus: (fulfilmentLineId: string, holdStatus: "NONE" | "ON_HOLD" | "CANCELLED") => authenticatedSession("planning:set-fulfilment-line-hold-status", fulfilmentLineId, holdStatus),
+    submitCrfForApproval: (salesOrderId: string) => authenticatedSession("planning:submit-crf-for-approval", salesOrderId),
+    decideApproval: (requestId: string, decision: "APPROVE" | "REJECT", comment: string) => authenticatedSession("planning:decide-approval", requestId, decision, comment),
+    saveChecklistTemplate: (input: unknown) => authenticatedSession("planning:save-checklist-template", input),
+    waiveChecklistRequirement: (salesOrderId: string, requirementId: string, reason: string) => authenticatedSession("planning:waive-checklist-requirement", salesOrderId, requirementId, reason),
+    getChecklistResultsForOrder: (salesOrderId: string) => authenticatedSession("planning:get-checklist-results-for-order", salesOrderId),
+    advanceSalesOrderStage: (orderId: string, targetStage: string) => authenticatedSession("planning:advance-sales-order-stage", orderId, targetStage),
+    applySourceAmendment: (amendmentId: string) => authenticatedSession("planning:apply-source-amendment", amendmentId),
+    requestCrfReapproval: (salesOrderId: string) => authenticatedSession("planning:request-crf-reapproval", salesOrderId),
+    getCrfHtml: (revisionId: string) => authenticatedSession("planning:get-crf-html", revisionId),
+    printCrfToPdf: (html: string, suggestedName: string) => authenticatedSession("desktop:print-html-to-pdf", html, suggestedName),
   },
   operations: {
     getState: () => authenticatedSession("operations:get-state"),
     saveUser: (input: unknown) => authenticatedSession("operations:save-user", input),
     resetCredential: (input: unknown) => authenticatedSession("operations:reset-credential", input),
+    listRoles: () => authenticatedSession("operations:list-roles"),
+    createRole: (name: string) => authenticatedSession("operations:create-role", name),
+    getRolePermissions: () => authenticatedSession("operations:get-role-permissions"),
+    setRolePermission: (input: { roleName: string; permission: string; enabled: boolean }) => authenticatedSession("operations:set-role-permission", input),
+    getComputerRestrictions: () => authenticatedSession("operations:get-computer-restrictions"),
+    setComputerRestriction: (input: { permission: string; computerNames: string[] }) => authenticatedSession("operations:set-computer-restriction", input),
     transitionCondition: (input: unknown) => authenticatedSession("operations:transition-condition", input),
     createFault: (input: unknown) => authenticatedSession("operations:create-fault", input),
     resolveFault: (input: unknown) => authenticatedSession("operations:resolve-fault", input),

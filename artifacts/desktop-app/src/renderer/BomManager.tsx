@@ -153,7 +153,7 @@ export default function BomManager({ planning, stores, onChanged, onStoresChange
           </div>
           {importDetails && <div className="import-summary"><strong>Spreadsheet loaded into this BOM draft</strong><span>{importDetails}</span></div>}
           <div className="form-grid form-grid--four">
-            <label>Product<select value={productGuid} onChange={(event) => setProductGuid(event.target.value)}><option value="">Select product…</option>{products.map((item) => <option key={item.tallyGuid} value={item.tallyGuid}>{item.name}{item.hasBom ? " · Tally BOM" : ""}</option>)}</select></label>
+            <label>Product<select value={productGuid} onChange={(event) => setProductGuid(event.target.value)}><option value="">Select product…</option>{products.map((item) => <option key={item.tallyGuid} value={item.tallyGuid}>{item.qualifiedName}{item.hasBom ? " · Tally BOM" : ""}</option>)}</select></label>
             <label>Version number<input type="number" min={1} step={1} value={versionNumber} onChange={(event) => setVersionNumber(event.target.value)} placeholder="Automatic" /></label>
             <label>Version label<input value={label} onChange={(event) => setLabel(event.target.value)} placeholder="e.g. Standard assembly" /></label>
             <label>Valid from<input type="date" value={validFrom} onChange={(event) => setValidFrom(event.target.value)} /></label>
@@ -163,7 +163,7 @@ export default function BomManager({ planning, stores, onChanged, onStoresChange
             {lines.map((line, index) => <div className="bom-line-editor__row" key={index}>
               <div className="bom-import-draft-component">
                 {line.importedComponentName && <small>Row {line.sourceRow}: {line.importedComponentName}{line.importedComponentType ? ` · ${line.importedComponentType}` : ""}</small>}
-                <select value={line.componentTallyGuid} onChange={(event) => setLines(lines.map((entry, rowIndex) => rowIndex === index ? { ...entry, componentTallyGuid: event.target.value } : entry))}><option value="">{line.importedComponentName ? "Match imported component…" : "Select component…"}</option>{components.filter((item) => item.tallyGuid !== productGuid).map((item) => <option key={item.tallyGuid} value={item.tallyGuid}>{item.name}</option>)}</select>
+                <select value={line.componentTallyGuid} onChange={(event) => setLines(lines.map((entry, rowIndex) => rowIndex === index ? { ...entry, componentTallyGuid: event.target.value } : entry))}><option value="">{line.importedComponentName ? "Match imported component…" : "Select component…"}</option>{components.filter((item) => item.tallyGuid !== productGuid).map((item) => <option key={item.tallyGuid} value={item.tallyGuid}>{item.qualifiedName}</option>)}</select>
               </div>
               <input type="number" min={1} step={1} value={line.quantityPerProduct} onChange={(event) => setLines(lines.map((entry, rowIndex) => rowIndex === index ? { ...entry, quantityPerProduct: Number(event.target.value) } : entry))} />
               <input type="number" min={0} max={100} step={0.1} value={line.lossBufferPercent} onChange={(event) => setLines(lines.map((entry, rowIndex) => rowIndex === index ? { ...entry, lossBufferPercent: Number(event.target.value) } : entry))} />

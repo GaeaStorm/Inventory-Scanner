@@ -7,9 +7,10 @@ import * as XLSX from "xlsx";
 
 import { ApplicationDatabase } from "../src/database/application-database";
 import { OperationsDatabase } from "../src/operations/database";
-import { permissionsForRole, requirePermission } from "../src/operations/permissions";
+import { permissionsForRole, requirePermission, resolveActorPermissions } from "../src/operations/permissions";
 import type { ActorContext, ConditionBalance } from "../src/operations/types";
 import { PlanningDatabase, warrantyStatusForSerial } from "../src/planning/database";
+import { buildCrfHtml } from "../src/planning/crf-document";
 import { traceabilityColumns } from "../src/renderer/traceability";
 import { parseBomWorkbook } from "../src/renderer/bom-import";
 import { retainedBackupPaths, StoresDatabase } from "../src/stores/database";
@@ -153,10 +154,6 @@ test("catalog group visibility drives planning while products are derived from B
     context.host.db.prepare(
       "UPDATE tally_stock_items SET parent_name = 'RESISTORS' WHERE tally_guid = ?",
     ).run(context.componentGuid);
-    context.stores.setCatalogVisibility({
-      groupName: "COMPONENTS",
-      ignored: false,
-    });
     let state = context.stores.getState();
     assert.equal(state.stockItems.find((item) => item.tallyGuid === context.productGuid)?.isProduct, true);
     assert.equal(state.stockItems.find((item) => item.tallyGuid === context.componentGuid)?.isProduct, false);
@@ -165,13 +162,76 @@ test("catalog group visibility drives planning while products are derived from B
     assert.ok(state.catalogGroups.some((group) => group.name === "COMPONENTS" && group.type === "PRIMARY"));
     assert.ok(state.catalogGroups.some((group) => group.name === "RESISTORS" && group.type === "SECONDARY" && group.primaryName === "COMPONENTS"));
 
-    context.stores.setCatalogVisibility({
-      groupName: "COMPONENTS",
-      ignored: true,
-    });
+    context.stores.setGroupCatalogRole({ groupName: "COMPONENTS", role: "IGNORED" });
     state = context.stores.getState();
     assert.equal(state.stockItems.find((item) => item.tallyGuid === context.componentGuid)?.ignored, true);
     assert.equal(context.planning.getState().items.some((item) => item.tallyItemGuid === context.componentGuid), false);
+  } finally {
+    closeContext(context);
+  }
+});
+
+test("a manual catalog role designation overrides automatic isProduct detection, in both directions", () => {
+  const context = createContext();
+  try {
+    let state = context.stores.getState();
+    assert.equal(state.stockItems.find((item) => item.tallyGuid === context.componentGuid)?.isProduct, false);
+    assert.equal(state.stockItems.find((item) => item.tallyGuid === context.productGuid)?.isProduct, true);
+
+    // A brand-new product has no BOM yet, so automatic detection alone can
+    // never mark it isProduct — the manual override is the only way in.
+    context.stores.setCatalogRole({ tallyItemGuid: context.componentGuid, role: "PRODUCT" });
+    state = context.stores.getState();
+    const overriddenComponent = state.stockItems.find((item) => item.tallyGuid === context.componentGuid);
+    assert.equal(overriddenComponent?.isProduct, true);
+    assert.equal(overriddenComponent?.catalogRoleOverride, "PRODUCT");
+
+    // The reverse: explicitly marking something that already has a BOM as
+    // "Neither" must suppress automatic detection too (a hard override).
+    context.stores.setCatalogRole({ tallyItemGuid: context.productGuid, role: "NEITHER" });
+    state = context.stores.getState();
+    assert.equal(state.stockItems.find((item) => item.tallyGuid === context.productGuid)?.isProduct, false);
+
+    // Clearing the override falls back to automatic detection again.
+    context.stores.setCatalogRole({ tallyItemGuid: context.productGuid, role: null });
+    state = context.stores.getState();
+    const restoredProduct = state.stockItems.find((item) => item.tallyGuid === context.productGuid);
+    assert.equal(restoredProduct?.isProduct, true);
+    assert.equal(restoredProduct?.catalogRoleOverride, null);
+  } finally {
+    closeContext(context);
+  }
+});
+
+test("a group-level designation cascades to its items, the nearest explicit ancestor wins, and an item override beats both", () => {
+  const context = createContext();
+  try {
+    context.stores.createCatalogGroup({ name: "Service" });
+    context.stores.createCatalogGroup({ name: "Repairs", parentName: "Service" });
+    const repairItem = context.stores.createLocalStockItem({ name: "Repair Visit", parentName: "Repairs" });
+
+    // Designating the whole "Service" group cascades down to "Repairs" too,
+    // since neither has been touched yet — the nearest explicit ancestor.
+    context.stores.setGroupCatalogRole({ groupName: "Service", role: "SERVICE" });
+    let state = context.stores.getState();
+    let repair = state.stockItems.find((item) => item.tallyGuid === repairItem.tallyGuid);
+    assert.equal(repair?.isService, true);
+    assert.equal(state.catalogGroups.find((group) => group.name === "Repairs")?.effectiveCatalogRole, "SERVICE");
+
+    // Explicitly marking the more specific subgroup "Neither" overrides the
+    // ancestor's "Service" designation for everything under it.
+    context.stores.setGroupCatalogRole({ groupName: "Repairs", role: "NEITHER" });
+    state = context.stores.getState();
+    repair = state.stockItems.find((item) => item.tallyGuid === repairItem.tallyGuid);
+    assert.equal(repair?.isService, false);
+    assert.equal(state.catalogGroups.find((group) => group.name === "Service")?.effectiveCatalogRole, "SERVICE");
+
+    // An item's own override beats its group either way.
+    context.stores.setCatalogRole({ tallyItemGuid: repairItem.tallyGuid, role: "PRODUCT" });
+    state = context.stores.getState();
+    repair = state.stockItems.find((item) => item.tallyGuid === repairItem.tallyGuid);
+    assert.equal(repair?.isProduct, true);
+    assert.equal(repair?.isService, false);
   } finally {
     closeContext(context);
   }
@@ -233,6 +293,122 @@ test("local-first catalog builds nested groups and categories and exports comple
     state = context.stores.getState();
     assert.equal(state.stockItems.some((entry) => entry.tallyGuid === item.tallyGuid), false);
     assert.equal(state.catalogGroups.some((entry) => entry.name === "Import"), false);
+  } finally {
+    closeContext(context);
+  }
+});
+
+test("duplicate item names are distinguished by Stock Group and movements snapshot the qualified name", () => {
+  const context = createContext();
+  try {
+    context.stores.createCatalogGroup({ name: "Raw Material" });
+    context.stores.createCatalogGroup({ name: "SMD", parentName: "Raw Material" });
+    context.stores.createCatalogGroup({ name: "Non-SMD", parentName: "Raw Material" });
+    const smdItem = context.stores.createLocalStockItem({ name: "ABCDE", parentName: "SMD" });
+    const nonSmdItem = context.stores.createLocalStockItem({ name: "ABCDE", parentName: "Non-SMD" });
+
+    assert.notEqual(smdItem.tallyGuid, nonSmdItem.tallyGuid);
+    const state = context.stores.getState();
+    const savedSmd = state.stockItems.find((entry) => entry.tallyGuid === smdItem.tallyGuid);
+    const savedNonSmd = state.stockItems.find((entry) => entry.tallyGuid === nonSmdItem.tallyGuid);
+    assert.equal(savedSmd?.qualifiedName, "Raw Material > SMD > ABCDE");
+    assert.equal(savedNonSmd?.qualifiedName, "Raw Material > Non-SMD > ABCDE");
+    assert.equal(state.qualifiedNameCollisions.length, 0);
+
+    context.stores.recordBulkVendorReceipt({
+      clientTransactionId: "dup-name-receipt",
+      supplierId: context.supplierId,
+      challanNumber: "CH-DUP",
+      challanDate: "2026-06-19",
+      receiptDate: "2026-06-19",
+      nonPoException: true,
+      lines: [{ tallyItemGuid: smdItem.tallyGuid, quantity: 4 }],
+    });
+    const movementRow = context.host.db.prepare(`
+      SELECT item_name_snapshot, item_qualified_name_snapshot, item_group_path_snapshot
+      FROM inventory_movements WHERE stock_item_id = ?
+    `).get(smdItem.id) as { item_name_snapshot: string; item_qualified_name_snapshot: string; item_group_path_snapshot: string };
+    assert.equal(movementRow.item_name_snapshot, "ABCDE");
+    assert.equal(movementRow.item_qualified_name_snapshot, "Raw Material > SMD > ABCDE");
+    assert.deepEqual(JSON.parse(movementRow.item_group_path_snapshot), ["Raw Material", "SMD"]);
+  } finally {
+    closeContext(context);
+  }
+});
+
+test("item specification fields generate a unique Tally name while keeping a duplicate-friendly display name, and can be reordered/deleted", () => {
+  const context = createContext();
+  try {
+    context.stores.createCatalogGroup({ name: "Switches" });
+    const pinCount = context.stores.saveItemFieldDefinition({ label: "Pin count", required: true });
+    const color = context.stores.saveItemFieldDefinition({ label: "Color", required: false });
+    assert.deepEqual(context.stores.listItemFieldDefinitions().map((field) => field.label), ["Pin count", "Color"]);
+
+    assert.throws(
+      () => context.stores.createLocalStockItem({ name: "Item010", parentName: "Switches", fieldValues: { color: "Red" } }),
+      /Pin count/,
+      "a required field left blank must be rejected",
+    );
+
+    const red = context.stores.createLocalStockItem({
+      name: "Item010", parentName: "Switches", fieldValues: { [pinCount.key]: "6 pin", [color.key]: "Red" },
+    });
+    assert.equal(red.tallyName, "Switches_6pin_Red_Item010");
+    assert.equal(red.name, "Item010", "display name stays the human label, not the generated name");
+
+    // A blank optional field contributes a literal "X", and the same display
+    // name + group with a different field combination is a distinct item.
+    const noColor = context.stores.createLocalStockItem({
+      name: "Item010", parentName: "Switches", fieldValues: { [pinCount.key]: "6 pin" },
+    });
+    assert.notEqual(noColor.tallyGuid, red.tallyGuid);
+    assert.equal(noColor.tallyName, "Switches_6pin_X_Item010");
+    assert.equal(noColor.name, "Item010");
+
+    const state = context.stores.getState();
+    const redFromState = state.stockItems.find((entry) => entry.tallyGuid === red.tallyGuid);
+    assert.deepEqual(redFromState?.fieldValues, { [pinCount.key]: "6 pin", [color.key]: "Red" });
+
+    // Reorder: Color before Pin count.
+    context.stores.reorderItemFieldDefinitions([color.id, pinCount.id]);
+    assert.deepEqual(context.stores.listItemFieldDefinitions().map((field) => field.label), ["Color", "Pin count"]);
+    const reorderedItem = context.stores.createLocalStockItem({
+      name: "Item011", parentName: "Switches", fieldValues: { [pinCount.key]: "4 pin", [color.key]: "Blue" },
+    });
+    assert.equal(reorderedItem.tallyName, "Switches_Blue_4pin_Item011", "generated name follows the new field order");
+
+    context.stores.deleteItemFieldDefinition(color.id);
+    assert.deepEqual(context.stores.listItemFieldDefinitions().map((field) => field.label), ["Pin count"]);
+
+    // A freshly created item's own field-value rows must never count as a
+    // blocking reference — they're descriptive metadata, not a real record.
+    context.stores.deleteStockItem({ tallyItemGuid: red.tallyGuid });
+    assert.ok(!context.stores.getState().stockItems.some((entry) => entry.tallyGuid === red.tallyGuid));
+  } finally {
+    closeContext(context);
+  }
+});
+
+test("a local Stock Item with no movements or other references can be deleted from the catalog", () => {
+  const context = createContext();
+  try {
+    context.stores.createCatalogGroup({ name: "Scratch" });
+    const item = context.stores.createLocalStockItem({ name: "Throwaway", parentName: "Scratch" });
+    assert.ok(context.stores.getState().stockItems.some((entry) => entry.tallyGuid === item.tallyGuid));
+    context.stores.deleteStockItem({ tallyItemGuid: item.tallyGuid });
+    assert.ok(!context.stores.getState().stockItems.some((entry) => entry.tallyGuid === item.tallyGuid));
+
+    const referenced = context.stores.createLocalStockItem({ name: "InUse", parentName: "Scratch" });
+    context.stores.recordBulkVendorReceipt({
+      clientTransactionId: "delete-guard-receipt",
+      supplierId: context.supplierId,
+      challanNumber: "CH-DELETE-GUARD",
+      challanDate: "2026-06-19",
+      receiptDate: "2026-06-19",
+      nonPoException: true,
+      lines: [{ tallyItemGuid: referenced.tallyGuid, quantity: 1 }],
+    });
+    assert.throws(() => context.stores.deleteStockItem({ tallyItemGuid: referenced.tallyGuid }), /referenced|cannot|in use/i);
   } finally {
     closeContext(context);
   }
@@ -344,6 +520,59 @@ test("production-order tracker persists canonical stages, stage history, spreads
   }
 });
 
+test("Production orders, Sales Orders, and fulfilment lines can go on hold or be cancelled without any stage-history time tracking", () => {
+  const context = createContext();
+  try {
+    const product = context.stores.getState().stockItems.find((item) => item.isProduct)
+      ?? context.stores.getState().stockItems[0];
+    const order = context.planning.saveProductOrder({
+      externalReference: "PO-HOLD-1",
+      productTallyGuid: product.tallyGuid,
+      quantity: 1,
+      workflowStateId: "po-pending",
+    });
+    const stageHistoryBeforeHold = context.planning.getState().productOrders.find((entry) => entry.id === order.id)!.stageHistory.length;
+    context.planning.updateProductOrderStatus(order.id, "ON_HOLD");
+    const onHold = context.planning.getState().productOrders.find((entry) => entry.id === order.id)!;
+    assert.equal(onHold.status, "ON_HOLD");
+    assert.equal(onHold.stageHistory.length, stageHistoryBeforeHold, "putting an order on hold must not write a stage-history row");
+    context.planning.updateProductOrderStatus(order.id, "CONFIRMED");
+    const resumed = context.planning.getState().productOrders.find((entry) => entry.id === order.id)!;
+    assert.equal(resumed.status, "CONFIRMED");
+
+    const importResult = context.planning.importTallySalesOrderAggregates([{
+      guid: "TALLY-SO-HOLD-1",
+      voucherNumber: "SO-HOLD-1",
+      voucherDate: "2026-06-24",
+      customerName: "Hold Test Customer",
+      reference: "CUSTOMER-PO-HOLD-1",
+      lines: [{ itemName: "Test Product", itemGuid: context.productGuid, quantity: 1, rate: 100, value: 100, orderNumber: "", trackingNumber: "" }],
+    }], context.actor);
+    assert.equal(importResult.imported, 1, JSON.stringify(importResult));
+    const allSalesOrders = context.planning.getState().salesOrders;
+    const salesOrder = allSalesOrders.find((entry) => entry.tallyVoucherGuid === "TALLY-SO-HOLD-1");
+    assert.ok(salesOrder, `expected to find TALLY-SO-HOLD-1 among: ${JSON.stringify(allSalesOrders.map((o) => o.tallyVoucherGuid))}`);
+    assert.equal(salesOrder.holdStatus, "NONE");
+    const heldOrder = context.planning.setSalesOrderHoldStatus(salesOrder.id, "ON_HOLD");
+    assert.equal(heldOrder.holdStatus, "ON_HOLD");
+    assert.equal(heldOrder.orderStage, salesOrder.orderStage, "a hold must never change orderStage");
+    const resumedSalesOrder = context.planning.setSalesOrderHoldStatus(salesOrder.id, "NONE");
+    assert.equal(resumedSalesOrder.holdStatus, "NONE");
+
+    const fulfilmentLine = context.planning.addSalesOrderFulfilmentLine(
+      { salesOrderId: salesOrder.id, itemTallyGuid: context.productGuid, quantity: 1 }, context.actor,
+    );
+    assert.equal(fulfilmentLine.holdStatus, "NONE");
+    const stageBeforeLineHold = fulfilmentLine.stage;
+    const afterCancellingLine = context.planning.setFulfilmentLineHoldStatus(fulfilmentLine.id, "CANCELLED");
+    const cancelledLine = afterCancellingLine.fulfilmentLines.find((line) => line.id === fulfilmentLine.id)!;
+    assert.equal(cancelledLine.holdStatus, "CANCELLED");
+    assert.equal(cancelledLine.stage, stageBeforeLineHold, "cancelling a fulfilment line must not change its stage");
+  } finally {
+    closeContext(context);
+  }
+});
+
 test("service orders use separate stages, do not reserve production stock, and derive warranty from Serial No", () => {
   const context = createContext();
   try {
@@ -440,6 +669,307 @@ test("Tally Sales Orders import conservatively and bulk updates preserve order-t
   }
 });
 
+test("Sales Order aggregate groups one Tally voucher into one order with classified source lines and no auto-created fulfilment lines", () => {
+  const context = createContext();
+  try {
+    const result = context.planning.importTallySalesOrderAggregates([{
+      guid: "TALLY-SO-AGG-1",
+      voucherNumber: "SO-AGG-1",
+      voucherDate: "2026-06-24",
+      customerName: "Aggregate Customer",
+      reference: "CUSTOMER-PO-AGG-1",
+      lines: [
+        { itemName: "Test Product", itemGuid: context.productGuid, quantity: 2, rate: 25000, value: 50000, orderNumber: "", trackingNumber: "" },
+        { itemName: "Test Component", itemGuid: context.componentGuid, quantity: 10, rate: 100, value: 1000, orderNumber: "", trackingNumber: "" },
+      ],
+    }], context.actor);
+    assert.deepEqual(result, { imported: 1, updated: 0, unmatched: 0 });
+
+    const salesOrders = context.planning.getState().salesOrders;
+    assert.equal(salesOrders.length, 1);
+    const order = salesOrders[0];
+    assert.equal(order.tallyVoucherGuid, "TALLY-SO-AGG-1");
+    assert.equal(order.customerName, "Aggregate Customer");
+    assert.equal(order.orderStage, "PENDING_PO_APPROVAL");
+    assert.equal(order.sourceLines.length, 2);
+    assert.equal(order.fulfilmentLines.length, 0);
+    const productLine = order.sourceLines.find((line) => line.itemTallyGuid === context.productGuid);
+    assert.equal(productLine?.family, "MANUFACTURED");
+    assert.equal(productLine?.itemQualifiedNameSnapshot, "MANUFACTURED PRODUCTS > Test Product");
+    const componentLine = order.sourceLines.find((line) => line.itemTallyGuid === context.componentGuid);
+    assert.equal(componentLine?.family, "UNKNOWN");
+
+    const reimported = context.planning.importTallySalesOrderAggregates([{
+      guid: "TALLY-SO-AGG-1",
+      voucherNumber: "SO-AGG-1",
+      voucherDate: "2026-06-24",
+      customerName: "Aggregate Customer Renamed",
+      reference: "CUSTOMER-PO-AGG-1",
+      lines: [
+        { itemName: "Test Product", itemGuid: context.productGuid, quantity: 3, rate: 25000, value: 75000, orderNumber: "", trackingNumber: "" },
+      ],
+    }], context.actor);
+    assert.deepEqual(reimported, { imported: 0, updated: 1, unmatched: 0 });
+    const updatedOrder = context.planning.getState().salesOrders.find((entry) => entry.tallyVoucherGuid === "TALLY-SO-AGG-1");
+    assert.equal(updatedOrder?.customerName, "Aggregate Customer Renamed");
+    assert.equal(updatedOrder?.sourceLines.length, 1);
+
+    // The legacy flat Production Order register is untouched by this aggregate import path.
+    assert.equal(context.planning.getState().productOrders.length, 0);
+  } finally {
+    closeContext(context);
+  }
+});
+
+test("CRF revisions freeze an immutable snapshot, reprint historically, and Tally amendments after CRF Sent never silently rewrite source lines", () => {
+  const context = createContext();
+  const sales: ActorContext = { userId: "u-sales", displayName: "Sales Rep", username: "sales", role: "SALES", auditIdentity: "SALES", permissions: permissionsForRole(context.host.db, "SALES") };
+  const accounts: ActorContext = { userId: "u-accounts", displayName: "Accounts Rep", username: "accounts", role: "ACCOUNTS", auditIdentity: "ACCOUNTS", permissions: permissionsForRole(context.host.db, "ACCOUNTS") };
+  try {
+    const tallyOrder = {
+      guid: "TALLY-SO-CRF-1",
+      voucherNumber: "SO-CRF-1",
+      voucherDate: "2026-06-24",
+      customerName: "CRF Customer",
+      reference: "CUSTOMER-PO-CRF-1",
+      lines: [{ itemName: "Test Product", itemGuid: context.productGuid, quantity: 1, rate: 1000, value: 1000, orderNumber: "", trackingNumber: "" }],
+    };
+    context.planning.importTallySalesOrderAggregates([tallyOrder], context.actor);
+    const orderId = context.planning.getState().salesOrders.find((entry) => entry.tallyVoucherGuid === "TALLY-SO-CRF-1")!.id;
+    context.planning.requestPoApproval(orderId, sales);
+    const poRequest = context.planning.getState().salesOrders.find((o) => o.id === orderId)!.approvalRequests[0];
+    context.planning.decideApproval(poRequest.id, "APPROVE", "", accounts);
+
+    context.planning.submitCrfForApproval(orderId, sales);
+    const afterSubmit = context.planning.getState().salesOrders.find((o) => o.id === orderId)!;
+    assert.equal(afterSubmit.crfRevisions.length, 1);
+    const firstRevision = afterSubmit.crfRevisions[0];
+    assert.equal(firstRevision.supersededAt, null);
+
+    const revision = context.planning.getCrfRevision(firstRevision.id);
+    assert.equal(revision.payload.order.customerName, "CRF Customer");
+    assert.equal(revision.payload.sourceLines.length, 1);
+    const html = buildCrfHtml(revision.payload);
+    assert.match(html, /CRF Customer/);
+    assert.match(html, /Test Product|MANUFACTURED/);
+
+    // Tally re-syncs the same voucher with a changed quantity after the CRF was already sent.
+    context.planning.importTallySalesOrderAggregates([{
+      ...tallyOrder,
+      lines: [{ itemName: "Test Product", itemGuid: context.productGuid, quantity: 5, rate: 1000, value: 5000, orderNumber: "", trackingNumber: "" }],
+    }], context.actor);
+    const afterAmendment = context.planning.getState().salesOrders.find((o) => o.id === orderId)!;
+    assert.equal(afterAmendment.sourceChanged, true);
+    assert.equal(afterAmendment.sourceLines[0].quantity, 1, "source lines must not be silently rewritten");
+    assert.ok(afterAmendment.pendingSourceAmendment);
+    assert.equal(afterAmendment.pendingSourceAmendment?.newSourceLines[0].quantity, 5);
+
+    // Fulfilment progress is held while the amendment is unresolved.
+    const fulfilmentLine = context.planning.addSalesOrderFulfilmentLine({ salesOrderId: orderId, itemTallyGuid: context.productGuid, quantity: 1 }, sales);
+    assert.throws(
+      () => context.planning.advanceFulfilmentLineStage(fulfilmentLine.id, "material-purchase", sales),
+      /Apply or review the amendment/,
+    );
+
+    // Applying the amendment updates the source lines and clears the hold.
+    const amendmentId = afterAmendment.pendingSourceAmendment!.id;
+    const appliedOrder = context.planning.applySourceAmendment(amendmentId, accounts);
+    assert.equal(appliedOrder.sourceChanged, false);
+    assert.equal(appliedOrder.sourceLines[0].quantity, 5);
+    context.planning.advanceFulfilmentLineStage(fulfilmentLine.id, "material-purchase", sales);
+
+    // A new CRF revision is required and supersedes the original.
+    context.planning.requestCrfReapproval(orderId, sales);
+    const afterReapproval = context.planning.getState().salesOrders.find((o) => o.id === orderId)!;
+    assert.equal(afterReapproval.crfRevisions.length, 2);
+    const original = afterReapproval.crfRevisions.find((entry) => entry.revisionNumber === 1)!;
+    assert.ok(original.supersededAt);
+    const reprint = context.planning.getCrfRevision(original.id);
+    assert.equal(reprint.payload.sourceLines[0].quantity, 1, "an old revision must reprint exactly as it was originally");
+  } finally {
+    closeContext(context);
+  }
+});
+
+test("dual-approval engine enforces distinct approvers and no self-approval, and the checklist engine resolves and waives requirements", () => {
+  const context = createContext();
+  const sales: ActorContext = { userId: "u-sales", displayName: "Sales Rep", username: "sales", role: "SALES", auditIdentity: "SALES", permissions: permissionsForRole(context.host.db, "SALES") };
+  const accounts: ActorContext = { userId: "u-accounts", displayName: "Accounts Rep", username: "accounts", role: "ACCOUNTS", auditIdentity: "ACCOUNTS", permissions: permissionsForRole(context.host.db, "ACCOUNTS") };
+  const secondAccounts: ActorContext = { userId: "u-accounts-2", displayName: "Accounts Rep 2", username: "accounts2", role: "ACCOUNTS", auditIdentity: "ACCOUNTS", permissions: permissionsForRole(context.host.db, "ACCOUNTS") };
+  try {
+    context.planning.importTallySalesOrderAggregates([{
+      guid: "TALLY-SO-APPROVAL-1",
+      voucherNumber: "SO-APPROVAL-1",
+      voucherDate: "2026-06-24",
+      customerName: "Approval Customer",
+      reference: "CUSTOMER-PO-AP-1",
+      lines: [{ itemName: "Test Product", itemGuid: context.productGuid, quantity: 1, rate: 1000, value: 1000, orderNumber: "", trackingNumber: "" }],
+    }], context.actor);
+    const orderId = context.planning.getState().salesOrders.find((entry) => entry.tallyVoucherGuid === "TALLY-SO-APPROVAL-1")!.id;
+
+    // PO approval: a single Accounts decision satisfies it and advances the order to CRF_PENDING.
+    context.planning.requestPoApproval(orderId, sales);
+    assert.throws(() => context.planning.requestPoApproval(orderId, sales), /already pending/);
+    const poRequest = context.planning.getState().salesOrders.find((o) => o.id === orderId)!.approvalRequests[0];
+    assert.throws(
+      () => context.planning.decideApproval(poRequest.id, "APPROVE", "", sales),
+      /does not hold a permission required/,
+    );
+    const afterPoApproval = context.planning.decideApproval(poRequest.id, "APPROVE", "", accounts);
+    assert.equal(afterPoApproval.orderStage, "CRF_PENDING");
+    assert.equal(afterPoApproval.approvalRequests[0].status, "APPROVED");
+
+    // Checklist: requires a Manufactured fulfilment line; waiving lets the CRF submit anyway.
+    context.planning.saveChecklistTemplate({
+      name: "Standard CRF Checklist",
+      requirements: [{ targetType: "PRIMARY_GROUP", targetValue: "MANUFACTURED", description: "At least one Manufactured Product line" }],
+    }, context.actor);
+    let checklist = context.planning.resolveChecklistForOrder(orderId, sales);
+    assert.equal(checklist[0].status, "UNSATISFIED");
+    context.planning.waiveChecklistRequirement(orderId, checklist[0].requirementId, "Customer-supplied assembly, no manufacturing on our side", context.actor);
+    checklist = context.planning.getChecklistResultsForOrder(orderId);
+    assert.equal(checklist[0].status, "WAIVED");
+    assert.equal(checklist[0].waiverReason, "Customer-supplied assembly, no manufacturing on our side");
+
+    // Submitting the CRF moves the order to CRF_SENT and opens the dual Accounts+Sales approval.
+    context.planning.submitCrfForApproval(orderId, sales);
+    const afterSubmit = context.planning.getState().salesOrders.find((o) => o.id === orderId)!;
+    assert.equal(afterSubmit.orderStage, "CRF_SENT");
+    const crfRequest = afterSubmit.approvalRequests.find((entry) => entry.entityType === "SALES_ORDER_CRF" && entry.status === "PENDING")!;
+
+    // The submitter cannot also approve.
+    assert.throws(() => context.planning.decideApproval(crfRequest.id, "APPROVE", "", sales), /cannot also approve/);
+    // One Accounts approval alone is not enough — Sales must also approve, from a different person.
+    context.planning.decideApproval(crfRequest.id, "APPROVE", "", accounts);
+    const partial = context.planning.getState().salesOrders.find((o) => o.id === orderId)!;
+    assert.equal(partial.orderStage, "CRF_SENT");
+    // A second Accounts approval cannot fill the Sales slot.
+    context.planning.decideApproval(crfRequest.id, "APPROVE", "", secondAccounts);
+    const stillPending = context.planning.getState().salesOrders.find((o) => o.id === orderId)!;
+    assert.equal(stillPending.orderStage, "CRF_SENT");
+
+    // Editing a fulfilment line after submission supersedes the pending approval.
+    context.planning.addSalesOrderFulfilmentLine({ salesOrderId: orderId, itemTallyGuid: context.productGuid, quantity: 1 }, sales);
+    const afterEdit = context.planning.getState().salesOrders.find((o) => o.id === orderId)!;
+    assert.equal(afterEdit.approvalRequests.find((entry) => entry.id === crfRequest.id)?.status, "SUPERSEDED");
+  } finally {
+    closeContext(context);
+  }
+});
+
+test("fulfilment-line workflows enforce family-derived stages, nesting rules, and order-level approval gates", () => {
+  const context = createContext();
+  try {
+    context.stores.createCatalogGroup({ name: "Resale Goods" });
+    context.stores.createCatalogGroup({ name: "Raw Materials" });
+    const resaleItem = context.stores.createLocalStockItem({ name: "Resale Widget", parentName: "Resale Goods" });
+    const rawMaterialItem = context.stores.createLocalStockItem({ name: "Raw Bolt", parentName: "Raw Materials" });
+    const supplierId = Number(context.host.db.prepare(
+      "INSERT INTO suppliers(tally_guid, name, synced_at) VALUES (?, ?, ?)",
+    ).run("SUPPLIER:RESALE", "Resale Supplier", new Date().toISOString()).lastInsertRowid);
+
+    const aggregate = context.planning.importTallySalesOrderAggregates([{
+      guid: "TALLY-SO-WORKFLOW-1",
+      voucherNumber: "SO-WORKFLOW-1",
+      voucherDate: "2026-06-24",
+      customerName: "Workflow Customer",
+      reference: "CUSTOMER-PO-WF-1",
+      lines: [{ itemName: "Test Product", itemGuid: context.productGuid, quantity: 1, rate: 1000, value: 1000, orderNumber: "", trackingNumber: "" }],
+    }], context.actor);
+    assert.equal(aggregate.imported, 1);
+    const orderId = context.planning.getState().salesOrders.find((entry) => entry.tallyVoucherGuid === "TALLY-SO-WORKFLOW-1")!.id;
+
+    // Manufactured line: starts at material-planning, reuses the 15-stage lookup, gates quality-control on material-purchase.
+    const manufacturedLine = context.planning.addSalesOrderFulfilmentLine({
+      salesOrderId: orderId,
+      itemTallyGuid: context.productGuid,
+      quantity: 1,
+    }, context.actor);
+    assert.equal(manufacturedLine.family, "MANUFACTURED");
+    assert.equal(manufacturedLine.stage, "material-planning");
+    assert.throws(
+      () => context.planning.advanceFulfilmentLineStage(manufacturedLine.id, "quality-control", context.actor),
+      /Material Purchase/,
+    );
+    context.planning.advanceFulfilmentLineStage(manufacturedLine.id, "material-purchase", context.actor);
+    context.planning.advanceFulfilmentLineStage(manufacturedLine.id, "quality-control", context.actor);
+
+    // Nested Resale line under the Manufactured line.
+    const resaleLine = context.planning.addSalesOrderFulfilmentLine({
+      salesOrderId: orderId,
+      parentFulfilmentLineId: manufacturedLine.id,
+      itemTallyGuid: resaleItem.tallyGuid,
+      quantity: 2,
+    }, context.actor);
+    assert.equal(resaleLine.parentFulfilmentLineId, manufacturedLine.id);
+    assert.equal(resaleLine.stage, "pending-supplier");
+    const resaleLineWithSupplier = context.planning.assignResaleSupplier(resaleLine.id, supplierId, context.actor);
+    assert.equal(resaleLineWithSupplier.resaleSupplierName, "Resale Supplier");
+    context.planning.advanceFulfilmentLineStage(resaleLine.id, "items-received", context.actor);
+    assert.throws(
+      () => context.planning.advanceFulfilmentLineStage(resaleLine.id, "not-a-real-stage", context.actor),
+      /valid stage/,
+    );
+
+    // Top-level Raw Material line, sold direct.
+    const rawMaterialLine = context.planning.addSalesOrderFulfilmentLine({
+      salesOrderId: orderId,
+      itemTallyGuid: rawMaterialItem.tallyGuid,
+      quantity: 5,
+    }, context.actor);
+    assert.equal(rawMaterialLine.stage, "awaiting-restock");
+
+    // Internally-consumed Raw Material line cannot be progressed through dispatch stages.
+    const internalLine = context.planning.addSalesOrderFulfilmentLine({
+      salesOrderId: orderId,
+      itemTallyGuid: rawMaterialItem.tallyGuid,
+      quantity: 3,
+      consumptionMode: "INTERNAL_CONSUMPTION",
+    }, context.actor);
+    assert.equal(internalLine.stage, "");
+    assert.throws(
+      () => context.planning.advanceFulfilmentLineStage(internalLine.id, "awaiting-restock", context.actor),
+      /Material Issue/,
+    );
+
+    // Manufactured/Service lines cannot nest under another line; non-Manufactured parents are rejected.
+    assert.throws(
+      () => context.planning.addSalesOrderFulfilmentLine({
+        salesOrderId: orderId, parentFulfilmentLineId: resaleLine.id, itemTallyGuid: rawMaterialItem.tallyGuid, quantity: 1,
+      }, context.actor),
+      /Manufactured Product lines can have supporting/,
+    );
+    assert.throws(
+      () => context.planning.addSalesOrderFulfilmentLine({
+        salesOrderId: orderId, parentFulfilmentLineId: manufacturedLine.id, itemTallyGuid: context.productGuid, quantity: 1,
+      }, context.actor),
+      /must be top-level/,
+    );
+
+    // Order-level stage machine: forward-only, and the two approval-gated transitions reject direct advancement.
+    assert.throws(
+      () => context.planning.advanceSalesOrderStage(orderId, "CRF_PENDING", context.actor),
+      /requires an approved request/,
+    );
+    assert.throws(
+      () => context.planning.advanceSalesOrderStage(orderId, "COMPLETED", context.actor),
+      /move forward one step/,
+    );
+    // Only the internal setSalesOrderStage() escape hatch (used by the approval engine) may apply the gated transitions.
+    context.planning.setSalesOrderStage(orderId, "CRF_PENDING", context.actor);
+    context.planning.advanceSalesOrderStage(orderId, "CRF_SENT", context.actor);
+    assert.throws(
+      () => context.planning.advanceSalesOrderStage(orderId, "IN_FULFILMENT", context.actor),
+      /requires an approved request/,
+    );
+    context.planning.setSalesOrderStage(orderId, "IN_FULFILMENT", context.actor);
+    const finalOrder = context.planning.advanceSalesOrderStage(orderId, "COMPLETED", context.actor);
+    assert.equal(finalOrder.orderStage, "COMPLETED");
+  } finally {
+    closeContext(context);
+  }
+});
+
 test("obsolete items remain visible to Accounts until a restock policy is decided", () => {
   const context = createContext();
   try {
@@ -493,7 +1023,7 @@ test("migrations are additive and receipt splits keep only AVAILABLE in the lega
       faultySerialNumbers: ["F-1", "F-2"],
       faultReason: "Damaged on arrival",
     });
-    assert.equal(context.operations.moduleVersion, 5);
+    assert.equal(context.operations.moduleVersion, 9);
     assert.equal(balance(context, "AVAILABLE").quantity, 5);
     assert.equal(balance(context, "PENDING_INSPECTION").quantity, 3);
     assert.equal(balance(context, "FAULTY").quantity, 2);
@@ -516,7 +1046,7 @@ test("migrations are additive and receipt splits keep only AVAILABLE in the lega
     const migrationRows = context.host.db.prepare(
       "SELECT version FROM application_module_migrations WHERE module_name = 'operations' ORDER BY version",
     ).all() as Array<{ version: number }>;
-    assert.deepEqual(migrationRows.map((row) => Number(row.version)), [1, 2, 3, 4, 5]);
+    assert.deepEqual(migrationRows.map((row) => Number(row.version)), [1, 2, 3, 4, 5, 6, 7, 8, 9]);
   } finally {
     closeContext(context);
   }
@@ -725,15 +1255,102 @@ test("rejected purchase receipts do not close purchase order demand", () => {
   }
 });
 
-test("role permissions are enforced independently of renderer visibility", () => {
-  const store: ActorContext = { userId: "u-store", displayName: "Store", username: "store", role: "STORE", auditIdentity: "STORE" };
-  const sales: ActorContext = { userId: "u-sales", displayName: "Sales", username: "sales", role: "SALES", auditIdentity: "SALES" };
-  assert.ok(permissionsForRole("STORE").includes("STOCK_COUNT"));
-  assert.ok(permissionsForRole("ACCOUNTS").includes("TALLY_REVIEW"));
-  assert.ok(permissionsForRole("PRODUCTION").includes("PRODUCTION_EXECUTE"));
-  assert.ok(permissionsForRole("SALES").includes("CUSTOMER_RETURN_INITIATE"));
-  assert.equal(requirePermission(store, "RECEIVE_MATERIAL"), store);
-  assert.throws(() => requirePermission(sales, "STOCK_ADJUST"), /does not have permission/);
+test("role permissions are enforced independently of renderer visibility, and are admin-configurable", () => {
+  const context = createContext();
+  try {
+    const db = context.host.db;
+    assert.ok(permissionsForRole(db, "STORE").includes("STOCK_COUNT"));
+    assert.ok(permissionsForRole(db, "ACCOUNTS").includes("TALLY_REVIEW"));
+    assert.ok(permissionsForRole(db, "PRODUCTION").includes("PRODUCTION_EXECUTE"));
+    assert.ok(permissionsForRole(db, "SALES").includes("CUSTOMER_RETURN_INITIATE"));
+
+    const store: ActorContext = { userId: "u-store", displayName: "Store", username: "store", role: "STORE", auditIdentity: "STORE", permissions: permissionsForRole(db, "STORE") };
+    const sales: ActorContext = { userId: "u-sales", displayName: "Sales", username: "sales", role: "SALES", auditIdentity: "SALES", permissions: permissionsForRole(db, "SALES") };
+    assert.equal(requirePermission(store, "RECEIVE_MATERIAL"), store);
+    assert.throws(() => requirePermission(sales, "STOCK_ADJUST"), /does not have permission/);
+
+    // The mapping is genuinely data-driven: toggling a grant takes effect without a code change.
+    db.prepare("UPDATE ops_role_permissions SET enabled = 0 WHERE role_name = 'STORE' AND permission = 'RECEIVE_MATERIAL'").run();
+    const storeAfterRevoke: ActorContext = { ...store, permissions: permissionsForRole(db, "STORE") };
+    assert.throws(() => requirePermission(storeAfterRevoke, "RECEIVE_MATERIAL"), /does not have permission/);
+  } finally {
+    closeContext(context);
+  }
+});
+
+test("a custom role granted the right permission can fill an approval slot, just like the original role would", () => {
+  const context = createContext();
+  try {
+    context.operations.createRole("SALES_JUNIOR", context.actor);
+    context.operations.setRolePermission("SALES_JUNIOR", "SALES_ORDER_VIEW", true, context.actor);
+    context.operations.setRolePermission("SALES_JUNIOR", "SALES_ORDER_EDIT_CRF", true, context.actor);
+    context.operations.setRolePermission("SALES_JUNIOR", "SALES_ORDER_SUBMIT_CRF", true, context.actor);
+    context.operations.setRolePermission("SALES_JUNIOR", "SALES_ORDER_APPROVE_CRF_SALES", true, context.actor);
+    assert.ok(context.operations.listRoles().some((role) => role.name === "SALES_JUNIOR" && !role.isSystem));
+
+    const db = context.host.db;
+    const juniorSales: ActorContext = {
+      userId: "u-junior-sales", displayName: "Junior Sales", username: "junior-sales",
+      role: "SALES_JUNIOR", auditIdentity: "SALES_JUNIOR", permissions: permissionsForRole(db, "SALES_JUNIOR"),
+    };
+    const secondJuniorSales: ActorContext = {
+      userId: "u-junior-sales-2", displayName: "Junior Sales 2", username: "junior-sales-2",
+      role: "SALES_JUNIOR", auditIdentity: "SALES_JUNIOR", permissions: permissionsForRole(db, "SALES_JUNIOR"),
+    };
+    const accounts: ActorContext = {
+      userId: "u-accounts", displayName: "Accounts Rep", username: "accounts",
+      role: "ACCOUNTS", auditIdentity: "ACCOUNTS", permissions: permissionsForRole(db, "ACCOUNTS"),
+    };
+
+    context.planning.importTallySalesOrderAggregates([{
+      guid: "TALLY-SO-CUSTOM-ROLE-1",
+      voucherNumber: "SO-CUSTOM-ROLE-1",
+      voucherDate: "2026-06-24",
+      customerName: "Custom Role Customer",
+      reference: "CUSTOMER-PO-CUSTOM-ROLE-1",
+      lines: [{ itemName: "Test Product", itemGuid: context.productGuid, quantity: 1, rate: 100, value: 100, orderNumber: "", trackingNumber: "" }],
+    }], context.actor);
+    const orderId = context.planning.getState().salesOrders.find((o) => o.tallyVoucherGuid === "TALLY-SO-CUSTOM-ROLE-1")!.id;
+    context.planning.requestPoApproval(orderId, context.actor);
+    const poRequest = context.planning.getState().salesOrders.find((o) => o.id === orderId)!.approvalRequests.find((r) => r.status === "PENDING")!;
+    context.planning.decideApproval(poRequest.id, "APPROVE", "", accounts);
+    context.planning.submitCrfForApproval(orderId, juniorSales);
+    const crfRequest = context.planning.getState().salesOrders.find((o) => o.id === orderId)!.approvalRequests.find((entry) => entry.entityType === "SALES_ORDER_CRF" && entry.status === "PENDING")!;
+    context.planning.decideApproval(crfRequest.id, "APPROVE", "", accounts);
+    context.planning.decideApproval(crfRequest.id, "APPROVE", "", secondJuniorSales);
+    const approved = context.planning.getState().salesOrders.find((o) => o.id === orderId)!;
+    assert.equal(approved.orderStage, "IN_FULFILMENT");
+  } finally {
+    closeContext(context);
+  }
+});
+
+test("a permission can be restricted to named computers, and is unaffected when unrestricted", () => {
+  const context = createContext();
+  try {
+    const db = context.host.db;
+    // Unrestricted by default: any computer name (including none) keeps the permission.
+    assert.ok(resolveActorPermissions(db, "STORE", "ANY-COMPUTER").includes("STOCK_COUNT"));
+    assert.ok(resolveActorPermissions(db, "STORE", "").includes("STOCK_COUNT"));
+
+    db.prepare("INSERT INTO ops_permission_computer_restrictions(permission, computer_name) VALUES ('STOCK_COUNT', 'STORE-PC-1')").run();
+    assert.ok(resolveActorPermissions(db, "STORE", "STORE-PC-1").includes("STOCK_COUNT"));
+    assert.ok(resolveActorPermissions(db, "STORE", "store-pc-1").includes("STOCK_COUNT"), "computer name match is case-insensitive");
+    assert.ok(!resolveActorPermissions(db, "STORE", "STORE-PC-2").includes("STOCK_COUNT"));
+    assert.ok(!resolveActorPermissions(db, "STORE", "").includes("STOCK_COUNT"), "an unidentified caller cannot use a restricted permission");
+    // Every other permission the role holds is untouched by this one restriction.
+    assert.ok(resolveActorPermissions(db, "STORE", "STORE-PC-2").includes("RECEIVE_MATERIAL"));
+
+    const onAllowedComputer: ActorContext = {
+      userId: "u-store", displayName: "Store", username: "store", role: "STORE", auditIdentity: "STORE",
+      permissions: resolveActorPermissions(db, "STORE", "STORE-PC-1"),
+    };
+    const onOtherComputer: ActorContext = { ...onAllowedComputer, permissions: resolveActorPermissions(db, "STORE", "STORE-PC-2") };
+    assert.equal(requirePermission(onAllowedComputer, "STOCK_COUNT"), onAllowedComputer);
+    assert.throws(() => requirePermission(onOtherComputer, "STOCK_COUNT"), /does not have permission/);
+  } finally {
+    closeContext(context);
+  }
 });
 
 test("condition transitions, serial uniqueness, supplier faults, partial resolution, return and scrap stay auditable", () => {

@@ -70,10 +70,14 @@ export default function ProductOrderPlanner({ planning, stores, onChanged, onNot
     () => new Set(planning.boms.filter((bom) => bom.status === "ACTIVE").map((bom) => bom.productTallyGuid)),
     [planning.boms],
   );
-  const itemByName = useMemo(
-    () => new Map(selectableItems.map((item) => [item.name.toLocaleLowerCase(), item])),
-    [selectableItems],
-  );
+  const itemsByName = useMemo(() => {
+    const map = new Map<string, typeof selectableItems>();
+    for (const item of selectableItems) {
+      const key = item.name.toLocaleLowerCase();
+      map.set(key, [...(map.get(key) ?? []), item]);
+    }
+    return map;
+  }, [selectableItems]);
   const products = useMemo(
     () => [...selectableItems].sort((left, right) => Number(activeBomProducts.has(right.tallyGuid)) - Number(activeBomProducts.has(left.tallyGuid)) || left.name.localeCompare(right.name)),
     [selectableItems, activeBomProducts],
@@ -117,12 +121,14 @@ export default function ProductOrderPlanner({ planning, stores, onChanged, onNot
       const records = XLSX.utils.sheet_to_json<Record<string, unknown>>(sheet, { defval: "", raw: true });
       const rows = records.map((row, index): ParsedOrderRow => {
         const productName = String(field(row, ["product", "product name", "finished product", "stock item"])).trim();
-        const product = itemByName.get(productName.toLocaleLowerCase());
+        const matches = itemsByName.get(productName.toLocaleLowerCase()) ?? [];
+        const product = matches.length === 1 ? matches[0] : undefined;
         const quantity = Number(field(row, ["quantity", "order quantity", "qty"]));
         const requiredDate = normalizedDate(field(row, ["required date", "need date", "due date", "date"]));
         const externalReference = String(field(row, ["external reference", "order reference", "order no", "order number", "reference"])).trim();
         const errors: string[] = [];
-        if (!product) errors.push("Product not matched");
+        if (matches.length === 0) errors.push("Product not matched");
+        else if (matches.length > 1) errors.push(`Product name matches ${matches.length} items in different Stock Groups — disambiguate by renaming or editing this order manually`);
         if (!Number.isInteger(quantity) || quantity <= 0) errors.push("Quantity must be a positive whole number");
         if (!requiredDate) errors.push("Required date is invalid");
         return { rowNumber: index + 2, productName, productGuid: product?.tallyGuid ?? "", externalReference, quantity, requiredDate, error: errors.join("; ") };
@@ -166,29 +172,17 @@ export default function ProductOrderPlanner({ planning, stores, onChanged, onNot
 
   return (
     <div className="planning-section-stack">
-      <section className="two-column-layout planning-orders-layout">
         <article className="panel">
           <div className="panel__header"><div><p className="eyebrow">STOCK PLANNING</p><h2>Reserve components</h2></div></div>
           <div className="form-grid form-grid--two">
             <label>Order reference<input value={draft.externalReference} onChange={(event) => setDraft({ ...draft, externalReference: event.target.value })} placeholder="Customer/order reference" /></label>
-            <label className="product-select-field">Product<select value={draft.productTallyGuid} onChange={(event) => setDraft({ ...draft, productTallyGuid: event.target.value })}><option value="">Select product…</option>{products.map((item) => <option key={item.tallyGuid} value={item.tallyGuid}>{item.name}{activeBomProducts.has(item.tallyGuid) ? " · BOM ready" : " · no BOM"}</option>)}</select></label>
+            <label className="product-select-field">Product<select value={draft.productTallyGuid} onChange={(event) => setDraft({ ...draft, productTallyGuid: event.target.value })}><option value="">Select product…</option>{products.map((item) => <option key={item.tallyGuid} value={item.tallyGuid}>{item.qualifiedName}{activeBomProducts.has(item.tallyGuid) ? " · BOM ready" : " · no BOM"}</option>)}</select></label>
             <label>Product quantity<input type="number" min={1} step={1} value={draft.quantity} onChange={(event) => setDraft({ ...draft, quantity: Number(event.target.value) })} /></label>
             <label>Required date<input type="date" value={draft.requiredDate} onChange={(event) => setDraft({ ...draft, requiredDate: event.target.value })} /></label>
             <label className="form-grid__wide">Notes<textarea rows={2} value={draft.notes} onChange={(event) => setDraft({ ...draft, notes: event.target.value })} /></label>
           </div>
           <div className="inline-actions"><button className="button button--secondary" type="button" onClick={() => setDraft({ externalReference: "", productTallyGuid: "", quantity: 1, requiredDate: new Date().toISOString().slice(0, 10), status: "CONFIRMED", notes: "" })}>Clear</button><button className="button" disabled={busy || !draft.productTallyGuid} type="button" onClick={() => void saveOrder()}>Confirm and reserve</button></div>
         </article>
-
-        <article className="panel">
-          <div className="panel__header"><div><p className="eyebrow">IMPORT</p><h2>Upload product orders</h2></div></div>
-          <label className="file-drop">Choose order spreadsheet<input type="file" accept=".xlsx,.xls,.csv" onChange={(event) => { const file = event.target.files?.[0]; if (file) void parseFile(file); event.currentTarget.value = ""; }} /></label>
-          {parsedRows.length > 0 && <>
-            <div className="import-summary"><strong>{parsedRows.filter((row) => !row.error).length} ready</strong><span>{parsedRows.filter((row) => row.error).length} need correction</span></div>
-            <div className="table-scroll import-preview"><table><thead><tr><th>Row</th><th>Product</th><th>Qty</th><th>Required</th><th>Reference</th><th>Result</th></tr></thead><tbody>{parsedRows.map((row) => <tr key={row.rowNumber} className={row.error ? "row-error" : ""}><td>{row.rowNumber}</td><td>{row.productName || "—"}</td><td>{Number.isFinite(row.quantity) ? row.quantity : "—"}</td><td>{row.requiredDate || "—"}</td><td>{row.externalReference || "—"}</td><td>{row.error || "Ready"}</td></tr>)}</tbody></table></div>
-            <div className="inline-actions"><button className="button button--secondary" type="button" onClick={() => setParsedRows([])}>Clear preview</button><button className="button" disabled={busy || parsedRows.every((row) => row.error)} type="button" onClick={() => void importOrders()}>Import confirmed orders</button></div>
-          </>}
-        </article>
-      </section>
 
       <article className="panel table-panel">
         <div className="panel__header"><div><p className="eyebrow">FEASIBILITY</p><h2>Planned product demand</h2></div><span className="table-count">{planning.productOrders.filter((order) => order.orderType === "PRODUCTION" && order.status === "CONFIRMED").length} active</span></div>

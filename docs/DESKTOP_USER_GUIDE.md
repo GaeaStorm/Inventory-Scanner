@@ -104,7 +104,7 @@ The Production server still listens on the selected company LAN so paired phones
 
 ## Credential recovery email
 
-Credential recovery sends a six-digit code from `gtrswnt@gmail.com`. On the Production computer, set `INVENTORY_GMAIL_APP_PASSWORD` to a Gmail app password for that account before starting Inventory Scanner. Do not use or store the normal Gmail password.
+Credential recovery sends a six-digit code from `email.gaia.verf@gmail.com`. On the Production computer, set `INVENTORY_GMAIL_APP_PASSWORD` to a Gmail app password for that account before starting Inventory Scanner. Do not use or store the normal Gmail password.
 
 Review pending Material In/Out and manual Accounts items before generating an export batch.
 

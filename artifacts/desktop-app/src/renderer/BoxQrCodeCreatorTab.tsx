@@ -1,7 +1,13 @@
 import { useEffect, useMemo, useState } from "react";
 import QRCode from "qrcode";
 
-import GroupFilterDropdown, { buildGroupTree, groupPathMatches } from "./GroupFilterDropdown";
+import GroupFilterDropdown, {
+  appendFieldLeaves,
+  buildGroupTree,
+  groupFilterValueFromNode,
+  itemMatchesFilter,
+  type GroupFilterValue,
+} from "./GroupFilterDropdown";
 import { operationalStockItems } from "./stock-item-visibility";
 import type { StoresBox, StoresState } from "./types";
 import "./BoxQrCodeCreatorTab.css";
@@ -64,7 +70,7 @@ export default function BoxQrCodeCreatorTab({ stores, onChanged }: Props) {
   const [expectedRevision, setExpectedRevision] = useState<number | undefined>();
   const [selectedGuids, setSelectedGuids] = useState<string[]>([]);
   const [search, setSearch] = useState("");
-  const [groupFilter, setGroupFilter] = useState<string[]>([]);
+  const [groupFilter, setGroupFilter] = useState<GroupFilterValue>({ path: [], groupDepth: 0 });
   const [categoryFilter, setCategoryFilter] = useState("ALL");
   const [stockFilter, setStockFilter] = useState<"ALL" | "AVAILABLE" | "EMPTY">("ALL");
   const [bomFilter, setBomFilter] = useState<"ALL" | "BOM" | "NO_BOM">("ALL");
@@ -85,10 +91,11 @@ export default function BoxQrCodeCreatorTab({ stores, onChanged }: Props) {
     () => selectedGuids.map((guid) => stores.stockItems.find((item) => item.tallyGuid === guid)).filter(Boolean),
     [selectedGuids, stores.stockItems],
   );
-  const groupTree = useMemo(
-    () => buildGroupTree(selectableItems.map((item) => item.groupPath).filter((path) => path.length > 0)),
-    [selectableItems],
-  );
+  const groupTree = useMemo(() => appendFieldLeaves(
+    buildGroupTree(selectableItems.map((item) => item.groupPath).filter((path) => path.length > 0)),
+    selectableItems.map((item) => ({ groupPath: item.groupPath, fieldValues: item.fieldValues, displayName: item.name, itemGuid: item.tallyGuid })),
+    stores.itemFieldDefinitions,
+  ), [selectableItems, stores.itemFieldDefinitions]);
   const categoryOptions = useMemo(
     () => [...new Set(selectableItems.map((item) => item.categoryName).filter(Boolean))].sort((left, right) => left.localeCompare(right)),
     [selectableItems],
@@ -97,15 +104,19 @@ export default function BoxQrCodeCreatorTab({ stores, onChanged }: Props) {
     const query = search.trim().toLocaleLowerCase();
     return selectableItems.filter((item) => {
       if (selectedGuids.includes(item.tallyGuid)) return false;
-      if (groupFilter.length > 0 && !groupPathMatches(groupFilter, item.groupPath)) return false;
+      if (groupFilter.path.length > 0 && !itemMatchesFilter(
+        groupFilter,
+        { groupPath: item.groupPath, fieldValues: item.fieldValues, displayName: item.name },
+        stores.itemFieldDefinitions,
+      )) return false;
       if (categoryFilter !== "ALL" && item.categoryName !== categoryFilter) return false;
       if (stockFilter === "AVAILABLE" && item.localAvailableQuantity <= 0) return false;
       if (stockFilter === "EMPTY" && item.localAvailableQuantity > 0) return false;
       if (bomFilter === "BOM" && !item.hasBom) return false;
       if (bomFilter === "NO_BOM" && item.hasBom) return false;
-      return !query || [item.name, item.primaryGroupName, item.secondaryGroupName, item.tallyGuid].some((value) => value.toLocaleLowerCase().includes(query));
+      return !query || [item.name, ...item.groupPath, item.tallyGuid].some((value) => value.toLocaleLowerCase().includes(query));
     });
-  }, [bomFilter, groupFilter, categoryFilter, search, selectedGuids, stockFilter, selectableItems]);
+  }, [bomFilter, groupFilter, categoryFilter, search, selectedGuids, stockFilter, selectableItems, stores.itemFieldDefinitions]);
 
   useEffect(() => {
     setQrDataUrl("");
@@ -267,8 +278,8 @@ export default function BoxQrCodeCreatorTab({ stores, onChanged }: Props) {
   return (
     <section className="tab-page">
       <div className="page-heading">
-        <div><p className="eyebrow">BOX LABELS</p><h1>QR Code Creator</h1></div>
-        <button className="button button--secondary" type="button" onClick={startNew}>New box</button>
+        {/* <div><p className="eyebrow">BOX LABELS</p><h1>QR Code Creator</h1></div> */}
+        
       </div>
       {error && <div className="alert alert--error">{error}</div>}
       {notice && <div className="alert alert--success">{notice}</div>}
@@ -278,17 +289,17 @@ export default function BoxQrCodeCreatorTab({ stores, onChanged }: Props) {
           <div className="panel__header"><div><p className="eyebrow">STORES CATALOG</p><h2>Select one to five items</h2></div><span className="table-count">{selectedGuids.length}/5 selected</span></div>
           <label className="box-qr-search-field">Search Tally Stock Items<input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Item name, group, or GUID" /></label>
           <div className="box-qr-catalog-filters">
-            <label>Stock Group<GroupFilterDropdown ariaLabel="Filter by Stock Group" tree={groupTree} value={groupFilter} onChange={setGroupFilter} /></label>
+            <label>Stock Group<GroupFilterDropdown ariaLabel="Filter by Stock Group" tree={groupTree} value={groupFilter.path} onChange={(path, node) => setGroupFilter(groupFilterValueFromNode(path, node))} /></label>
             <label>Stock Category<select value={categoryFilter} onChange={(event) => setCategoryFilter(event.target.value)}><option value="ALL">All Stock Categories</option>{categoryOptions.map((name) => <option key={name} value={name}>{name}</option>)}</select></label>
             <label>Stock<select value={stockFilter} onChange={(event) => setStockFilter(event.target.value as typeof stockFilter)}><option value="ALL">All stock</option><option value="AVAILABLE">Available only</option><option value="EMPTY">Zero stock</option></select></label>
             <label>Product type<select value={bomFilter} onChange={(event) => setBomFilter(event.target.value as typeof bomFilter)}><option value="ALL">All items</option><option value="BOM">Has BOM</option><option value="NO_BOM">No BOM</option></select></label>
-            <button type="button" className="text-button" onClick={() => { setSearch(""); setGroupFilter([]); setCategoryFilter("ALL"); setStockFilter("ALL"); setBomFilter("ALL"); }}>Clear filters</button>
+            <button type="button" className="text-button" onClick={() => { setSearch(""); setGroupFilter({ path: [], groupDepth: 0 }); setCategoryFilter("ALL"); setStockFilter("ALL"); setBomFilter("ALL"); }}>Clear filters</button>
           </div>
           <div className="box-qr-catalog-result-count">Showing {filtered.length} of {selectableItems.length} catalog items</div>
           <div className="box-qr-catalog-scroll" tabIndex={0}>
             {filtered.map((item) => (
               <button key={item.tallyGuid} type="button" className="box-qr-catalog-action" disabled={selectedGuids.length >= 5} onClick={() => setSelectedGuids((current) => [...current, item.tallyGuid])}>
-                <span><strong>{item.name}</strong><small>{[item.primaryGroupName, item.secondaryGroupName].filter(Boolean).join(" › ") || "Ungrouped"} · Available {item.localAvailableQuantity}</small></span><b>＋</b>
+                <span><strong>{item.name}</strong><small>{item.groupPath.join(" › ") || "Ungrouped"} · Available {item.localAvailableQuantity}</small></span><b>＋</b>
               </button>
             ))}
             {filtered.length === 0 && <p className="empty-table">No matching synchronized Stock Items.</p>}
@@ -301,7 +312,7 @@ export default function BoxQrCodeCreatorTab({ stores, onChanged }: Props) {
         </article>
 
         <article className="panel box-qr-builder-panel">
-          <div className="panel__header"><div><p className="eyebrow">BOX LABEL</p><h2>Authoritative box record</h2></div>{savedBox && <span className="health-badge">REVISION {savedBox.revision}</span>}</div>
+          <div className="panel__header"><div><p className="eyebrow">QR CODE GENERATOR</p><h2>Authoritative box record</h2></div>{savedBox && <span className="health-badge">REVISION {savedBox.revision}</span>}</div>
           <label className="path-field">Box ID<input value={boxId} onChange={(event) => setBoxId(event.target.value)} /></label>
           <div className="box-qr-selected-list">
             {selectedItems.map((item, index) => item && (
@@ -310,8 +321,12 @@ export default function BoxQrCodeCreatorTab({ stores, onChanged }: Props) {
             {selectedItems.length === 0 && <p className="muted">Choose at least one Tally Stock Item.</p>}
           </div>
           <button className="button box-qr-save" type="button" onClick={() => void saveBox()} disabled={busy}>{busy ? "Saving…" : "Save box and generate QR"}</button>
+          <button className="button box-qr-save" type="button" onClick={startNew}>New box</button>
           <div className="box-qr-preview">{qrDataUrl && savedBox ? <div className="box-label-preview"><img src={qrDataUrl} alt={`QR for ${savedBox.boxId}`} /><div className="box-label-preview__items">{savedBox.items.map((item) => <strong key={item.tallyItemGuid}>{item.itemName}</strong>)}</div></div> : <div className="qr-placeholder">Save the box to generate its version-3 QR.</div>}</div>
-          <div className="box-qr-actions"><button className="button button--secondary" type="button" onClick={downloadPng} disabled={!qrDataUrl}>Download PNG</button><button className="button button--ghost" type="button" onClick={clearItems} disabled={selectedGuids.length === 0}>Clear</button><label>Copies<input type="number" min="1" max="100" value={copies} onChange={(event) => setCopies(event.target.value)} /></label><button className="button" type="button" onClick={addToQueue} disabled={!qrDataUrl}>Add to print queue</button></div>
+          <div className="box-qr-actions"><button className="button button--secondary" type="button" onClick={downloadPng} disabled={!qrDataUrl}>Download PNG</button>
+          <button className="button button--ghost" type="button" onClick={clearItems} disabled={selectedGuids.length === 0}>Clear</button>
+          <label>Copies<input type="number" min="1" max="100" value={copies} onChange={(event) => setCopies(event.target.value)} /></label>
+          <button className="button" type="button" onClick={addToQueue} disabled={!qrDataUrl}>Add to print queue</button></div>
         </article>
       </div>
 

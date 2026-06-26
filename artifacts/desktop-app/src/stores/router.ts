@@ -9,11 +9,15 @@ function tokenFrom(request: Request): string {
   return header.replace(/^Bearer\s+/i, "").trim();
 }
 
+function computerNameFrom(request: Request): string {
+  return (request.header("x-inventory-computer-name") ?? "").trim();
+}
+
 export function createStoresRouter(service: StoresService, operations: OperationsService): Router {
   const router = Router();
   const actor = (request: Request, permission?: Parameters<OperationsService["requireActor"]>[1]) =>
-    operations.requireActor(tokenFrom(request), permission);
-  const phoneActor = (request: Request) => operations.scannerActor(request.header("x-scanner-token") ?? "");
+    operations.requireActor(tokenFrom(request), permission, computerNameFrom(request));
+  const phoneActor = (request: Request) => operations.scannerActor(request.header("x-scanner-token") ?? "", computerNameFrom(request));
 
   router.get("/state", (request, response) => {
     actor(request, "INVENTORY_VIEW");
@@ -25,6 +29,17 @@ export function createStoresRouter(service: StoresService, operations: Operation
   });
   router.delete("/catalog/local-items/:tallyItemGuid", (request, response) => {
     response.json(service.deleteStockItem({ tallyItemGuid: request.params.tallyItemGuid }, actor(request, "CATALOG_MANAGE")));
+  });
+  router.post("/catalog/item-fields", (request, response) => {
+    response.status(201).json(service.saveItemFieldDefinition(request.body, actor(request, "CATALOG_MANAGE")));
+  });
+  router.delete("/catalog/item-fields/:fieldId", (request, response) => {
+    response.json(service.deleteItemFieldDefinition(request.params.fieldId, actor(request, "CATALOG_MANAGE")));
+  });
+  router.post("/catalog/item-fields/reorder", (request, response) => {
+    response.json(service.reorderItemFieldDefinitions(
+      Array.isArray(request.body?.orderedIds) ? request.body.orderedIds : [], actor(request, "CATALOG_MANAGE"),
+    ));
   });
   router.post("/catalog/groups", (request, response) => {
     response.status(201).json(service.createCatalogGroup(request.body, actor(request, "CATALOG_MANAGE")));
@@ -39,7 +54,8 @@ export function createStoresRouter(service: StoresService, operations: Operation
     response.json(service.deleteStockCategory({ name: request.params.name }, actor(request, "CATALOG_MANAGE")));
   });
   router.post("/catalog/status", (request, response) => response.json(service.setCatalogStatus(request.body, actor(request, "CATALOG_MANAGE"))));
-  router.post("/catalog/visibility", (request, response) => response.json(service.setCatalogVisibility(request.body, actor(request, "CATALOG_MANAGE"))));
+  router.post("/catalog/group-role", (request, response) => response.json(service.setGroupCatalogRole(request.body, actor(request, "CATALOG_MANAGE"))));
+  router.post("/catalog/role", (request, response) => response.json(service.setCatalogRole(request.body, actor(request, "CATALOG_MANAGE"))));
   router.post("/catalog/rename", (request, response) => response.json(service.renameStockItem(request.body, actor(request, "CATALOG_MANAGE"))));
   router.post("/catalog/export-cleanup", (request, response) => response.json(service.exportCatalogCleanup(actor(request))));
 

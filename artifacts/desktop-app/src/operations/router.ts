@@ -9,13 +9,17 @@ function tokenFrom(request: Request): string {
   return header.replace(/^Bearer\s+/i, "").trim();
 }
 
+function computerNameFrom(request: Request): string {
+  return (request.header("x-inventory-computer-name") ?? "").trim();
+}
+
 export function createOperationsRouter(service: OperationsService): Router {
   const router = Router();
-  const actor = (request: Request, permission?: Permission) => service.requireActor(tokenFrom(request), permission);
+  const actor = (request: Request, permission?: Permission) => service.requireActor(tokenFrom(request), permission, computerNameFrom(request));
 
-  router.get("/auth/state", (request, response) => response.json(service.authState(tokenFrom(request))));
-  router.post("/auth/bootstrap", (request, response) => response.status(201).json(service.bootstrapAdmin(request.body)));
-  router.post("/auth/login", (request, response) => response.json(service.login(request.body)));
+  router.get("/auth/state", (request, response) => response.json(service.authState(tokenFrom(request), computerNameFrom(request))));
+  router.post("/auth/bootstrap", (request, response) => response.status(201).json(service.bootstrapAdmin(request.body, computerNameFrom(request))));
+  router.post("/auth/login", (request, response) => response.json(service.login(request.body, computerNameFrom(request))));
   router.post("/auth/recovery/request", async (request, response) => {
     await service.requestCredentialRecovery(request.body);
     response.status(204).end();
@@ -25,7 +29,7 @@ export function createOperationsRouter(service: OperationsService): Router {
     response.status(204).end();
   });
   router.post("/auth/email", (request, response) => response.json(service.updateOwnEmail(request.body, actor(request))));
-  router.post("/auth/resume", (request, response) => response.json(service.resume(String(request.body?.token ?? tokenFrom(request)))));
+  router.post("/auth/resume", (request, response) => response.json(service.resume(String(request.body?.token ?? tokenFrom(request)), computerNameFrom(request))));
   router.post("/auth/logout", (request, response) => {
     service.logout(tokenFrom(request));
     response.status(204).end();
@@ -37,6 +41,16 @@ export function createOperationsRouter(service: OperationsService): Router {
     service.resetCredential(request.body, actor(request, "AUTH_MANAGE_USERS"));
     response.status(204).end();
   });
+  router.get("/roles", (_request, response) => response.json(service.listRoles()));
+  router.post("/roles", (request, response) => response.status(201).json(service.createRole(request.body?.name, actor(request, "AUTH_MANAGE_USERS"))));
+  router.get("/role-permissions", (request, response) => response.json(service.getRolePermissions(actor(request, "AUTH_MANAGE_USERS"))));
+  router.post("/role-permissions", (request, response) => response.json(service.setRolePermission(
+    request.body.roleName, request.body.permission, Boolean(request.body.enabled), actor(request, "AUTH_MANAGE_USERS"),
+  )));
+  router.get("/computer-restrictions", (request, response) => response.json(service.getComputerRestrictions(actor(request, "AUTH_MANAGE_USERS"))));
+  router.post("/computer-restrictions", (request, response) => response.json(service.setComputerRestriction(
+    request.body.permission, Array.isArray(request.body.computerNames) ? request.body.computerNames : [], actor(request, "AUTH_MANAGE_USERS"),
+  )));
 
   router.post("/conditions/transition", (request, response) => response.status(201).json(service.transitionCondition(request.body, actor(request))));
   router.post("/faults", (request, response) => response.status(201).json(service.createFault(request.body, actor(request, "MARK_FAULTY"))));

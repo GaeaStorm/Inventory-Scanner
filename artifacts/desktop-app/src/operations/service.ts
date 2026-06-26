@@ -46,22 +46,22 @@ export class OperationsService {
     this.planning = planning;
   }
 
-  actorForToken(token: string): ActorContext | null {
-    return this.database.actorForToken(token);
+  actorForToken(token: string, computerName = ""): ActorContext | null {
+    return this.database.actorForToken(token, computerName);
   }
 
-  requireActor(token: string, permission?: Permission): ActorContext {
-    const actor = this.actorForToken(token);
+  requireActor(token: string, permission?: Permission, computerName = ""): ActorContext {
+    const actor = this.actorForToken(token, computerName);
     if (!actor) throw new Error("Sign in before performing this operation.");
     return permission ? requirePermission(actor, permission) : actor;
   }
 
-  bootstrapAdmin(input: BootstrapAdminInput) {
-    return this.database.bootstrapAdmin(input);
+  bootstrapAdmin(input: BootstrapAdminInput, computerName = "") {
+    return this.database.bootstrapAdmin(input, computerName);
   }
 
-  login(input: LoginInput) {
-    return this.database.login(input);
+  login(input: LoginInput, computerName = "") {
+    return this.database.login(input, computerName);
   }
 
   async requestCredentialRecovery(input: RequestCredentialRecoveryInput): Promise<void> {
@@ -82,30 +82,56 @@ export class OperationsService {
     return this.database.updateOwnEmail(input, actor);
   }
 
-  sharedPhoneActor() {
-    return this.database.sharedPhoneActor();
+  sharedPhoneActor(computerName = "") {
+    return this.database.sharedPhoneActor(computerName);
   }
 
-  scannerActor(deviceToken: string) {
-    const actor = this.database.scannerActor(deviceToken);
+  scannerActor(deviceToken: string, computerName = "") {
+    const actor = this.database.scannerActor(deviceToken, computerName);
     if (!actor) throw new Error("This scanner is not paired or has been revoked.");
     return actor;
   }
 
-  resume(token: string) {
-    return this.database.resume(token);
+  resume(token: string, computerName = "") {
+    return this.database.resume(token, computerName);
   }
 
   logout(token: string) {
     this.database.logout(token);
   }
 
-  authState(token?: string) {
-    return this.database.authState(token ? this.actorForToken(token) : null);
+  authState(token?: string, computerName = "") {
+    return this.database.authState(token ? this.actorForToken(token, computerName) : null, computerName);
   }
 
   saveUser(input: SaveUserInput, actor: ActorContext) {
     return this.database.saveUser(input, actor);
+  }
+
+  listRoles() {
+    return this.database.listRoles();
+  }
+
+  createRole(name: string, actor: ActorContext) {
+    this.database.createRole(name, actor);
+    return this.database.listRoles();
+  }
+
+  getRolePermissions(actor: ActorContext) {
+    return this.database.getRolePermissions(actor);
+  }
+
+  setRolePermission(roleName: string, permission: Permission, enabled: boolean, actor: ActorContext) {
+    this.database.setRolePermission(roleName, permission, enabled, actor);
+    return this.database.getRolePermissions(actor);
+  }
+
+  getComputerRestrictions(actor: ActorContext) {
+    return this.database.getComputerRestrictions(actor);
+  }
+
+  setComputerRestriction(permission: Permission, computerNames: string[], actor: ActorContext) {
+    return this.database.setComputerRestriction(permission, computerNames, actor);
   }
 
   resetCredential(input: ResetCredentialInput, actor: ActorContext) {

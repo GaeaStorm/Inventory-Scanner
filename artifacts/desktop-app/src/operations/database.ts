@@ -57,7 +57,8 @@ import type {
   TraceabilityInput,
   UserRole,
 } from "./types";
-import { permissionsForRole, requirePermission } from "./permissions";
+import { allPermissions, defaultPermissionsByRole, permissionsForRole, requirePermission, resolveActorPermissions } from "./permissions";
+import { formatQualifiedItemName } from "../stores/item-family";
 
 const MODULE_NAME = "operations";
 const SESSION_HOURS = 12;
@@ -629,6 +630,146 @@ const migrations: ApplicationDatabaseMigration[] = [
       `);
     },
   },
+  {
+    version: 6,
+    description: "Add full qualified-name and group-path snapshots to movements",
+    up(database: DatabaseSync) {
+      database.exec(`
+        ALTER TABLE ops_movements ADD COLUMN item_qualified_name_snapshot TEXT NOT NULL DEFAULT '';
+        ALTER TABLE ops_movements ADD COLUMN item_group_path_snapshot TEXT NOT NULL DEFAULT '[]';
+      `);
+      // Best-effort backfill using each item's *current* name/group — there is
+      // no rename/regroup history to protect retroactively for older rows.
+      const groupRows = database.prepare("SELECT name, parent_name FROM tally_stock_groups").all() as Array<{ name: string; parent_name: string }>;
+      const parents = new Map(groupRows.map((row) => [String(row.name ?? "").toLocaleLowerCase(), String(row.parent_name ?? "")]));
+      const groupPathFor = (directName: string): string[] => {
+        const direct = String(directName ?? "").trim();
+        if (!direct) return [];
+        const result: string[] = [];
+        let current = direct;
+        const visited = new Set<string>();
+        for (;;) {
+          const key = current.toLocaleLowerCase();
+          if (visited.has(key)) break;
+          visited.add(key);
+          result.unshift(current);
+          const parent = parents.get(key) ?? "";
+          if (!parent || parent.toLocaleLowerCase() === "primary") break;
+          current = parent;
+        }
+        return result;
+      };
+      const items = database.prepare("SELECT id, name, parent_name FROM tally_stock_items").all() as Array<{ id: number; name: string; parent_name: string }>;
+      const itemGroupPathById = new Map(items.map((item) => [item.id, groupPathFor(item.parent_name)]));
+      const movementRows = database.prepare("SELECT id, stock_item_id, item_name_snapshot FROM ops_movements").all() as Array<{ id: string; stock_item_id: number; item_name_snapshot: string }>;
+      const update = database.prepare(`
+        UPDATE ops_movements SET item_qualified_name_snapshot = ?, item_group_path_snapshot = ? WHERE id = ?
+      `);
+      for (const movement of movementRows) {
+        const groupPath = itemGroupPathById.get(movement.stock_item_id) ?? [];
+        const name = String(movement.item_name_snapshot ?? "");
+        update.run(formatQualifiedItemName(groupPath, name), JSON.stringify(groupPath), movement.id);
+      }
+    },
+  },
+  {
+    version: 7,
+    description: "Make role permissions admin-configurable instead of hardcoded",
+    up(database: DatabaseSync) {
+      database.exec(`
+        CREATE TABLE ops_role_permissions (
+          role_name TEXT NOT NULL,
+          permission TEXT NOT NULL,
+          enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0,1)),
+          PRIMARY KEY(role_name, permission)
+        ) STRICT;
+      `);
+      const insert = database.prepare(`
+        INSERT INTO ops_role_permissions(role_name, permission, enabled) VALUES (?, ?, ?)
+      `);
+      for (const [role, granted] of Object.entries(defaultPermissionsByRole)) {
+        const grantedSet = new Set(granted);
+        for (const permission of allPermissions) {
+          insert.run(role, permission, grantedSet.has(permission) ? 1 : 0);
+        }
+      }
+    },
+  },
+  {
+    version: 8,
+    description: "Allow custom roles beyond the original 5 fixed ones",
+    up(database: DatabaseSync) {
+      database.exec(`
+        CREATE TABLE ops_roles (
+          name TEXT PRIMARY KEY,
+          is_system INTEGER NOT NULL DEFAULT 0 CHECK (is_system IN (0,1)),
+          created_at TEXT NOT NULL
+        ) STRICT;
+      `);
+      const insertRole = database.prepare(
+        "INSERT INTO ops_roles(name, is_system, created_at) VALUES (?, 1, ?)",
+      );
+      const timestamp = new Date().toISOString();
+      for (const role of Object.keys(defaultPermissionsByRole)) {
+        insertRole.run(role, timestamp);
+      }
+
+      // Recreates the table to drop the role CHECK constraint (SQLite can't
+      // alter that in place). Other tables' REFERENCES ops_users(id) resolve
+      // by name once the new table takes over the original name below; the
+      // constructor disables foreign_keys around this whole migration run
+      // so the brief absence of the parent table doesn't trip FK enforcement.
+      database.exec(`
+        CREATE TABLE ops_users_new (
+          id TEXT PRIMARY KEY,
+          display_name TEXT NOT NULL,
+          username TEXT NOT NULL UNIQUE COLLATE NOCASE,
+          credential_hash TEXT NOT NULL,
+          credential_salt TEXT NOT NULL,
+          credential_type TEXT NOT NULL CHECK (credential_type IN ('PASSWORD','PIN')),
+          role TEXT NOT NULL REFERENCES ops_roles(name),
+          active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0,1)),
+          must_reset_credential INTEGER NOT NULL DEFAULT 0 CHECK (must_reset_credential IN (0,1)),
+          last_login TEXT,
+          audit_identity TEXT NOT NULL UNIQUE,
+          version INTEGER NOT NULL DEFAULT 1 CHECK (version > 0),
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          email TEXT NOT NULL DEFAULT '',
+          email_required INTEGER NOT NULL DEFAULT 1 CHECK (email_required IN (0,1))
+        ) STRICT;
+
+        INSERT INTO ops_users_new (
+          id, display_name, username, credential_hash, credential_salt, credential_type,
+          role, active, must_reset_credential, last_login, audit_identity, version,
+          created_at, updated_at, email, email_required
+        )
+        SELECT
+          id, display_name, username, credential_hash, credential_salt, credential_type,
+          role, active, must_reset_credential, last_login, audit_identity, version,
+          created_at, updated_at, email, email_required
+        FROM ops_users;
+
+        DROP TABLE ops_users;
+        ALTER TABLE ops_users_new RENAME TO ops_users;
+        CREATE UNIQUE INDEX idx_ops_users_email_unique
+          ON ops_users(email COLLATE NOCASE) WHERE email <> '';
+      `);
+    },
+  },
+  {
+    version: 9,
+    description: "Allow restricting a permission to specific named computers",
+    up(database: DatabaseSync) {
+      database.exec(`
+        CREATE TABLE ops_permission_computer_restrictions (
+          permission TEXT NOT NULL,
+          computer_name TEXT NOT NULL,
+          PRIMARY KEY(permission, computer_name)
+        ) STRICT;
+      `);
+    },
+  },
 ];
 
 export class OperationsDatabase {
@@ -637,7 +778,17 @@ export class OperationsDatabase {
 
   constructor(host: ApplicationDatabase, beforeMigration?: () => void) {
     this.host = host;
-    this.moduleVersion = this.host.migrateModule(MODULE_NAME, migrations, beforeMigration);
+    // Migration 8 recreates ops_users (SQLite can't drop a column CHECK
+    // constraint in place), which many other tables reference by foreign key
+    // (ops_sessions, ops_audit_events, ops_movements, ops_scanner_devices,
+    // and more) — foreign_keys must be off while the parent table is briefly
+    // gone, and can only be toggled outside an active transaction.
+    this.host.db.exec("PRAGMA foreign_keys = OFF");
+    try {
+      this.moduleVersion = this.host.migrateModule(MODULE_NAME, migrations, beforeMigration);
+    } finally {
+      this.host.db.exec("PRAGMA foreign_keys = ON");
+    }
     this.pruneExpiredSessions();
   }
 
@@ -710,7 +861,7 @@ export class OperationsDatabase {
       .map((row) => this.mapUser(row));
   }
 
-  authState(actor?: ActorContext | null): AuthState {
+  authState(actor?: ActorContext | null, computerName = ""): AuthState {
     const currentUser = actor
       ? this.listUsers().find((user) => user.userId === actor.userId) ?? null
       : null;
@@ -720,12 +871,12 @@ export class OperationsDatabase {
         WHERE id <> ? AND id NOT LIKE 'SCANNER:%'
       `).get(SHARED_PHONE_USER_ID) as Row).count) === 0,
       currentUser,
-      permissions: currentUser ? permissionsForRole(currentUser.role) : [],
+      permissions: currentUser ? resolveActorPermissions(this.db, currentUser.role, computerName) : [],
       users: currentUser?.role === "ADMIN" ? this.listUsers() : [],
     };
   }
 
-  bootstrapAdmin(input: BootstrapAdminInput): AuthSession {
+  bootstrapAdmin(input: BootstrapAdminInput, computerName = ""): AuthSession {
     return this.transaction("creating the first administrator", () => {
       const count = Number((this.db.prepare("SELECT COUNT(*) AS count FROM ops_users").get() as Row).count);
       if (count !== 0) throw new Error("The initial administrator has already been created.");
@@ -746,11 +897,11 @@ export class OperationsDatabase {
       `).run(userId, displayName, username, hashed.hash, hashed.salt, credentialType, `ADMIN:${username}`, email, timestamp, timestamp);
       const actor: ActorContext = { userId, username, displayName, auditIdentity: `ADMIN:${username}`, role: "ADMIN" };
       this.audit(actor, "BOOTSTRAP_ADMIN", "USER", userId, { username });
-      return this.createSession(userId, text(input.username) ? "Initial desktop" : "");
+      return this.createSession(userId, text(input.username) ? "Initial desktop" : "", computerName);
     });
   }
 
-  private createSession(userId: string, deviceLabel: string): AuthSession {
+  private createSession(userId: string, deviceLabel: string, computerName = ""): AuthSession {
     const row = this.db.prepare("SELECT * FROM ops_users WHERE id = ? AND active = 1").get(userId) as Row | undefined;
     if (!row) throw new Error("The user account is inactive or unavailable.");
     const token = randomBytes(32).toString("base64url");
@@ -762,17 +913,17 @@ export class OperationsDatabase {
     `).run(hashToken(token), userId, deviceLabel, createdAt, expiresAt, createdAt);
     this.db.prepare("UPDATE ops_users SET last_login = ?, updated_at = ? WHERE id = ?").run(createdAt, createdAt, userId);
     const user = this.mapUser({ ...row, last_login: createdAt, updated_at: createdAt });
-    return { token, expiresAt, user, permissions: permissionsForRole(user.role) };
+    return { token, expiresAt, user, permissions: resolveActorPermissions(this.db, user.role, computerName) };
   }
 
-  login(input: LoginInput): AuthSession {
+  login(input: LoginInput, computerName = ""): AuthSession {
     return this.transaction("signing in", () => {
       const username = text(input.username);
       const row = this.db.prepare("SELECT * FROM ops_users WHERE username = ? COLLATE NOCASE").get(username) as Row | undefined;
       if (!row || Number(row.active) !== 1 || !verifyCredential(String(input.credential ?? ""), text(row.credential_salt), text(row.credential_hash))) {
         throw new Error("Invalid username or credential.");
       }
-      return this.createSession(text(row.id), text(input.deviceLabel));
+      return this.createSession(text(row.id), text(input.deviceLabel), computerName);
     });
   }
 
@@ -897,7 +1048,7 @@ export class OperationsDatabase {
     });
   }
 
-  scannerActor(deviceToken: string): ActorContext | null {
+  scannerActor(deviceToken: string, computerName = ""): ActorContext | null {
     const tokenHash = hashToken(text(deviceToken));
     if (!deviceToken) return null;
     const row = this.db.prepare(`
@@ -916,6 +1067,8 @@ export class OperationsDatabase {
       displayName: text(row.label),
       auditIdentity: text(row.audit_identity),
       role: "STORE",
+      permissions: resolveActorPermissions(this.db, "STORE", computerName),
+      computerName,
     };
   }
 
@@ -942,7 +1095,7 @@ export class OperationsDatabase {
     this.audit(actor, "SCANNER_REVOKED", "SCANNER", text(deviceId), {});
   }
 
-  sharedPhoneActor(): ActorContext {
+  sharedPhoneActor(computerName = ""): ActorContext {
     const realUserCount = Number((this.db.prepare(
       "SELECT COUNT(*) AS count FROM ops_users WHERE id <> ?",
     ).get(SHARED_PHONE_USER_ID) as Row).count);
@@ -967,10 +1120,12 @@ export class OperationsDatabase {
       displayName: text(row.display_name),
       auditIdentity: text(row.audit_identity),
       role: "STORE",
+      permissions: resolveActorPermissions(this.db, "STORE", computerName),
+      computerName,
     };
   }
 
-  actorForToken(token: string): ActorContext | null {
+  actorForToken(token: string, computerName = ""): ActorContext | null {
     const tokenValue = text(token);
     if (!tokenValue) return null;
     const timestamp = nowIso();
@@ -981,21 +1136,24 @@ export class OperationsDatabase {
     `).get(hashToken(tokenValue), timestamp) as Row | undefined;
     if (!row) return null;
     this.db.prepare("UPDATE ops_sessions SET last_seen_at = ? WHERE token_hash = ?").run(timestamp, hashToken(tokenValue));
+    const role = text(row.role) as UserRole;
     return {
       userId: text(row.id),
       username: text(row.username),
       displayName: text(row.display_name),
       auditIdentity: text(row.audit_identity),
-      role: text(row.role) as UserRole,
+      role,
+      permissions: resolveActorPermissions(this.db, role, computerName),
+      computerName,
     };
   }
 
-  resume(token: string): AuthSession {
-    const actor = this.actorForToken(token);
+  resume(token: string, computerName = ""): AuthSession {
+    const actor = this.actorForToken(token, computerName);
     if (!actor) throw new Error("The saved session has expired. Sign in again.");
     const user = this.listUsers().find((entry) => entry.userId === actor.userId)!;
     const session = this.db.prepare("SELECT expires_at FROM ops_sessions WHERE token_hash = ?").get(hashToken(token)) as Row;
-    return { token, expiresAt: text(session.expires_at), user, permissions: permissionsForRole(user.role) };
+    return { token, expiresAt: text(session.expires_at), user, permissions: resolveActorPermissions(this.db, user.role, computerName) };
   }
 
   logout(token: string): void {
@@ -1011,7 +1169,7 @@ export class OperationsDatabase {
       const email = emailAddress(input.email);
       const role = input.role;
       if (!displayName || !username) throw new Error("Display name and username are required.");
-      if (!["STORE", "ACCOUNTS", "PRODUCTION", "SALES", "ADMIN"].includes(role)) throw new Error("Choose a valid role.");
+      if (!this.db.prepare("SELECT 1 FROM ops_roles WHERE name = ?").get(role)) throw new Error("Choose a valid role.");
       const existing = this.db.prepare("SELECT * FROM ops_users WHERE id = ?").get(id) as Row | undefined;
       const timestamp = nowIso();
       if (!existing) {
@@ -1050,6 +1208,85 @@ export class OperationsDatabase {
     });
   }
 
+  /** Every known role × every known permission, with its current enabled flag — the full grid an admin edits. */
+  listRoles(): Array<{ name: string; isSystem: boolean }> {
+    return (this.db.prepare("SELECT name, is_system FROM ops_roles ORDER BY is_system DESC, name").all() as Row[])
+      .map((row) => ({ name: text(row.name), isSystem: Number(row.is_system) === 1 }));
+  }
+
+  createRole(name: string, actor: ActorContext): void {
+    requirePermission(actor, "AUTH_MANAGE_USERS");
+    const roleName = text(name).toLocaleUpperCase().replaceAll(/[^A-Z0-9_]/g, "_");
+    if (!roleName) throw new Error("Enter a role name.");
+    if (this.db.prepare("SELECT 1 FROM ops_roles WHERE name = ?").get(roleName)) {
+      throw new Error("A role with that name already exists.");
+    }
+    this.transaction("creating a custom role", () => {
+      this.db.prepare("INSERT INTO ops_roles(name, is_system, created_at) VALUES (?, 0, ?)").run(roleName, nowIso());
+      const insert = this.db.prepare("INSERT INTO ops_role_permissions(role_name, permission, enabled) VALUES (?, ?, 0)");
+      for (const permission of allPermissions) insert.run(roleName, permission);
+      this.audit(actor, "ROLE_CREATED", "ROLE", roleName, {});
+    });
+  }
+
+  getRolePermissions(actor: ActorContext): Array<{ roleName: string; permission: Permission; enabled: boolean }> {
+    requirePermission(actor, "AUTH_MANAGE_USERS");
+    const roles = (this.db.prepare("SELECT DISTINCT role_name FROM ops_role_permissions ORDER BY role_name").all() as Row[])
+      .map((row) => text(row.role_name));
+    const enabledByKey = new Set(
+      (this.db.prepare("SELECT role_name, permission FROM ops_role_permissions WHERE enabled = 1").all() as Row[])
+        .map((row) => `${text(row.role_name)}::${text(row.permission)}`),
+    );
+    return roles.flatMap((roleName) => allPermissions.map((permission) => ({
+      roleName,
+      permission,
+      enabled: enabledByKey.has(`${roleName}::${permission}`),
+    })));
+  }
+
+  setRolePermission(roleName: string, permission: Permission, enabled: boolean, actor: ActorContext): void {
+    requirePermission(actor, "AUTH_MANAGE_USERS");
+    if (!allPermissions.includes(permission)) throw new Error("Unknown permission.");
+    if (text(roleName).toLocaleUpperCase() === "ADMIN" && !enabled) {
+      throw new Error("ADMIN always has every permission and cannot be restricted.");
+    }
+    this.db.prepare(`
+      INSERT INTO ops_role_permissions(role_name, permission, enabled) VALUES (?, ?, ?)
+      ON CONFLICT(role_name, permission) DO UPDATE SET enabled = excluded.enabled
+    `).run(text(roleName), permission, enabled ? 1 : 0);
+    this.audit(actor, enabled ? "ROLE_PERMISSION_GRANTED" : "ROLE_PERMISSION_REVOKED", "ROLE", text(roleName), { permission });
+  }
+
+  /** Every permission that currently has at least one named-computer restriction, with the computer names allowed for it. A permission absent here is unrestricted. */
+  getComputerRestrictions(actor: ActorContext): Array<{ permission: Permission; computerNames: string[] }> {
+    requirePermission(actor, "AUTH_MANAGE_USERS");
+    const rows = this.db.prepare(
+      "SELECT permission, computer_name FROM ops_permission_computer_restrictions ORDER BY permission, computer_name",
+    ).all() as Row[];
+    const byPermission = new Map<string, string[]>();
+    for (const row of rows) {
+      const permission = text(row.permission);
+      const list = byPermission.get(permission) ?? [];
+      list.push(text(row.computer_name));
+      byPermission.set(permission, list);
+    }
+    return [...byPermission.entries()].map(([permission, computerNames]) => ({ permission: permission as Permission, computerNames }));
+  }
+
+  /** Replaces the full set of allowed computers for one permission. An empty list removes the restriction entirely (unrestricted). */
+  setComputerRestriction(permission: Permission, computerNames: string[], actor: ActorContext): Array<{ permission: Permission; computerNames: string[] }> {
+    requirePermission(actor, "AUTH_MANAGE_USERS");
+    if (!allPermissions.includes(permission)) throw new Error("Unknown permission.");
+    const names = [...new Set(computerNames.map((name) => text(name)).filter(Boolean))];
+    this.transaction("updating a per-computer permission restriction", () => {
+      this.db.prepare("DELETE FROM ops_permission_computer_restrictions WHERE permission = ?").run(permission);
+      const insert = this.db.prepare("INSERT INTO ops_permission_computer_restrictions(permission, computer_name) VALUES (?, ?)");
+      for (const name of names) insert.run(permission, name);
+      this.audit(actor, "PERMISSION_COMPUTER_RESTRICTION_SET", "PERMISSION", permission, { computerNames: names });
+    });
+    return this.getComputerRestrictions(actor);
+  }
+
   updateOwnEmail(input: { email: string }, actor: ActorContext): AuthUser {
     const email = emailAddress(input.email);
     this.transaction("saving an account recovery email", () => {
@@ -1084,6 +1321,27 @@ export class OperationsDatabase {
     `).get(text(tallyItemGuid)) as Row | undefined;
     if (!row) throw new Error("The selected Stock Item is not available.");
     return row;
+  }
+
+  /** Walks tally_stock_groups.parent_name up to "Primary", same algorithm Stores uses. */
+  private resolveGroupPath(directName: string): string[] {
+    const direct = text(directName);
+    if (!direct) return [];
+    const groupRows = this.db.prepare("SELECT name, parent_name FROM tally_stock_groups").all() as Row[];
+    const parents = new Map(groupRows.map((row) => [text(row.name).toLocaleLowerCase(), text(row.parent_name)]));
+    const result: string[] = [];
+    let current = direct;
+    const visited = new Set<string>();
+    for (;;) {
+      const key = current.toLocaleLowerCase();
+      if (visited.has(key)) break;
+      visited.add(key);
+      result.unshift(current);
+      const parent = parents.get(key) ?? "";
+      if (!parent || parent.toLocaleLowerCase() === "primary") break;
+      current = parent;
+    }
+    return result;
   }
 
   private stockItemById(stockItemId: number): Row {
@@ -1393,18 +1651,22 @@ export class OperationsDatabase {
     const supplier = this.supplierRow(input.supplierId);
     const movementId = `OPM-${randomUUID()}`;
     const timestamp = nowIso();
+    const itemGroupPath = this.resolveGroupPath(text(item.parent_name));
     this.db.prepare(`
       INSERT INTO ops_movements(
         id, client_transaction_id, movement_type, event_date, event_timestamp, stock_item_id,
-        item_name_snapshot, item_group_snapshot, quantity, source_condition, target_condition,
+        item_name_snapshot, item_group_snapshot, item_qualified_name_snapshot, item_group_path_snapshot,
+        quantity, source_condition, target_condition,
         supplier_id, supplier_name_snapshot, purchase_order_id, purchase_order_reference,
         receipt_reference, product_order_id, product_name_snapshot, fault_id,
         legacy_movement_id, reference_movement_id, reversal_of_movement_id, status,
         notes, metadata_json, operator_user_id, operator_name, operator_role, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       movementId, text(input.clientTransactionId), input.movementType, dateOnly(input.eventDate), timestamp,
-      input.stockItemId, text(item.name), text(item.parent_name), whole(input.quantity, "Movement quantity"),
+      input.stockItemId, text(item.name), text(item.parent_name),
+      formatQualifiedItemName(itemGroupPath, text(item.name)), json(itemGroupPath),
+      whole(input.quantity, "Movement quantity"),
       input.sourceCondition ?? null, input.targetCondition ?? null, input.supplierId ?? null,
       text(supplier?.name), input.purchaseOrderId ?? null, text(input.purchaseOrderReference),
       text(input.receiptReference), text(input.productOrderId), text(input.productName), text(input.faultId),

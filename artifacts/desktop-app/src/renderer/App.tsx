@@ -4,14 +4,11 @@ import QRCode from "qrcode";
 import BackupRestorePanel from "./BackupRestorePanel";
 import AdministrationDashboard from "./AdministrationDashboard";
 import AuthGate from "./AuthGate";
-import BoxQrCodeCreatorTab from "./BoxQrCodeCreatorTab";
-import BulkMaterialInForm from "./BulkMaterialInForm";
-import CatalogStatusPanel from "./CatalogStatusPanel";
 import DeploymentSetup from "./DeploymentSetup";
 import InventoryPlanningDashboard from "./InventoryPlanningDashboard";
-import OpeningQuantityPanel from "./OpeningQuantityPanel";
 import OperationsTab from "./OperationsTab";
 import TallyTab from "./TallyTab";
+import PermissionsPanel from "./PermissionsPanel";
 import UserManagementPanel from "./UserManagementPanel";
 import {
   getDashboard,
@@ -31,13 +28,13 @@ import type {
   ScannerDevice,
 } from "./types";
 
-const tabs: Array<{ id: AppTab; label: string; icon: string; permission?: Permission }> = [
-  { id: "dashboard", label: "Inventory Dashboard", icon: "▦", permission: "RESTOCK_VIEW" },
+const tabs: Array<{ id: AppTab; label: string; icon: string; permission?: Permission | Permission[] }> = [
   { id: "administration", label: "Admin Dashboard", icon: "₹", permission: "TALLY_REVIEW" },
-  { id: "tracker", label: "Inventory Tracker", icon: "▤", permission: "INVENTORY_VIEW" },
   { id: "operations", label: "Orders & Production", icon: "↻", permission: "INVENTORY_VIEW" },
-  { id: "qr", label: "QR Code Creator", icon: "⌗", permission: "QR_MANAGE" },
-  { id: "settings", label: "Settings", icon: "⚙", permission: "SETTINGS_MANAGE" },
+  { id: "dashboard", label: "Inventory Dashboard", icon: "▦", permission: "RESTOCK_VIEW" },
+  // Anyone who can manage settings OR just pair scanner phones needs to reach this tab —
+  // the panels inside are gated individually so Stores only sees the pairing card.
+  { id: "settings", label: "Settings", icon: "⚙", permission: ["SETTINGS_MANAGE", "SCANNER_PAIRING_MANAGE"] },
   { id: "tally", label: "Tally Syncer", icon: "⇄", permission: "TALLY_REVIEW" },
 ];
 
@@ -88,19 +85,37 @@ export default function App() {
   const [requiredEmail, setRequiredEmail] = useState("");
 
   const refresh = useCallback(async () => {
-    const [nextStores, nextPlanning, nextOperations, nextDashboard, nextAuth] = await Promise.all([
-      window.desktop.stores.getState(),
-      window.desktop.planning.getState(),
-      window.desktop.operations.getState(),
-      getDashboard(100),
-      window.desktop.auth.state(),
-    ]);
-    setStores(nextStores);
-    setPlanning(nextPlanning);
-    setOperations(nextOperations);
-    setDashboard(nextDashboard);
-    setAuth(nextAuth);
+    setNotice("");
+    setError("");
+    try {
+      const [nextStores, nextPlanning, nextOperations, nextDashboard, nextAuth] = await Promise.all([
+        window.desktop.stores.getState(),
+        window.desktop.planning.getState(),
+        window.desktop.operations.getState(),
+        getDashboard(100),
+        window.desktop.auth.state(),
+      ]);
+      setStores(nextStores);
+      setPlanning(nextPlanning);
+      setOperations(nextOperations);
+      setDashboard(nextDashboard);
+      setAuth(nextAuth);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    }
   }, []);
+
+  useEffect(() => {
+    if (!notice) return;
+    const timer = setTimeout(() => setNotice(""), 30_000);
+    return () => clearTimeout(timer);
+  }, [notice]);
+
+  useEffect(() => {
+    if (!error) return;
+    const timer = setTimeout(() => setError(""), 30_000);
+    return () => clearTimeout(timer);
+  }, [error]);
 
   useEffect(() => {
     let cancelled = false;
@@ -198,7 +213,7 @@ export default function App() {
     ? dashboard.scannerUrls
     : desktopInfo?.scannerUrls ?? [];
   useEffect(() => {
-    if (activeTab !== "settings" || !session?.permissions.includes("SETTINGS_MANAGE")) return;
+    if (activeTab !== "settings" || !session?.permissions.includes("SCANNER_PAIRING_MANAGE")) return;
     void window.desktop.scanners.list().then(setScannerDevices).catch(() => undefined);
   }, [activeTab, session]);
 
@@ -242,7 +257,8 @@ export default function App() {
     return <AuthGate authState={auth ?? { needsBootstrap: false, currentUser: null, permissions: [], users: [] }} onAuthenticated={(next) => void authenticated(next)} />;
   }
 
-  const visibleTabs = tabs.filter((tab) => !tab.permission || auth.permissions.includes(tab.permission));
+  const visibleTabs = tabs.filter((tab) => !tab.permission
+    || (Array.isArray(tab.permission) ? tab.permission.some((permission) => auth.permissions.includes(permission)) : auth.permissions.includes(tab.permission)));
   const can = (permission: Permission) => auth.permissions.includes(permission);
 
   return (
@@ -279,51 +295,6 @@ export default function App() {
           <div className="alert alert--demo"><strong>Demo data is active.</strong> Sync Tally to replace it.</div>
         )}
 
-        {activeTab === "tracker" && stores && (
-          <section className="tab-page">
-            <div className="page-heading">
-              <div><p className="eyebrow">LOCAL STORES DATABASE</p><h1>Inventory Tracker</h1></div>
-              <button className="button button--secondary" type="button" onClick={() => void refresh()}>Refresh</button>
-            </div>
-            {can("RECEIVE_MATERIAL") && <BulkMaterialInForm
-              stores={stores}
-              onChanged={handleStoresChanged}
-              onNotice={setNotice}
-              onError={setError}
-            />}
-            <article className="panel table-panel">
-              <div className="panel__header"><div><p className="eyebrow">RECENT EVENTS</p><h2>Vendor receipts, issues, and adjustments</h2></div><span className="table-count">{stores.recentMovements.length} shown</span></div>
-              <div className="table-scroll stores-main-table"><table>
-                <thead><tr><th>Date</th><th>Workflow</th><th>Box</th><th>Item</th><th>Qty</th><th>Destination / details</th><th>PO / challan</th><th>Status</th></tr></thead>
-                <tbody>
-                  {stores.recentMovements.map((movement) => (
-                    <tr key={movement.id}>
-                      <td>{movement.eventDate}</td><td>{movement.workflow.replaceAll("_", " ")}</td><td><code>{movement.boxId || "—"}</code></td><td>{movement.itemName}</td><td>{movement.quantity}</td>
-                      <td>
-                        <span>{movement.destinationName || movement.supplierName || "—"}</span>
-                        {movement.workflow === "ADJUSTMENT" && <small className="table-subtext">{movement.adjustmentDirection === "RETURN_TO_STOCK" ? "Return to stock" : "Additional issue"} · {formatCode(movement.adjustmentReason)}{movement.adjustmentNote ? ` · ${movement.adjustmentNote}` : ""}</small>}
-                      </td><td>{[movement.poNumber, movement.challanNumber].filter(Boolean).join(" / ") || "—"}</td><td><span className={`review-status review-status--${movement.status.toLowerCase().replaceAll("_", "-")}`}>{movement.status}</span></td>
-                    </tr>
-                  ))}
-                  {stores.recentMovements.length === 0 && <tr><td colSpan={8} className="empty-table">No local inventory movements have been recorded yet.</td></tr>}
-                </tbody>
-              </table></div>
-            </article>
-            {can("STOCK_ADJUST") && <OpeningQuantityPanel
-              stores={stores}
-              onChanged={handleStoresChanged}
-              onNotice={setNotice}
-              onError={setError}
-            />}
-            {can("CATALOG_MANAGE") && <CatalogStatusPanel
-              stores={stores}
-              onChanged={handleStoresChanged}
-              onNotice={setNotice}
-              onError={setError}
-            />}
-          </section>
-        )}
-
         {activeTab === "operations" && stores && planning && operations && (
           <OperationsTab stores={stores} planning={planning} operations={operations} auth={auth} permissions={auth.permissions} onRefresh={refresh} onNotice={setNotice} onError={setError} />
         )}
@@ -332,8 +303,10 @@ export default function App() {
           <InventoryPlanningDashboard
             planning={planning}
             stores={stores}
+            permissions={auth.permissions}
             onPlanningChanged={setPlanning}
             onStoresChanged={handleStoresChanged}
+            onRefresh={refresh}
             onNotice={setNotice}
             onError={setError}
           />
@@ -343,15 +316,11 @@ export default function App() {
           <AdministrationDashboard operations={operations} planning={planning} onRefresh={refresh} />
         )}
 
-        {activeTab === "qr" && stores && (
-          <BoxQrCodeCreatorTab stores={stores} onChanged={handleStoresChanged} />
-        )}
-
         {activeTab === "settings" && stores && (
           <section className="tab-page">
             <div className="page-heading"><div><p className="eyebrow">APPLICATION SETTINGS</p><h1>Scanner, database, and exports</h1></div></div>
             <div className="settings-grid settings-grid--application">
-              <article className="panel">
+              {can("SETTINGS_MANAGE") && <article className="panel">
                 <div className="panel__header"><div><p className="eyebrow">COMPANY LAN</p><h2>{desktopInfo?.deploymentRole === "LAN_CLIENT" ? "LAN client" : "Production server"}</h2></div><span className="health-badge">{desktopInfo?.deploymentRole === "LAN_CLIENT" ? "REMOTE" : "AUTHORITATIVE"}</span></div>
                 <dl className="settings-details">
                   <div><dt>This computer</dt><dd>{desktopInfo?.computerName ?? "Production"}</dd></div>
@@ -363,8 +332,8 @@ export default function App() {
                 <div className="settings-actions">
                   <button className="button button--secondary" type="button" onClick={() => setShowDeploymentSetup(true)}>Change LAN setup</button>
                 </div>
-              </article>
-              <article className="panel">
+              </article>}
+              {can("SCANNER_PAIRING_MANAGE") && <article className="panel">
                 <div className="panel__header"><div><p className="eyebrow">PHONE CONNECTION</p><h2>Pair a scanner</h2></div></div>
                 <div className="scanner-settings">
                   <div className="scanner-qr-card">{scannerQrUrl ? <img src={scannerQrUrl} alt="One-time phone scanner pairing QR" /> : <span>Create a one-time pairing QR</span>}</div>
@@ -383,11 +352,11 @@ export default function App() {
                   {scannerDevices.length === 0 && <tr><td colSpan={4} className="empty-table">No paired scanners yet.</td></tr>}
                 </tbody></table></div>
                 <div className="read-only-note"><strong>LAN boundary:</strong> the API listens on the selected company LAN, but scanner inventory routes require a paired device token. Browser origins are restricted; native paired scanners do not send browser-origin headers.</div>
-              </article>
-              <article className="panel settings-database-card">
+              </article>}
+              {can("SETTINGS_MANAGE") && <article className="panel settings-database-card">
                 <div className="panel__header"><div><p className="eyebrow">SQLITE</p><h2>Operational database</h2></div><span className="health-badge">{stores.database.integrity.toUpperCase()}</span></div>
                 <dl className="settings-details"><div><dt>Path</dt><dd>{stores.database.path}</dd></div><div><dt>Schema</dt><dd>v{stores.database.schemaVersion}</dd></div><div><dt>Size</dt><dd>{formatBytes(stores.database.sizeBytes)}</dd></div><div><dt>Latest backup</dt><dd>{stores.database.latestBackup ?? "—"}</dd></div><div><dt>Host ID</dt><dd><code>{stores.database.hostId}</code></dd></div><div><dt>Writer mode</dt><dd>Authoritative desktop host</dd></div></dl>
-              </article>
+              </article>}
             </div>
 
             {can("AUTH_MANAGE_USERS") && <UserManagementPanel
@@ -396,6 +365,8 @@ export default function App() {
               onNotice={setNotice}
               onError={setError}
             />}
+
+            {can("AUTH_MANAGE_USERS") && <PermissionsPanel onNotice={setNotice} onError={setError} />}
 
             {desktopInfo?.deploymentRole !== "LAN_CLIENT" && <BackupRestorePanel
               stores={stores}

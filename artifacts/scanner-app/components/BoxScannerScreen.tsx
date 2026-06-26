@@ -40,6 +40,9 @@ interface CatalogItem {
   id: number;
   tallyGuid: string;
   name: string;
+  /** Display-only "Group > Subgroup > Name" breadcrumb. Never use this to look up an item — identity is always tallyGuid. */
+  qualifiedName: string;
+  groupPath: string[];
   parentName: string;
   hasBom: boolean;
   localAvailableQuantity: number;
@@ -265,6 +268,8 @@ export default function BoxScannerScreen() {
           id: -(index + 1),
           tallyGuid: item.tallyItemGuid,
           name: item.itemName,
+          qualifiedName: item.itemName,
+          groupPath: [],
           parentName: "QR fallback",
           hasBom: false,
           localAvailableQuantity: 0,
@@ -405,7 +410,7 @@ export default function BoxScannerScreen() {
               {usingCachedData ? <Text style={styles.offlineNotice}>Offline mode · cached box/catalog · {queueSummary.pending} waiting to sync</Text> : null}
               {queueSummary.rejected > 0 ? <Text style={styles.error}>{queueSummary.rejected} queued transaction{queueSummary.rejected === 1 ? "" : "s"} need review after the desktop rejected them.</Text> : null}
               {error ? <Text style={styles.error}>{error}</Text> : null}
-              {catalog && <Dropdown label="ITEM IN BOX" value={selectedItem} values={boxCatalogItems} display={(item) => item.name} detail={(item) => `Available ${item.localAvailableQuantity}`} onChange={setSelectedItem} colors={c} required />}
+              {catalog && <Dropdown label="ITEM IN BOX" value={selectedItem} values={boxCatalogItems} display={(item) => item.qualifiedName} detail={(item) => `Available ${item.localAvailableQuantity}`} onChange={setSelectedItem} colors={c} required />}
 
               <View style={styles.section}>
                 <Text style={[styles.label, { color: c.mutedForeground }]}>STORE WORKFLOW</Text>
@@ -424,7 +429,7 @@ export default function BoxScannerScreen() {
                 ] as const).map(([value, label]) => <TouchableOpacity key={value} style={[styles.workflowButton, { borderColor: materialOutPurpose === value ? colors.light.primary : c.border, backgroundColor: materialOutPurpose === value ? colors.light.primary : c.background }]} onPress={() => { setMaterialOutPurpose(value); setError(""); if (value !== "PRODUCTION") setDestination(null); }}><Text style={[styles.workflowText, { color: materialOutPurpose === value ? "#fff" : c.foreground }]}>{label}</Text></TouchableOpacity>)}</View>
               </View>}
 
-              {workflow === "MATERIAL_OUT" && materialOutPurpose === "PRODUCTION" && catalog && <Dropdown label="DESTINATION PRODUCT" value={destination} values={catalog.destinations} display={(item) => item.name} detail={(item) => item.hasBom ? "Has BOM" : item.parentName} onChange={setDestination} colors={c} required />}
+              {workflow === "MATERIAL_OUT" && materialOutPurpose === "PRODUCTION" && catalog && <Dropdown label="DESTINATION PRODUCT" value={destination} values={catalog.destinations} display={(item) => item.qualifiedName} detail={(item) => item.hasBom ? "Has BOM" : item.parentName} onChange={setDestination} colors={c} required />}
 
               {workflow === "ADJUSTMENT" && <Text style={styles.offlineNotice}>Use this only for physical stock that has been found and must be returned to available inventory. It records a fixed “Return found stock” audit note and is not matched to a product or earlier issue.</Text>}
 

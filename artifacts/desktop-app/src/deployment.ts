@@ -1,6 +1,7 @@
 import { execFile } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 
@@ -9,6 +10,7 @@ export type DeploymentRole = "UNCONFIGURED" | "PRODUCTION_SERVER" | "LAN_CLIENT"
 export interface DeploymentConfig {
   configured: boolean;
   role: DeploymentRole;
+  computerName: string;
   productionHost: string;
   inventoryPort: number;
   tallyHost: string;
@@ -18,6 +20,7 @@ export interface DeploymentConfig {
 
 export interface SaveDeploymentInput {
   role: Exclude<DeploymentRole, "UNCONFIGURED">;
+  computerName?: string;
   productionHost?: string;
   inventoryPort?: number;
   tallyHost?: string;
@@ -58,6 +61,7 @@ export function normalizeDeploymentConfig(value: Partial<DeploymentConfig>): Dep
   return {
     configured: role !== "UNCONFIGURED",
     role,
+    computerName: cleanHost(value.computerName, os.hostname()),
     productionHost: cleanHost(value.productionHost, "production"),
     inventoryPort: cleanPort(value.inventoryPort, DEFAULT_PORT),
     tallyHost: cleanHost(value.tallyHost, "accounts"),
@@ -105,6 +109,7 @@ export function normalizeSaveDeploymentInput(value: unknown): SaveDeploymentInpu
   }
   return {
     role: input.role,
+    computerName: cleanHost(input.computerName, os.hostname()),
     productionHost: cleanHost(input.productionHost, "production"),
     inventoryPort: cleanPort(input.inventoryPort, DEFAULT_PORT),
     tallyHost: cleanHost(input.tallyHost, "accounts"),
@@ -184,4 +189,35 @@ export async function configureWindowsFirewall(input: SaveDeploymentInput): Prom
   } catch {
     throw new Error("Windows did not apply the firewall rule. Approve the Administrator prompt, or clear the firewall option and ask your IT administrator to allow the port.");
   }
+}
+
+/**
+ * Actually renames the Windows computer so it resolves by this name over the
+ * LAN the same way productionHost/tallyHost already do. Requires elevation
+ * and a restart before the new name is visible to other computers.
+ */
+export async function renameComputer(newName: string): Promise<{ renamed: boolean; restartRequired: boolean }> {
+  const name = cleanHost(newName, "");
+  if (!name || name.toLocaleLowerCase() === os.hostname().toLocaleLowerCase()) {
+    return { renamed: false, restartRequired: false };
+  }
+  if (process.platform !== "win32") {
+    throw new Error("Renaming the computer is only supported on Windows. Rename it from your operating system's network settings instead.");
+  }
+
+  const elevatedCommand = powershellEncodedCommand([
+    "$ErrorActionPreference = 'Stop'",
+    `Rename-Computer -NewName '${name}' -Force`,
+  ].join("; "));
+  const launcher = [
+    "$process = Start-Process -FilePath 'powershell.exe' -Verb RunAs -Wait -PassThru",
+    `-ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-EncodedCommand','${elevatedCommand}'`,
+    "; if ($process.ExitCode -ne 0) { exit $process.ExitCode }",
+  ].join(" ");
+  try {
+    await executeFile("powershell.exe", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", launcher]);
+  } catch {
+    throw new Error("Windows did not apply the computer name change. Approve the Administrator prompt and try again.");
+  }
+  return { renamed: true, restartRequired: true };
 }

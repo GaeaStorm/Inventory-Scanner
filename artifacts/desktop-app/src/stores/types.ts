@@ -22,11 +22,16 @@ export type ReviewStatus =
   | "CONFIRMED"
   | "EXCEPTION";
 
+/** A single designation shared by Stock Groups and Stock Items — NEITHER is the default for everything. */
+export type CatalogRole = "PRODUCT" | "SERVICE" | "NEITHER" | "IGNORED";
+
 export interface StoresStockItem {
   id: number;
   tallyGuid: string;
   tallyName: string;
   name: string;
+  /** Display-only "Group > Subgroup > Name" breadcrumb. Never use this to look up an item — identity is always tallyGuid/id. */
+  qualifiedName: string;
   parentName: string;
   groupPath: string[];
   categoryName: string;
@@ -45,11 +50,30 @@ export interface StoresStockItem {
   source: "TALLY" | "LOCAL";
   catalogStatus: "ACTIVE" | "DUPLICATE" | "OBSOLETE";
   isProduct: boolean;
+  isService: boolean;
+  /** This item's own explicit designation, if any — null means it inherits from the nearest ancestor Stock Group that has one set (or NEITHER if none do). */
+  catalogRoleOverride: CatalogRole | null;
+  /** The designation actually in effect for this item (its own override, else inherited from its Stock Group hierarchy, else NEITHER). */
+  effectiveCatalogRole: CatalogRole;
   ignored: boolean;
-  itemIgnored: boolean;
-  groupIgnored: boolean;
   duplicateOfTallyGuid: string | null;
   duplicateOfName: string | null;
+  /** Specification field values (field key -> typed value) for the additional hierarchy levels appended to the generated Tally name. */
+  fieldValues: Record<string, string>;
+}
+
+/** An admin-defined specification field (e.g. "Pin count", "Color") appended in order to the generated Tally name for new local items. */
+export interface ItemFieldDefinition {
+  id: string;
+  key: string;
+  label: string;
+  required: boolean;
+  position: number;
+}
+
+export interface SaveItemFieldDefinitionInput {
+  label: string;
+  required: boolean;
 }
 
 export interface StoresSupplier {
@@ -240,6 +264,10 @@ export interface StoresCatalogGroup {
   level: number;
   path: string[];
   source: "TALLY" | "LOCAL";
+  /** This group's own explicit designation — NEITHER when never explicitly set. */
+  catalogRole: CatalogRole;
+  /** The designation in effect for items in this group: this group's own role if set, else the nearest ancestor's, else NEITHER. */
+  effectiveCatalogRole: CatalogRole;
   ignored: boolean;
   itemCount: number;
 }
@@ -251,6 +279,11 @@ export interface StoresStockCategory {
   path: string[];
   source: "TALLY" | "LOCAL";
   itemCount: number;
+}
+
+export interface StoresQualifiedNameCollision {
+  qualifiedName: string;
+  itemIds: number[];
 }
 
 export interface StoresState {
@@ -269,8 +302,10 @@ export interface StoresState {
   openingQuantityAdjustments: StoresOpeningQuantityAdjustment[];
   catalogGroups: StoresCatalogGroup[];
   stockCategories: StoresStockCategory[];
+  qualifiedNameCollisions: StoresQualifiedNameCollision[];
   exportSchemaVersion: string;
   materialOutXmlConfigured: boolean;
+  itemFieldDefinitions: ItemFieldDefinition[];
 }
 
 export interface CreateLocalStockItemInput {
@@ -278,6 +313,8 @@ export interface CreateLocalStockItemInput {
   parentName?: string;
   categoryName?: string;
   baseUnits?: string;
+  /** Specification field values (field key -> typed value), used to build a unique generated Tally name. */
+  fieldValues?: Record<string, string>;
 }
 
 export interface CreateCatalogGroupInput {
@@ -308,9 +345,15 @@ export interface SetCatalogStatusInput {
   duplicateOfTallyGuid?: string | null;
 }
 
-export interface SetCatalogVisibilityInput {
+export interface SetCatalogRoleInput {
+  tallyItemGuid: string;
+  /** Null clears the item's own override so it inherits from its Stock Group again. */
+  role: CatalogRole | null;
+}
+
+export interface SetGroupRoleInput {
   groupName: string;
-  ignored: boolean;
+  role: CatalogRole;
 }
 
 export interface GeneratedExportFile {

@@ -94,7 +94,7 @@ export default function BulkMaterialInForm({ stores, onChanged, onNotice, onErro
     ? selectedPo.lines.filter((line) => line.outstandingQuantity > 0 && visibleGuids.has(line.tallyItemGuid))
     : operationalItems.map((item) => ({
         tallyItemGuid: item.tallyGuid,
-        itemName: item.name,
+        itemName: item.qualifiedName,
         orderedQuantity: 0,
         receivedQuantity: 0,
         outstandingQuantity: 0,
@@ -266,7 +266,7 @@ export default function BulkMaterialInForm({ stores, onChanged, onNotice, onErro
   return (
     <article className="panel bulk-receipt-panel">
       <div className="panel__header bulk-receipt-heading">
-        <div><p className="eyebrow">MATERIAL IN · RECEIPT NOTE / GRN</p><h2>Record a vendor restock</h2></div>
+        <div><p className="eyebrow">MATERIAL IN</p><h2>Record a vendor restock</h2></div>
         <div className="bulk-receipt-heading-actions">
           <button className="button button--secondary" type="button" onClick={clearForm} disabled={busy}>Clear form</button>
           <span className="health-badge">WHOLE COUNTS</span>
@@ -288,7 +288,7 @@ export default function BulkMaterialInForm({ stores, onChanged, onNotice, onErro
           const poLine = selectedPo?.lines.find((line) => line.tallyItemGuid === row.tallyItemGuid);
           const selectable = row.poLine
             ? allowedItems
-            : operationalItems.map((item) => ({ tallyItemGuid: item.tallyGuid, itemName: item.name }));
+            : operationalItems.map((item) => ({ tallyItemGuid: item.tallyGuid, itemName: item.qualifiedName }));
           return (
             <div className="bulk-receipt-row" key={`${index}-${row.tallyItemGuid}`}>
               <div className="bulk-receipt-line bulk-receipt-line--inspection">

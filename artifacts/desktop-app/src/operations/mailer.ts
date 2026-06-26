@@ -2,7 +2,7 @@ import tls from "node:tls";
 
 const GMAIL_HOST = "smtp.gmail.com";
 const GMAIL_PORT = 465;
-const DEFAULT_SENDER = "gtrswnt@gmail.com";
+const DEFAULT_SENDER = "email.gaia.verf@gmail.com";
 
 function smtpLine(value: string): string {
   return value.replace(/[\r\n]+/g, " ").trim();

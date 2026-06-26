@@ -37,6 +37,7 @@ function renameRows(items: StoresStockItem[]): Row[] {
     .map((item) => ({
       "Tally Current Name": item.tallyName,
       "New Name": item.name,
+      "Qualified Name": item.qualifiedName,
       "Tally GUID": item.tallyGuid,
       Group: item.parentName,
       "XML Included": item.source === "TALLY" ? "Yes" : "No",
@@ -55,9 +56,11 @@ function duplicateRows(items: StoresStockItem[]): Row[] {
       return {
         "Duplicate Tally Name": item.tallyName,
         "Duplicate Local Name": item.name,
+        "Duplicate Qualified Name": item.qualifiedName,
         "Duplicate Tally GUID": item.tallyGuid,
         "Primary Tally Name": primary?.tallyName ?? item.duplicateOfName ?? "",
         "Primary Local Name": primary?.name ?? item.duplicateOfName ?? "",
+        "Primary Qualified Name": primary?.qualifiedName ?? item.duplicateOfName ?? "",
         "Primary Tally GUID": primary?.tallyGuid ?? item.duplicateOfTallyGuid ?? "",
         "Local Stock Remaining": item.localAvailableQuantity,
         "Recommended Tally Action": "Review vouchers/BOM references with Accounts; do not delete a used Stock Item. Keep the primary item for future entries.",
@@ -71,6 +74,7 @@ function obsoleteRows(items: StoresStockItem[]): Row[] {
     .map((item) => ({
       "Tally Current Name": item.tallyName,
       "Local Display Name": item.name,
+      "Qualified Name": item.qualifiedName,
       "Tally GUID": item.tallyGuid,
       Group: item.parentName,
       "Local Stock Remaining": item.localAvailableQuantity,
@@ -283,9 +287,9 @@ export class CatalogExporter {
       "Tally GUID": supplier.tallyGuid,
     })), [40, 44]);
     appendSheet(workbook, "Open Purchase Orders", purchaseOrderRows, [24, 14, 34, 34, 42, 14, 14, 16, 14, 16]);
-    appendSheet(workbook, "Renames", renames, [34, 34, 42, 28, 15, 72]);
-    appendSheet(workbook, "Duplicates", duplicates, [34, 34, 42, 34, 34, 42, 22, 82]);
-    appendSheet(workbook, "Obsolete", obsolete, [34, 34, 42, 28, 22, 82]);
+    appendSheet(workbook, "Renames", renames, [34, 34, 54, 42, 28, 15, 72]);
+    appendSheet(workbook, "Duplicates", duplicates, [34, 34, 54, 42, 34, 34, 54, 42, 22, 82]);
+    appendSheet(workbook, "Obsolete", obsolete, [34, 34, 54, 42, 28, 22, 82]);
     appendSheet(workbook, "All Changes", [
       ...renames.map((row) => ({
         Change: "RENAME",

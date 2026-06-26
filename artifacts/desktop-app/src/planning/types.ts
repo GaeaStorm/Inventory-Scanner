@@ -12,7 +12,7 @@ export type RecommendationStatus =
   | "APPROVED"
   | "EXPORTED";
 export type BomStatus = "DRAFT" | "ACTIVE" | "ARCHIVED";
-export type ProductOrderStatus = "DRAFT" | "CONFIRMED" | "CANCELLED" | "COMPLETED";
+export type ProductOrderStatus = "DRAFT" | "CONFIRMED" | "ON_HOLD" | "CANCELLED" | "COMPLETED";
 export type ProductOrderType = "PRODUCTION" | "SERVICE";
 export type WarrantyStatus = "IN_WARRANTY" | "OUT_OF_WARRANTY" | "NOT_APPLICABLE";
 export type ProductOrderFieldType = "TEXT" | "NUMBER" | "DATE" | "BOOLEAN";
@@ -42,7 +42,10 @@ export interface RestockPolicy {
   stockItemId: number;
   tallyItemGuid: string;
   itemName: string;
+  /** Display-only "Group > Subgroup > Name" breadcrumb. Never use this to look up an item. */
+  qualifiedName: string;
   groupName: string;
+  groupPath: string[];
   primaryGroupName: string;
   secondaryGroupName: string;
   catalogSource: "TALLY" | "LOCAL";
@@ -312,6 +315,173 @@ export interface PlanningFreshness {
   message: string;
 }
 
+/** Derived from a Tally Stock Group's top-level ancestry; never set manually. */
+export type ItemFamily = "MANUFACTURED" | "RESALE" | "SERVICE" | "RAW_MATERIAL" | "UNKNOWN";
+
+export type SalesOrderStage = "PENDING_PO_APPROVAL" | "CRF_PENDING" | "CRF_SENT" | "IN_FULFILMENT" | "COMPLETED";
+
+/** Independent of orderStage/stage — putting something on hold or cancelling it never writes a stage-history row, so no duration is ever attributed to the hold period. */
+export type HoldStatus = "NONE" | "ON_HOLD" | "CANCELLED";
+
+export type FulfilmentConsumptionMode = "SOLD_DIRECT" | "INTERNAL_CONSUMPTION";
+
+/** A read-only Tally voucher line. Sales builds fulfilment lines separately; these are never edited. */
+export interface SalesOrderSourceLine {
+  id: string;
+  tallyVoucherLineGuid: string;
+  itemId: number;
+  itemTallyGuid: string;
+  itemNameSnapshot: string;
+  itemQualifiedNameSnapshot: string;
+  family: ItemFamily;
+  quantity: number;
+  value: number | null;
+}
+
+export interface SalesOrderFulfilmentLine {
+  id: string;
+  salesOrderId: string;
+  parentFulfilmentLineId: string | null;
+  family: Exclude<ItemFamily, "UNKNOWN">;
+  itemId: number;
+  itemTallyGuid: string;
+  itemName: string;
+  itemQualifiedName: string;
+  quantity: number;
+  consumptionMode: FulfilmentConsumptionMode;
+  stage: string;
+  holdStatus: HoldStatus;
+  serviceDone: boolean;
+  resaleSupplierId: number | null;
+  resaleSupplierName: string;
+  notes: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export type ApprovalEntityType = "SALES_ORDER_PO" | "SALES_ORDER_CRF";
+export type ApprovalRequestStatus = "PENDING" | "APPROVED" | "REJECTED" | "SUPERSEDED";
+
+export interface ApprovalDecision {
+  id: string;
+  decidedByUserId: string;
+  decidedByName: string;
+  decidedByRole: string;
+  decision: "APPROVE" | "REJECT";
+  comment: string;
+  decidedAt: string;
+}
+
+export interface ApprovalRequest {
+  id: string;
+  entityType: ApprovalEntityType;
+  entityId: string;
+  status: ApprovalRequestStatus;
+  payloadHash: string;
+  createdByUserId: string;
+  createdAt: string;
+  decisions: ApprovalDecision[];
+}
+
+export type ChecklistRequirementStatus = "SATISFIED" | "WAIVED" | "UNSATISFIED";
+
+export interface ChecklistResult {
+  requirementId: string;
+  targetType: string;
+  targetValue: string;
+  description: string;
+  status: ChecklistRequirementStatus;
+  waiverReason: string;
+  waiverActorName: string;
+  waiverRole: string;
+  waiverAt: string;
+}
+
+export interface SalesOrder {
+  id: string;
+  tallyVoucherGuid: string;
+  customerName: string;
+  customerTallyGuid: string;
+  poReference: string;
+  poValue: number | null;
+  voucherNumber: string;
+  voucherDate: string;
+  dueDate: string;
+  ownerUserId: string;
+  orderStage: SalesOrderStage;
+  holdStatus: HoldStatus;
+  sourceChanged: boolean;
+  sourceLines: SalesOrderSourceLine[];
+  fulfilmentLines: SalesOrderFulfilmentLine[];
+  approvalRequests: ApprovalRequest[];
+  crfRevisions: Array<{ id: string; revisionNumber: number; createdAt: string; supersededAt: string | null }>;
+  pendingSourceAmendment: SalesOrderSourceAmendment | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface SaveSalesOrderFulfilmentLineInput {
+  id?: string;
+  salesOrderId: string;
+  parentFulfilmentLineId?: string | null;
+  itemTallyGuid: string;
+  quantity: number;
+  consumptionMode?: FulfilmentConsumptionMode;
+  notes?: string;
+}
+
+export interface ChecklistTemplate {
+  id: string;
+  name: string;
+  version: number;
+  status: "DRAFT" | "ACTIVE" | "ARCHIVED";
+  requirements: Array<{ id: string; targetType: string; targetValue: string; description: string }>;
+  createdAt: string;
+}
+
+export interface CrfPayload {
+  revisionNumber: number;
+  generatedAt: string;
+  order: {
+    id: string;
+    customerName: string;
+    poReference: string;
+    poValue: number | null;
+    voucherNumber: string;
+    voucherDate: string;
+    orderStage: SalesOrderStage;
+  };
+  sourceLines: SalesOrderSourceLine[];
+  fulfilmentLines: SalesOrderFulfilmentLine[];
+  checklist: ChecklistResult[];
+  approvalRequests: ApprovalRequest[];
+}
+
+export interface CrfRevision {
+  id: string;
+  salesOrderId: string;
+  revisionNumber: number;
+  payload: CrfPayload;
+  payloadHash: string;
+  createdAt: string;
+  supersededAt: string | null;
+}
+
+export interface SalesOrderSourceAmendment {
+  id: string;
+  salesOrderId: string;
+  newSourceLines: SalesOrderSourceLine[];
+  diffSummary: string;
+  detectedAt: string;
+  applied: boolean;
+  appliedAt: string | null;
+}
+
+export interface SaveChecklistTemplateInput {
+  name: string;
+  requirements: Array<{ targetType: string; targetValue: string; description: string }>;
+}
+
 export interface PlanningState {
   moduleVersion: number;
   exportSchemaVersion: string;
@@ -326,4 +496,6 @@ export interface PlanningState {
   groups: string[];
   primaryGroups: string[];
   secondaryGroups: string[];
+  salesOrders: SalesOrder[];
+  checklistTemplates: ChecklistTemplate[];
 }

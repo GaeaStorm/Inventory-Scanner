@@ -72,14 +72,14 @@ function ItemPicker({ stores, value, onChange, labelText = "Stock item", include
   onChange: (value: string) => void;
   labelText?: string;
   includeInactive?: boolean;
-  role?: "FINISHED_PRODUCT" | "MATERIAL";
+  role?: "PRODUCT" | "MATERIAL";
 }) {
   const [search, setSearch] = useState("");
   const items = stores.stockItems.filter((item) => !item.ignored && (includeInactive || item.active))
-    .filter((item) => role === "FINISHED_PRODUCT" ? item.isProduct : role === "MATERIAL" ? !item.isProduct : true)
+    .filter((item) => role === "PRODUCT" ? item.isProduct : role === "MATERIAL" ? !item.isProduct : true)
     .filter((item) =>
-    !search.trim() || `${item.name} ${item.primaryGroupName} ${item.secondaryGroupName}`.toLocaleLowerCase().includes(search.trim().toLocaleLowerCase()));
-  return <div className="search-picker"><label>{labelText}<input placeholder="Filter items…" value={search} onChange={(event) => setSearch(event.target.value)} /></label><select aria-label={labelText} value={value} onChange={(event) => onChange(event.target.value)}><option value="">Select…</option>{items.map((item) => <option key={item.tallyGuid} value={item.tallyGuid}>{item.name} · {[item.primaryGroupName, item.secondaryGroupName].filter(Boolean).join(" › ") || "Ungrouped"}</option>)}</select></div>;
+    !search.trim() || item.qualifiedName.toLocaleLowerCase().includes(search.trim().toLocaleLowerCase()));
+  return <div className="search-picker"><label>{labelText}<input placeholder="Filter items…" value={search} onChange={(event) => setSearch(event.target.value)} /></label><select aria-label={labelText} value={value} onChange={(event) => onChange(event.target.value)}><option value="">Select…</option>{items.map((item) => <option key={item.tallyGuid} value={item.tallyGuid}>{item.qualifiedName}</option>)}</select></div>;
 }
 
 function SupplierPicker({ stores, value, onChange }: { stores: StoresState; value: string; onChange: (value: string) => void }) {
@@ -113,30 +113,13 @@ function OperationPanel({ eyebrow, title, children, actions }: { eyebrow: string
   return <article className="panel operations-panel"><div className="panel__header"><div><p className="eyebrow">{eyebrow}</p><h2>{title}</h2></div>{actions}</div>{children}</article>;
 }
 
-export default function OperationsTab({ stores, planning, operations, auth, permissions, onRefresh, onNotice, onError }: Props) {
-  const [busy, setBusy] = useState(false);
-
-  async function run(action: () => Promise<unknown>, message: string) {
-    setBusy(true);
-    onError("");
-    try {
-      await action();
-      await onRefresh();
-      onNotice(message);
-    } catch (reason) {
-      onError(reason instanceof Error ? reason.message : String(reason));
-    } finally {
-      setBusy(false);
-    }
-  }
-
+export default function OperationsTab({ stores, planning, auth, permissions, onRefresh, onNotice, onError }: Props) {
   return <section className="tab-page operations-page">
-    <div className="page-heading"><div><p className="eyebrow">CUSTOMER ORDERS</p><h1>Orders &amp; Production</h1></div><button className="button button--secondary" type="button" onClick={() => void onRefresh()}>Refresh</button></div>
     <OrderRegister
-      planning={planning}
       stores={stores}
+      planning={planning}
       currentUser={auth.currentUser}
-      canManage={permissions.includes("PRODUCT_ORDER_MANAGE")}
+      permissions={permissions}
       onRefresh={onRefresh}
       onNotice={onNotice}
       onError={onError}
@@ -431,12 +414,12 @@ function Production({ stores, planning, operations, busy, run }: { stores: Store
     {orderId && <div className="operations-two-column">
       <OperationPanel eyebrow="COMPONENT ISSUE" title="Partial, additional, or substituted material">
         <form className="operations-form operations-form-single" onSubmit={(event) => { event.preventDefault(); void run(() => window.desktop.operations.issueProductionMaterial({ clientTransactionId: clientId("production-issue"), productOrderId: orderId, tallyItemGuid: component, destinationTallyItemGuid: destination || order?.productTallyGuid || "", quantity: issueQty, substitutionForTallyGuid: substitution || undefined, additionalConsumption: additional, notes, serialNumbers: serials(issueSerialText) }), "Production-linked material issued."); }}>
-          <ItemPicker stores={stores} value={component} onChange={setComponent} labelText="Component" role="MATERIAL" /><ItemPicker stores={stores} value={destination} onChange={setDestination} labelText="Destination product" role="FINISHED_PRODUCT" /><label>Quantity<input type="number" min={1} step={1} value={issueQty} onChange={(event) => setIssueQty(Number(event.target.value))} /></label><ItemPicker stores={stores} value={substitution} onChange={setSubstitution} labelText="Substitution for (optional)" role="MATERIAL" /><label className="check-row"><input type="checkbox" checked={additional} onChange={(event) => setAdditional(event.target.checked)} />Additional consumption beyond BOM</label><SerialField value={issueSerialText} onChange={setIssueSerialText} /><label>Notes<input value={notes} onChange={(event) => setNotes(event.target.value)} required={additional || !!substitution} /></label><button className="button" disabled={busy || !component} type="submit">Issue material</button>
+          <ItemPicker stores={stores} value={component} onChange={setComponent} labelText="Component" role="MATERIAL" /><ItemPicker stores={stores} value={destination} onChange={setDestination} labelText="Destination product" role="PRODUCT" /><label>Quantity<input type="number" min={1} step={1} value={issueQty} onChange={(event) => setIssueQty(Number(event.target.value))} /></label><ItemPicker stores={stores} value={substitution} onChange={setSubstitution} labelText="Substitution for (optional)" role="MATERIAL" /><label className="check-row"><input type="checkbox" checked={additional} onChange={(event) => setAdditional(event.target.checked)} />Additional consumption beyond BOM</label><SerialField value={issueSerialText} onChange={setIssueSerialText} /><label>Notes<input value={notes} onChange={(event) => setNotes(event.target.value)} required={additional || !!substitution} /></label><button className="button" disabled={busy || !component} type="submit">Issue material</button>
         </form>
       </OperationPanel>
       <OperationPanel eyebrow="FINISHED GOODS" title="Partial production completion">
         <form className="operations-form operations-form-single" onSubmit={(event) => { event.preventDefault(); void run(() => window.desktop.operations.productionCompletion({ clientTransactionId: clientId("production-completion"), productOrderId: orderId, tallyItemGuid: finishedItem, completedQuantity: completed, availableQuantity: available, pendingInspectionQuantity: pending, faultyQuantity: faulty, batchNumber: batch, supplierLotReference, availableSerialNumbers: serials(availableSerialText), pendingSerialNumbers: serials(pendingSerialText), faultySerialNumbers: serials(faultySerialText), manufacturingDate, expiryDate, traceabilityNotes: notes }), "Finished goods received into inventory."); }}>
-          <ItemPicker stores={stores} value={finishedItem} onChange={setFinishedItem} labelText="Finished product" role="FINISHED_PRODUCT" /><label>Total completed<input type="number" min={1} step={1} value={completed} onChange={(event) => setCompleted(Number(event.target.value))} /></label><label>Available<input type="number" min={0} step={1} value={available} onChange={(event) => setAvailable(Number(event.target.value))} /></label><label>Pending inspection<input type="number" min={0} step={1} value={pending} onChange={(event) => setPending(Number(event.target.value))} /></label><label>Faulty output<input type="number" min={0} step={1} value={faulty} onChange={(event) => setFaulty(Number(event.target.value))} /></label><label>Batch<input value={batch} onChange={(event) => setBatch(event.target.value)} /></label><label>Supplier / maker lot<input value={supplierLotReference} onChange={(event) => setSupplierLotReference(event.target.value)} /></label><label>Available serials<textarea value={availableSerialText} onChange={(event) => setAvailableSerialText(event.target.value)} placeholder="Comma or line separated" /></label><label>Pending serials<textarea value={pendingSerialText} onChange={(event) => setPendingSerialText(event.target.value)} placeholder="Comma or line separated" /></label><label>Faulty serials<textarea value={faultySerialText} onChange={(event) => setFaultySerialText(event.target.value)} placeholder="Comma or line separated" /></label><label>Manufactured<input type="date" value={manufacturingDate} onChange={(event) => setManufacturingDate(event.target.value)} /></label><label>Expiry<input type="date" value={expiryDate} onChange={(event) => setExpiryDate(event.target.value)} /></label><label>Traceability notes<textarea value={notes} onChange={(event) => setNotes(event.target.value)} /></label><button className="button" disabled={busy || !finishedItem || available + pending + faulty !== completed} type="submit">Receive finished goods</button>
+          <ItemPicker stores={stores} value={finishedItem} onChange={setFinishedItem} labelText="Finished product" role="PRODUCT" /><label>Total completed<input type="number" min={1} step={1} value={completed} onChange={(event) => setCompleted(Number(event.target.value))} /></label><label>Available<input type="number" min={0} step={1} value={available} onChange={(event) => setAvailable(Number(event.target.value))} /></label><label>Pending inspection<input type="number" min={0} step={1} value={pending} onChange={(event) => setPending(Number(event.target.value))} /></label><label>Faulty output<input type="number" min={0} step={1} value={faulty} onChange={(event) => setFaulty(Number(event.target.value))} /></label><label>Batch<input value={batch} onChange={(event) => setBatch(event.target.value)} /></label><label>Supplier / maker lot<input value={supplierLotReference} onChange={(event) => setSupplierLotReference(event.target.value)} /></label><label>Available serials<textarea value={availableSerialText} onChange={(event) => setAvailableSerialText(event.target.value)} placeholder="Comma or line separated" /></label><label>Pending serials<textarea value={pendingSerialText} onChange={(event) => setPendingSerialText(event.target.value)} placeholder="Comma or line separated" /></label><label>Faulty serials<textarea value={faultySerialText} onChange={(event) => setFaultySerialText(event.target.value)} placeholder="Comma or line separated" /></label><label>Manufactured<input type="date" value={manufacturingDate} onChange={(event) => setManufacturingDate(event.target.value)} /></label><label>Expiry<input type="date" value={expiryDate} onChange={(event) => setExpiryDate(event.target.value)} /></label><label>Traceability notes<textarea value={notes} onChange={(event) => setNotes(event.target.value)} /></label><button className="button" disabled={busy || !finishedItem || available + pending + faulty !== completed} type="submit">Receive finished goods</button>
         </form>
       </OperationPanel>
     </div>}
