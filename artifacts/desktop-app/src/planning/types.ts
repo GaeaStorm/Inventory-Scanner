@@ -241,10 +241,12 @@ export interface SaveProductOrderInput {
 export interface ProductOrderWorkflowState {
   id: string;
   orderType: ProductOrderType;
+  stockGroupName: string;
   name: string;
   color: string;
   position: number;
   terminal: boolean;
+  requiredPermissions: string[];
 }
 
 export interface ProductOrderFieldDefinition {
@@ -256,9 +258,14 @@ export interface ProductOrderFieldDefinition {
 }
 
 export interface SaveProductOrderWorkflowStateInput {
+  id?: string;
+  orderType?: ProductOrderType;
+  stockGroupName?: string;
   name: string;
   color?: string;
+  position?: number;
   terminal?: boolean;
+  requiredPermissions?: string[];
 }
 
 export interface BulkProductOrderUpdateInput {
@@ -318,7 +325,8 @@ export interface PlanningFreshness {
 /** Derived from a Tally Stock Group's top-level ancestry; never set manually. */
 export type ItemFamily = "MANUFACTURED" | "RESALE" | "SERVICE" | "RAW_MATERIAL" | "UNKNOWN";
 
-export type SalesOrderStage = "PENDING_PO_APPROVAL" | "CRF_PENDING" | "CRF_SENT" | "IN_FULFILMENT" | "COMPLETED";
+export type SalesOrderStage = string;
+export type SalesOrderKind = "SALES" | "SERVICE";
 
 /** Independent of orderStage/stage — putting something on hold or cancelling it never writes a stage-history row, so no duration is ever attributed to the hold period. */
 export type HoldStatus = "NONE" | "ON_HOLD" | "CANCELLED";
@@ -355,11 +363,12 @@ export interface SalesOrderFulfilmentLine {
   resaleSupplierId: number | null;
   resaleSupplierName: string;
   notes: string;
+  stageHistory: SalesOrderStageHistory[];
   createdAt: string;
   updatedAt: string;
 }
 
-export type ApprovalEntityType = "SALES_ORDER_PO" | "SALES_ORDER_CRF";
+export type ApprovalEntityType = "SALES_ORDER_PO" | "SALES_ORDER_CRF" | "SALES_ORDER_STAGE";
 export type ApprovalRequestStatus = "PENDING" | "APPROVED" | "REJECTED" | "SUPERSEDED";
 
 export interface ApprovalDecision {
@@ -376,11 +385,23 @@ export interface ApprovalRequest {
   id: string;
   entityType: ApprovalEntityType;
   entityId: string;
+  targetStage: string;
   status: ApprovalRequestStatus;
   payloadHash: string;
   createdByUserId: string;
   createdAt: string;
   decisions: ApprovalDecision[];
+}
+
+export interface SalesOrderWorkflowStage {
+  id: string;
+  orderKind: SalesOrderKind;
+  stockGroupName: string;
+  name: string;
+  color: string;
+  position: number;
+  terminal: boolean;
+  requiredPermissions: string[];
 }
 
 export type ChecklistRequirementStatus = "SATISFIED" | "WAIVED" | "UNSATISFIED";
@@ -399,6 +420,7 @@ export interface ChecklistResult {
 
 export interface SalesOrder {
   id: string;
+  orderKind: SalesOrderKind;
   tallyVoucherGuid: string;
   customerName: string;
   customerTallyGuid: string;
@@ -411,6 +433,7 @@ export interface SalesOrder {
   orderStage: SalesOrderStage;
   holdStatus: HoldStatus;
   sourceChanged: boolean;
+  stageHistory: SalesOrderStageHistory[];
   sourceLines: SalesOrderSourceLine[];
   fulfilmentLines: SalesOrderFulfilmentLine[];
   approvalRequests: ApprovalRequest[];
@@ -418,6 +441,60 @@ export interface SalesOrder {
   pendingSourceAmendment: SalesOrderSourceAmendment | null;
   createdAt: string;
   updatedAt: string;
+}
+
+export interface SalesOrderStageHistory {
+  id: string;
+  scope: "ORDER" | "FULFILMENT_LINE";
+  scopeId: string;
+  stageId: string;
+  stageName: string;
+  enteredAt: string;
+  exitedAt: string | null;
+  durationHours: number;
+}
+
+export interface SaveSalesOrderInput {
+  id?: string;
+  orderKind?: SalesOrderKind;
+  customerName: string;
+  customerTallyGuid?: string;
+  poReference: string;
+  poValue?: number | null;
+  voucherNumber?: string;
+  voucherDate?: string;
+  dueDate?: string;
+  ownerUserId?: string;
+  sourceLines: Array<{
+    itemTallyGuid: string;
+    quantity: number;
+    value?: number | null;
+  }>;
+}
+
+export interface SaveSalesOrderWorkflowStageInput {
+  id?: string;
+  orderKind?: SalesOrderKind;
+  stockGroupName?: string;
+  name: string;
+  color?: string;
+  position?: number;
+  terminal?: boolean;
+  requiredPermissions?: string[];
+}
+
+export interface SalesOrderVoucherExportInput {
+  salesOrderIds: string[];
+  exportedBy?: string;
+}
+
+export interface SalesOrderVoucherExportResult {
+  schemaVersion: string;
+  batchId: string;
+  excelPath: string;
+  xmlPath: string;
+  itemCount: number;
+  warnings: string[];
 }
 
 export interface SaveSalesOrderFulfilmentLineInput {
@@ -493,6 +570,7 @@ export interface PlanningState {
   productOrders: ProductOrder[];
   productOrderWorkflowStates: ProductOrderWorkflowState[];
   productOrderFieldDefinitions: ProductOrderFieldDefinition[];
+  salesOrderWorkflowStages: SalesOrderWorkflowStage[];
   groups: string[];
   primaryGroups: string[];
   secondaryGroups: string[];

@@ -347,11 +347,17 @@ export default function CrfBuilder({ order, stores, planning, permissions, onBac
           <thead><tr><th>Gate</th><th>Status</th><th>Decisions</th><th /></tr></thead>
           <tbody>
             {order.approvalRequests.map((request) => {
+              const stage = request.entityType === "SALES_ORDER_STAGE"
+                ? planning.salesOrderWorkflowStages.find((entry) => entry.orderKind === order.orderKind && entry.id === request.targetStage)
+                : null;
+              const requiredPermissions = stage?.requiredPermissions ?? [];
               const canDecide = request.status === "PENDING"
                 && (request.entityType === "SALES_ORDER_PO" ? permissions.includes("SALES_ORDER_APPROVE_PO")
-                  : permissions.includes("SALES_ORDER_APPROVE_CRF_ACCOUNTS") || permissions.includes("SALES_ORDER_APPROVE_CRF_SALES"));
+                  : request.entityType === "SALES_ORDER_CRF"
+                    ? permissions.includes("SALES_ORDER_APPROVE_CRF_ACCOUNTS") || permissions.includes("SALES_ORDER_APPROVE_CRF_SALES")
+                    : requiredPermissions.some((permission) => permissions.includes(permission as Permission)));
               return <tr key={request.id}>
-                <td>{request.entityType === "SALES_ORDER_PO" ? "PO Approval" : "CRF Approval"}</td>
+                <td>{request.entityType === "SALES_ORDER_PO" ? "PO Approval" : request.entityType === "SALES_ORDER_CRF" ? "CRF Approval" : `Stage: ${stage?.name ?? request.targetStage}`}</td>
                 <td><Status value={request.status} kind="approval" /></td>
                 <td>{request.decisions.map((decision) => <div key={decision.id}>{decision.decidedByName} ({decision.decidedByRole}) — {decision.decision}{decision.comment ? `: ${decision.comment}` : ""}</div>)}</td>
                 <td>{canDecide && <div className="inline-actions">

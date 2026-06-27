@@ -24,6 +24,7 @@ export function createPlanningRouter(service: PlanningService, operations: Opera
   router.post("/boms", (request, response) => response.status(201).json(service.saveBom(request.body, actor(request, "BOM_MANAGE"))));
   router.post("/boms/:bomId/activate", (request, response) => response.json(service.activateBom(request.params.bomId, actor(request, "BOM_MANAGE"))));
   router.post("/product-orders", (request, response) => response.status(201).json(service.saveProductOrder(request.body, actor(request, "PRODUCT_ORDER_MANAGE"))));
+  router.post("/sales-orders", (request, response) => response.status(201).json(service.saveSalesOrder(request.body, actor(request, "SALES_ORDER_EDIT_CRF"))));
   router.post("/product-orders/bulk-update", (request, response) => response.json(
     service.bulkUpdateProductOrders(request.body, actor(request, "PRODUCT_ORDER_MANAGE")),
   ));
@@ -36,6 +37,16 @@ export function createPlanningRouter(service: PlanningService, operations: Opera
   router.post("/product-order-workflow-states", (request, response) => response.status(201).json(
     service.saveProductOrderWorkflowState(request.body, actor(request, "PRODUCT_ORDER_MANAGE")),
   ));
+  router.post("/sales-order-workflow-stages", (request, response) => response.status(201).json(
+    service.saveSalesOrderWorkflowStage(request.body, actor(request, "SALES_ORDER_CHECKLIST_CONFIGURE")),
+  ));
+  router.delete("/sales-order-workflow-stages/:orderKind/:stageId", (request, response) => response.json(
+    service.deleteSalesOrderWorkflowStage({
+      id: request.params.stageId,
+      orderKind: request.params.orderKind as "SALES" | "SERVICE",
+      stockGroupName: String(request.query.stockGroupName ?? ""),
+    }, actor(request, "SALES_ORDER_CHECKLIST_CONFIGURE")),
+  ));
   router.delete("/product-order-workflow-states/:stateId", (request, response) => response.json(
     service.deleteProductOrderWorkflowState(request.params.stateId, actor(request, "PRODUCT_ORDER_MANAGE")),
   ));
@@ -46,6 +57,9 @@ export function createPlanningRouter(service: PlanningService, operations: Opera
     service.deleteProductOrderFieldDefinition(request.params.fieldId, actor(request, "PRODUCT_ORDER_MANAGE")),
   ));
   router.post("/export", (request, response) => response.json(service.exportRestock(request.body, actor(request, "RESTOCK_MANAGE"))));
+  router.post("/sales-orders/export-vouchers", (request, response) => response.json(
+    service.exportSalesOrderVouchers(request.body, actor(request, "TALLY_REVIEW")),
+  ));
 
   router.post("/sales-orders/fulfilment-lines", (request, response) => response.status(201).json(
     service.addSalesOrderFulfilmentLine(request.body, actor(request, "SALES_ORDER_EDIT_CRF")),

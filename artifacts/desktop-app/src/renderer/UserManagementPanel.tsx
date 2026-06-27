@@ -52,6 +52,21 @@ export default function UserManagementPanel({ auth, onRefresh, onNotice, onError
     }
   }
 
+  async function deleteRole(name: string) {
+    if (!window.confirm(`Delete role ${name}? Users must be moved to another role first.`)) return;
+    setCreatingRole(true);
+    onError("");
+    try {
+      setRoles(await window.desktop.operations.deleteRole(name));
+      if (role === name) clear();
+      onNotice(`Role ${name} deleted.`);
+    } catch (error) {
+      onError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setCreatingRole(false);
+    }
+  }
+
   function clear(nextRole: UserRole = "STORE") {
     setSelected("");
     setDisplayName("");
@@ -111,9 +126,12 @@ export default function UserManagementPanel({ auth, onRefresh, onNotice, onError
       <div className="role-checklist">
         {roles.map((entry) => {
           const count = auth.users.filter((user) => user.active && user.role === entry.name).length;
-          return <button key={entry.name} type="button" className={`role-check ${count ? "role-check--ready" : ""}`} onClick={() => clear(entry.name)}>
-            <strong>{entry.name}</strong><span>{count ? `${count} active` : "Add account"}</span>
-          </button>;
+          return <div key={entry.name} className={`role-check-card ${count ? "role-check-card--ready" : ""}`}>
+            <button type="button" className="role-check" onClick={() => clear(entry.name)}>
+              <strong>{entry.name}</strong><span>{count ? `${count} active` : "Add account"}</span>
+            </button>
+            {!entry.isSystem && <button className="role-delete-button" type="button" disabled={creatingRole} onClick={() => void deleteRole(entry.name)}>Delete</button>}
+          </div>;
         })}
       </div>
       <form className="inline-actions" onSubmit={(event) => void addRole(event)}>

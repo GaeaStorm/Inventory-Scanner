@@ -117,6 +117,11 @@ export class OperationsService {
     return this.database.listRoles();
   }
 
+  deleteRole(name: string, actor: ActorContext) {
+    this.database.deleteRole(name, actor);
+    return this.database.listRoles();
+  }
+
   getRolePermissions(actor: ActorContext) {
     return this.database.getRolePermissions(actor);
   }

@@ -16,7 +16,10 @@ import type {
   SaveProductOrderFieldDefinitionInput,
   SaveProductOrderInput,
   SaveProductOrderWorkflowStateInput,
+  SaveSalesOrderInput,
+  SaveSalesOrderWorkflowStageInput,
   SaveSalesOrderFulfilmentLineInput,
+  SalesOrderVoucherExportInput,
 } from "./types";
 
 export class PlanningService {
@@ -74,6 +77,12 @@ export class PlanningService {
     return this.getState();
   }
 
+  saveSalesOrder(input: SaveSalesOrderInput, actor: ActorContext) {
+    requirePermission(actor, "SALES_ORDER_EDIT_CRF");
+    this.database.saveSalesOrder(input, actor);
+    return this.getState();
+  }
+
   updateProductOrderStatus(orderId: string, status: "CANCELLED" | "COMPLETED" | "CONFIRMED" | "ON_HOLD", actor: ActorContext) {
     requirePermission(actor, "PRODUCT_ORDER_MANAGE");
     this.database.updateProductOrderStatus(orderId, status, actor);
@@ -122,9 +131,21 @@ export class PlanningService {
     return this.getState();
   }
 
+  saveSalesOrderWorkflowStage(input: SaveSalesOrderWorkflowStageInput, actor: ActorContext) {
+    requirePermission(actor, "SALES_ORDER_CHECKLIST_CONFIGURE");
+    this.database.saveSalesOrderWorkflowStage(input);
+    return this.getState();
+  }
+
   deleteProductOrderWorkflowState(stateId: string, actor: ActorContext) {
     requirePermission(actor, "PRODUCT_ORDER_MANAGE");
     this.database.deleteProductOrderWorkflowState(stateId);
+    return this.getState();
+  }
+
+  deleteSalesOrderWorkflowStage(input: { id: string; orderKind?: "SALES" | "SERVICE"; stockGroupName?: string }, actor: ActorContext) {
+    requirePermission(actor, "SALES_ORDER_CHECKLIST_CONFIGURE");
+    this.database.deleteSalesOrderWorkflowStage(input);
     return this.getState();
   }
 
@@ -143,6 +164,11 @@ export class PlanningService {
   exportRestock(input: PlanningExportInput, actor: ActorContext) {
     requirePermission(actor, "RESTOCK_MANAGE");
     return this.exporter.generate(input);
+  }
+
+  exportSalesOrderVouchers(input: SalesOrderVoucherExportInput, actor: ActorContext) {
+    requirePermission(actor, "TALLY_REVIEW");
+    return this.exporter.generateSalesOrderVouchers(input);
   }
 
   addSalesOrderFulfilmentLine(input: SaveSalesOrderFulfilmentLineInput, actor: ActorContext) {

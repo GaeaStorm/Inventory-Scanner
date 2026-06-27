@@ -19,6 +19,8 @@ interface Props {
   onRefresh: () => Promise<void>;
   onNotice: (message: string) => void;
   onError: (message: string) => void;
+  scannerUrls: string[];
+  canManageScannerPairing: boolean;
 }
 
 type PlanningSection = "action" | "boms" | "orders" | "tracker" | "qr";
@@ -48,6 +50,8 @@ export default function InventoryPlanningDashboard({
   onRefresh,
   onNotice,
   onError,
+  scannerUrls,
+  canManageScannerPairing,
 }: Props) {
   const [section, setSection] = useState<PlanningSection>("action");
   const can = (permission: Permission) => permissions.includes(permission);
@@ -156,7 +160,12 @@ export default function InventoryPlanningDashboard({
       )}
 
       {section === "qr" && (
-        <BoxQrCodeCreatorTab stores={stores} onChanged={onStoresChanged} />
+        <BoxQrCodeCreatorTab
+          stores={stores}
+          onChanged={onStoresChanged}
+          scannerUrls={scannerUrls}
+          canManageScannerPairing={canManageScannerPairing}
+        />
       )}
     </section>
   );

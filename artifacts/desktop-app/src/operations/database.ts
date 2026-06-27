@@ -1238,6 +1238,23 @@ export class OperationsDatabase {
     });
   }
 
+  deleteRole(name: string, actor: ActorContext): void {
+    requirePermission(actor, "AUTH_MANAGE_USERS");
+    const roleName = text(name).toLocaleUpperCase();
+    const role = this.db.prepare("SELECT name, is_system FROM ops_roles WHERE name = ?").get(roleName) as Row | undefined;
+    if (!role) throw new Error("Role not found.");
+    if (Number(role.is_system) === 1) throw new Error("System roles cannot be deleted.");
+    const assignedUsers = Number((this.db.prepare("SELECT COUNT(*) AS count FROM ops_users WHERE role = ?").get(roleName) as Row).count);
+    if (assignedUsers > 0) {
+      throw new Error("Move users out of this role before deleting it.");
+    }
+    this.transaction("deleting a custom role", () => {
+      this.db.prepare("DELETE FROM ops_role_permissions WHERE role_name = ?").run(roleName);
+      this.db.prepare("DELETE FROM ops_roles WHERE name = ?").run(roleName);
+      this.audit(actor, "ROLE_DELETED", "ROLE", roleName, {});
+    });
+  }
+
   getRolePermissions(actor: ActorContext): Array<{ roleName: string; permission: Permission; enabled: boolean }> {
     requirePermission(actor, "AUTH_MANAGE_USERS");
     const roles = (this.db.prepare("SELECT DISTINCT role_name FROM ops_role_permissions ORDER BY role_name").all() as Row[])

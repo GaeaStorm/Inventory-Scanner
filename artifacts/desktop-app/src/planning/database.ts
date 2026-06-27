@@ -26,8 +26,13 @@ import type {
   RestockPolicyInput,
   SalesOrder,
   SalesOrderFulfilmentLine,
+  SalesOrderKind,
   SalesOrderSourceLine,
+  SalesOrderStageHistory,
   SalesOrderStage,
+  SalesOrderWorkflowStage,
+  SaveSalesOrderInput,
+  SaveSalesOrderWorkflowStageInput,
   SaveBomInput,
   SaveChecklistTemplateInput,
   SaveProductOrderFieldDefinitionInput,
@@ -37,6 +42,7 @@ import type {
   TallySalesOrderImportLine,
 } from "./types";
 import type { ActorContext, Permission } from "../operations/types";
+import { allPermissions } from "../operations/permissions";
 import { formatQualifiedItemName, resolvePrimaryGroupFamily } from "../stores/item-family";
 import { payloadHash } from "../database/hash";
 import type { TallySalesOrder } from "../tally/types";
@@ -133,9 +139,19 @@ function normalizedOrderType(value: unknown): ProductOrderType {
   return text(value).toLocaleUpperCase() === "SERVICE" ? "SERVICE" : "PRODUCTION";
 }
 
-const SALES_ORDER_STAGE_SEQUENCE: SalesOrderStage[] = [
-  "PENDING_PO_APPROVAL", "CRF_PENDING", "CRF_SENT", "IN_FULFILMENT", "COMPLETED",
-];
+function normalizedSalesOrderKind(value: unknown): SalesOrderKind {
+  return text(value).toLocaleUpperCase() === "SERVICE" ? "SERVICE" : "SALES";
+}
+
+function workflowStageId(value: unknown): string {
+  const raw = text(value);
+  const normalized = raw
+    .toLocaleUpperCase()
+    .replace(/[^A-Z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .slice(0, 80);
+  return normalized || randomUUID();
+}
 
 // Resale and Raw Material fulfilment-line stages are fixed per the brief and
 // validated in application code rather than a DB CHECK, since mixing all 4
@@ -735,6 +751,119 @@ const migrations: ApplicationDatabaseMigration[] = [
       `);
     },
   },
+  {
+    version: 12,
+    description: "Make Sales Order creation and workflow stages configurable by order kind",
+    up(database: DatabaseSync) {
+      database.exec(`
+        CREATE TABLE planning_sales_orders_new (
+          id TEXT PRIMARY KEY,
+          order_kind TEXT NOT NULL DEFAULT 'SALES' CHECK (order_kind IN ('SALES','SERVICE')),
+          tally_voucher_guid TEXT NOT NULL UNIQUE,
+          customer_name TEXT NOT NULL DEFAULT '',
+          customer_tally_guid TEXT NOT NULL DEFAULT '',
+          po_reference TEXT NOT NULL DEFAULT '',
+          po_value REAL,
+          voucher_number TEXT NOT NULL DEFAULT '',
+          voucher_date TEXT NOT NULL DEFAULT '',
+          due_date TEXT NOT NULL DEFAULT '',
+          owner_user_id TEXT NOT NULL DEFAULT '',
+          order_stage TEXT NOT NULL DEFAULT 'PENDING_PO_APPROVAL',
+          hold_status TEXT NOT NULL DEFAULT 'NONE' CHECK (hold_status IN ('NONE','ON_HOLD','CANCELLED')),
+          source_snapshot_hash TEXT NOT NULL DEFAULT '',
+          source_changed INTEGER NOT NULL DEFAULT 0 CHECK (source_changed IN (0,1)),
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        ) STRICT;
+        INSERT INTO planning_sales_orders_new(
+          id, order_kind, tally_voucher_guid, customer_name, customer_tally_guid, po_reference,
+          po_value, voucher_number, voucher_date, due_date, owner_user_id, order_stage, hold_status,
+          source_snapshot_hash, source_changed, created_at, updated_at
+        )
+        SELECT
+          id, 'SALES', tally_voucher_guid, customer_name, customer_tally_guid, po_reference,
+          po_value, voucher_number, voucher_date, due_date, owner_user_id, order_stage, hold_status,
+          source_snapshot_hash, source_changed, created_at, updated_at
+        FROM planning_sales_orders;
+        DROP TABLE planning_sales_orders;
+        ALTER TABLE planning_sales_orders_new RENAME TO planning_sales_orders;
+        CREATE INDEX idx_sales_orders_stage ON planning_sales_orders(order_stage, updated_at);
+        CREATE INDEX idx_sales_orders_kind ON planning_sales_orders(order_kind, updated_at);
+
+        CREATE TABLE approval_requests_new (
+          id TEXT PRIMARY KEY,
+          entity_type TEXT NOT NULL,
+          entity_id TEXT NOT NULL,
+          target_stage TEXT NOT NULL DEFAULT '',
+          payload_hash TEXT NOT NULL,
+          status TEXT NOT NULL DEFAULT 'PENDING' CHECK (status IN ('PENDING','APPROVED','REJECTED','SUPERSEDED')),
+          created_by_user_id TEXT NOT NULL DEFAULT '',
+          created_at TEXT NOT NULL,
+          superseded_by_request_id TEXT REFERENCES approval_requests(id)
+        ) STRICT;
+        INSERT INTO approval_requests_new(
+          id, entity_type, entity_id, target_stage, payload_hash, status, created_by_user_id, created_at, superseded_by_request_id
+        )
+        SELECT
+          id, entity_type, entity_id,
+          CASE entity_type
+            WHEN 'SALES_ORDER_PO' THEN 'CRF_PENDING'
+            WHEN 'SALES_ORDER_CRF' THEN 'IN_FULFILMENT'
+            ELSE ''
+          END,
+          payload_hash, status, created_by_user_id, created_at, superseded_by_request_id
+        FROM approval_requests;
+        DROP TABLE approval_requests;
+        ALTER TABLE approval_requests_new RENAME TO approval_requests;
+        CREATE INDEX idx_approval_requests_entity ON approval_requests(entity_type, entity_id, status);
+
+        CREATE TABLE planning_sales_order_workflow_stages (
+          id TEXT NOT NULL,
+          order_kind TEXT NOT NULL DEFAULT 'SALES' CHECK (order_kind IN ('SALES','SERVICE')),
+          stock_group_name TEXT NOT NULL DEFAULT '',
+          name TEXT NOT NULL,
+          color TEXT NOT NULL DEFAULT '#6B778C',
+          position INTEGER NOT NULL,
+          terminal INTEGER NOT NULL DEFAULT 0 CHECK (terminal IN (0,1)),
+          required_permissions_json TEXT NOT NULL DEFAULT '[]',
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          PRIMARY KEY(id, order_kind, stock_group_name)
+        ) STRICT;
+      `);
+      const timestamp = nowIso();
+      const insert = database.prepare(`
+        INSERT INTO planning_sales_order_workflow_stages(
+          id, order_kind, stock_group_name, name, color, position, terminal, required_permissions_json, created_at, updated_at
+        ) VALUES (?, ?, '', ?, ?, ?, ?, ?, ?, ?)
+      `);
+      const defaults: Array<[string, SalesOrderKind, string, string, number, number, Permission[]]> = [
+        ["PENDING_PO_APPROVAL", "SALES", "PO Approval", "#6B778C", 1, 0, []],
+        ["CRF_PENDING", "SALES", "CRF Pending", "#9F7AEA", 2, 0, ["SALES_ORDER_APPROVE_PO"]],
+        ["CRF_SENT", "SALES", "CRF Sent", "#6554C0", 3, 0, []],
+        ["IN_FULFILMENT", "SALES", "In Fulfilment", "#246BCE", 4, 0, ["SALES_ORDER_APPROVE_CRF_ACCOUNTS", "SALES_ORDER_APPROVE_CRF_SALES"]],
+        ["COMPLETED", "SALES", "Completed", "#23855B", 5, 1, []],
+        ["PENDING_PO_APPROVAL", "SERVICE", "Service Order Entered", "#6B778C", 1, 0, []],
+        ["CRF_PENDING", "SERVICE", "Service Scope Pending", "#9F7AEA", 2, 0, ["SALES_ORDER_APPROVE_PO"]],
+        ["CRF_SENT", "SERVICE", "Service Scope Sent", "#6554C0", 3, 0, []],
+        ["IN_FULFILMENT", "SERVICE", "Service Execution", "#246BCE", 4, 0, ["SALES_ORDER_APPROVE_CRF_ACCOUNTS", "SALES_ORDER_APPROVE_CRF_SALES"]],
+        ["COMPLETED", "SERVICE", "Completed", "#23855B", 5, 1, []],
+      ];
+      for (const [id, kind, name, color, position, terminal, permissions] of defaults) {
+        insert.run(id, kind, name, color, position, terminal, JSON.stringify(permissions), timestamp, timestamp);
+      }
+    },
+  },
+  {
+    version: 13,
+    description: "Allow item workflow stages to be scoped by Stock Group and gated by permissions",
+    up(database: DatabaseSync) {
+      database.exec(`
+        ALTER TABLE planning_product_order_workflow_states ADD COLUMN stock_group_name TEXT NOT NULL DEFAULT '';
+        ALTER TABLE planning_product_order_workflow_states ADD COLUMN required_permissions_json TEXT NOT NULL DEFAULT '[]';
+      `);
+    },
+  },
 ];
 
 export class PlanningDatabase {
@@ -809,6 +938,23 @@ export class PlanningDatabase {
     ).get(text(guid)) as Row | undefined;
     if (!row) throw new Error("The selected Tally Stock Item is no longer active in the Stores Catalog.");
     return row;
+  }
+
+  private workflowStageAppliesToItem(stage: Row, itemId: number): boolean {
+    const stockGroupName = text(stage.stock_group_name);
+    if (!stockGroupName) return true;
+    const item = this.db.prepare("SELECT parent_name FROM tally_stock_items WHERE id = ?").get(itemId) as Row | undefined;
+    if (!item) return false;
+    return this.resolveGroupPath(text(item.parent_name)).includes(stockGroupName);
+  }
+
+  private requireWorkflowStagePermissions(stage: Row, actor?: ActorContext): void {
+    const requiredPermissions = parseJsonSafe<string[]>(text(stage.required_permissions_json), [])
+      .filter((permission): permission is Permission => allPermissions.includes(permission as Permission));
+    if (requiredPermissions.length === 0) return;
+    if (!actor?.permissions?.some((permission) => requiredPermissions.includes(permission))) {
+      throw new Error(`Moving to ${text(stage.name)} requires one of these permissions: ${requiredPermissions.join(", ")}.`);
+    }
   }
 
   syncMissingTallyBoms(): number {
@@ -1014,14 +1160,76 @@ export class PlanningDatabase {
 
   saveProductOrderWorkflowState(input: SaveProductOrderWorkflowStateInput): ProductOrderWorkflowState {
     this.ensureReady();
-    void input;
-    throw new Error("Order stages are fixed so timing reports remain consistent.");
+    const orderType = normalizedOrderType(input.orderType);
+    const stockGroupName = text(input.stockGroupName);
+    const name = text(input.name);
+    if (!name) throw new Error("Stage name is required.");
+    const requiredPermissions = [...new Set((input.requiredPermissions ?? []).map((permission) => text(permission)).filter(Boolean))];
+    const unknown = requiredPermissions.find((permission) => !allPermissions.includes(permission as Permission));
+    if (unknown) throw new Error(`Unknown approval permission: ${unknown}.`);
+    const id = input.id
+      ? workflowStageId(input.id).toLocaleLowerCase().replaceAll("_", "-")
+      : workflowStageId(stockGroupName ? `${stockGroupName}-${name}` : name).toLocaleLowerCase().replaceAll("_", "-");
+    const position = input.position == null
+      ? Number((this.db.prepare(`
+        SELECT COALESCE(MAX(position), 0) + 1 AS next_position
+        FROM planning_product_order_workflow_states
+        WHERE order_type = ? AND stock_group_name = ?
+      `).get(orderType, stockGroupName) as Row).next_position)
+      : wholeNumber(input.position, "Stage position", false);
+    this.db.prepare(`
+      INSERT INTO planning_product_order_workflow_states(
+        id, name, color, position, terminal, order_type, stock_group_name, required_permissions_json
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        name = excluded.name,
+        color = excluded.color,
+        position = excluded.position,
+        terminal = excluded.terminal,
+        order_type = excluded.order_type,
+        stock_group_name = excluded.stock_group_name,
+        required_permissions_json = excluded.required_permissions_json
+    `).run(
+      id, name, text(input.color) || "#6B778C", position, input.terminal ? 1 : 0,
+      orderType, stockGroupName, json(requiredPermissions),
+    );
+    return this.getProductOrderWorkflowStates().find((stage) => stage.id === id)!;
   }
 
   deleteProductOrderWorkflowState(stateIdValue: string): void {
     this.ensureReady();
-    void stateIdValue;
-    throw new Error("Order stages are fixed so timing reports remain consistent.");
+    const stateId = text(stateIdValue);
+    const state = this.db.prepare(`
+      SELECT id, name, order_type, stock_group_name
+      FROM planning_product_order_workflow_states
+      WHERE id = ?
+    `).get(stateId) as Row | undefined;
+    if (!state) throw new Error("Stage not found.");
+    const currentOrders = Number((this.db.prepare(`
+      SELECT COUNT(*) AS count FROM planning_product_orders WHERE workflow_state_id = ?
+    `).get(stateId) as Row).count);
+    const orderHistory = Number((this.db.prepare(`
+      SELECT COUNT(*) AS count FROM planning_product_order_stage_history WHERE workflow_state_id = ?
+    `).get(stateId) as Row).count);
+    const fulfilmentLines = Number((this.db.prepare(`
+      SELECT COUNT(*) AS count FROM planning_sales_order_fulfilment_lines WHERE stage = ?
+    `).get(stateId) as Row).count);
+    const fulfilmentHistory = Number((this.db.prepare(`
+      SELECT COUNT(*) AS count FROM planning_sales_order_stage_history
+      WHERE scope = 'FULFILMENT_LINE' AND stage = ?
+    `).get(stateId) as Row).count);
+    const approvals = Number((this.db.prepare(`
+      SELECT COUNT(*) AS count FROM approval_requests WHERE target_stage = ?
+    `).get(stateId) as Row).count);
+    if (currentOrders || orderHistory || fulfilmentLines || fulfilmentHistory || approvals) {
+      throw new Error("This item stage is already used by orders, history, or approvals, so it cannot be deleted.");
+    }
+    const peers = Number((this.db.prepare(`
+      SELECT COUNT(*) AS count FROM planning_product_order_workflow_states
+      WHERE order_type = ? AND stock_group_name = ?
+    `).get(text(state.order_type), text(state.stock_group_name)) as Row).count);
+    if (!text(state.stock_group_name) && peers <= 1) throw new Error("Keep at least one item stage in the default workflow.");
+    this.db.prepare("DELETE FROM planning_product_order_workflow_states WHERE id = ?").run(stateId);
   }
 
   saveProductOrderFieldDefinition(input: SaveProductOrderFieldDefinitionInput): ProductOrderFieldDefinition {
@@ -1071,16 +1279,20 @@ export class PlanningDatabase {
   updateProductOrderWorkflowState(orderId: string, workflowStateId: string, actor?: ActorContext): void {
     this.ensureReady();
     const state = this.db.prepare(`
-      SELECT id, order_type FROM planning_product_order_workflow_states WHERE id = ?
+      SELECT id, name, order_type, stock_group_name, required_permissions_json FROM planning_product_order_workflow_states WHERE id = ?
     `).get(text(workflowStateId)) as Row | undefined;
     if (!state) throw new Error("Workflow state not found.");
     const order = this.db.prepare(`
-      SELECT workflow_state_id, order_type FROM planning_product_orders WHERE id = ?
+      SELECT workflow_state_id, order_type, product_item_id FROM planning_product_orders WHERE id = ?
     `).get(text(orderId)) as Row | undefined;
     if (!order) throw new Error("Product order not found.");
     if (normalizedOrderType(order.order_type) !== normalizedOrderType(state.order_type)) {
       throw new Error("Choose a stage belonging to this order type.");
     }
+    if (!this.workflowStageAppliesToItem(state, Number(order.product_item_id))) {
+      throw new Error("Choose a stage configured for this item's Stock Group.");
+    }
+    this.requireWorkflowStagePermissions(state, actor);
     if (normalizedOrderType(order.order_type) === "PRODUCTION" && text(state.id) === "quality-control" && !this.db.prepare(`
       SELECT 1 FROM planning_product_order_stage_history
       WHERE product_order_id = ? AND workflow_state_id = 'material-purchase'
@@ -1140,14 +1352,18 @@ export class PlanningDatabase {
         || text(existing?.workflow_state_id)
         || text((this.db.prepare(`
           SELECT id FROM planning_product_order_workflow_states
-          WHERE order_type = ? ORDER BY position LIMIT 1
+          WHERE order_type = ? AND stock_group_name = '' ORDER BY position LIMIT 1
         `).get(orderType) as Row | undefined)?.id);
       const workflowState = this.db.prepare(`
-        SELECT id, order_type FROM planning_product_order_workflow_states WHERE id = ?
+        SELECT id, name, order_type, stock_group_name, required_permissions_json FROM planning_product_order_workflow_states WHERE id = ?
       `).get(workflowStateId) as Row | undefined;
       if (!workflowState || normalizedOrderType(workflowState.order_type) !== orderType) {
         throw new Error("Choose a valid workflow state.");
       }
+      if (!this.workflowStageAppliesToItem(workflowState, Number(product.id))) {
+        throw new Error("Choose a stage configured for this item's Stock Group.");
+      }
+      this.requireWorkflowStagePermissions(workflowState, actor);
       if (orderType === "PRODUCTION" && workflowStateId === "quality-control" && !this.db.prepare(`
         SELECT 1 FROM planning_product_order_stage_history
         WHERE product_order_id = ? AND workflow_state_id = 'material-purchase'
@@ -1531,6 +1747,218 @@ export class PlanningDatabase {
     return { imported, updated, unmatched };
   }
 
+  getSalesOrderWorkflowStages(): SalesOrderWorkflowStage[] {
+    this.ensureReady();
+    return (this.db.prepare(`
+      SELECT * FROM planning_sales_order_workflow_stages
+      ORDER BY order_kind, stock_group_name COLLATE NOCASE, position, name COLLATE NOCASE
+    `).all() as Row[]).map((row) => ({
+      id: text(row.id),
+      orderKind: normalizedSalesOrderKind(row.order_kind),
+      stockGroupName: text(row.stock_group_name),
+      name: text(row.name),
+      color: text(row.color) || "#6B778C",
+      position: Number(row.position),
+      terminal: Number(row.terminal) === 1,
+      requiredPermissions: parseJsonSafe<string[]>(text(row.required_permissions_json), []),
+    }));
+  }
+
+  saveSalesOrderWorkflowStage(input: SaveSalesOrderWorkflowStageInput): void {
+    this.ensureReady();
+    const orderKind = normalizedSalesOrderKind(input.orderKind);
+    const stockGroupName = "";
+    const name = text(input.name);
+    if (!name) throw new Error("Stage name is required.");
+    const requiredPermissions = [...new Set((input.requiredPermissions ?? []).map((permission) => text(permission)).filter(Boolean))];
+    const unknown = requiredPermissions.find((permission) => !allPermissions.includes(permission as Permission));
+    if (unknown) throw new Error(`Unknown approval permission: ${unknown}.`);
+    const existingPosition = input.position == null ? null : wholeNumber(input.position, "Stage position", false);
+    const position = existingPosition ?? Number((this.db.prepare(`
+      SELECT COALESCE(MAX(position), 0) + 1 AS next_position
+      FROM planning_sales_order_workflow_stages
+      WHERE order_kind = ? AND stock_group_name = ?
+    `).get(orderKind, stockGroupName) as Row).next_position);
+    const id = input.id ? workflowStageId(input.id) : workflowStageId(name);
+    const timestamp = nowIso();
+    this.db.prepare(`
+      INSERT INTO planning_sales_order_workflow_stages(
+        id, order_kind, stock_group_name, name, color, position, terminal, required_permissions_json, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id, order_kind, stock_group_name) DO UPDATE SET
+        name = excluded.name,
+        color = excluded.color,
+        position = excluded.position,
+        terminal = excluded.terminal,
+        required_permissions_json = excluded.required_permissions_json,
+        updated_at = excluded.updated_at
+    `).run(
+      id, orderKind, stockGroupName, name, text(input.color) || "#6B778C",
+      position, input.terminal ? 1 : 0, json(requiredPermissions), timestamp, timestamp,
+    );
+  }
+
+  deleteSalesOrderWorkflowStage(input: { id: string; orderKind?: SalesOrderKind; stockGroupName?: string }): void {
+    this.ensureReady();
+    const id = workflowStageId(input.id);
+    const orderKind = normalizedSalesOrderKind(input.orderKind);
+    const stockGroupName = text(input.stockGroupName);
+    const stage = this.db.prepare(`
+      SELECT id, name, order_kind, stock_group_name
+      FROM planning_sales_order_workflow_stages
+      WHERE id = ? AND order_kind = ? AND stock_group_name = ?
+    `).get(id, orderKind, stockGroupName) as Row | undefined;
+    if (!stage) throw new Error("Stage not found.");
+    const currentOrders = Number((this.db.prepare(`
+      SELECT COUNT(*) AS count FROM planning_sales_orders
+      WHERE order_kind = ? AND order_stage = ?
+    `).get(orderKind, id) as Row).count);
+    const orderHistory = Number((this.db.prepare(`
+      SELECT COUNT(*) AS count FROM planning_sales_order_stage_history
+      WHERE scope = 'ORDER' AND stage = ?
+    `).get(id) as Row).count);
+    const approvals = Number((this.db.prepare(`
+      SELECT COUNT(*) AS count FROM approval_requests WHERE target_stage = ?
+    `).get(id) as Row).count);
+    if (currentOrders || orderHistory || approvals) {
+      throw new Error("This order stage is already used by orders, history, or approvals, so it cannot be deleted.");
+    }
+    const peers = Number((this.db.prepare(`
+      SELECT COUNT(*) AS count FROM planning_sales_order_workflow_stages
+      WHERE order_kind = ? AND stock_group_name = ?
+    `).get(orderKind, stockGroupName) as Row).count);
+    if (peers <= 1) throw new Error("Keep at least one order stage for this order type.");
+    this.db.prepare(`
+      DELETE FROM planning_sales_order_workflow_stages
+      WHERE id = ? AND order_kind = ? AND stock_group_name = ?
+    `).run(id, orderKind, stockGroupName);
+  }
+
+  private salesOrderSourceLineFromItem(input: {
+    item: Row;
+    quantity: number;
+    value: number | null;
+  }): Omit<SalesOrderSourceLine, "id" | "tallyVoucherLineGuid"> {
+    const groupPath = this.resolveGroupPath(text(input.item.parent_name));
+    return {
+      itemId: Number(input.item.id),
+      itemTallyGuid: text(input.item.tally_guid),
+      itemNameSnapshot: text(input.item.name),
+      itemQualifiedNameSnapshot: formatQualifiedItemName(groupPath, text(input.item.name)),
+      family: resolvePrimaryGroupFamily(groupPath),
+      quantity: input.quantity,
+      value: input.value,
+    };
+  }
+
+  private salesOrderWorkflowStagesFor(orderKind: SalesOrderKind, stockGroupName: string): SalesOrderWorkflowStage[] {
+    const rows = (this.db.prepare(`
+      SELECT * FROM planning_sales_order_workflow_stages
+      WHERE order_kind = ? AND stock_group_name = ?
+      ORDER BY position, name COLLATE NOCASE
+    `).all(orderKind, stockGroupName) as Row[]);
+    if (rows.length === 0 && stockGroupName) return this.salesOrderWorkflowStagesFor(orderKind, "");
+    return rows.map((row) => ({
+      id: text(row.id),
+      orderKind: normalizedSalesOrderKind(row.order_kind),
+      stockGroupName: text(row.stock_group_name),
+      name: text(row.name),
+      color: text(row.color) || "#6B778C",
+      position: Number(row.position),
+      terminal: Number(row.terminal) === 1,
+      requiredPermissions: parseJsonSafe<string[]>(text(row.required_permissions_json), []),
+    }));
+  }
+
+  private salesOrderWorkflowStagesForOrder(orderId: string): SalesOrderWorkflowStage[] {
+    const order = this.salesOrderById(orderId);
+    return this.salesOrderWorkflowStagesFor(normalizedSalesOrderKind(order.order_kind), "");
+  }
+
+  private requiredPermissionsForSalesOrderStage(orderId: string, targetStage: string): Permission[] {
+    const stage = this.salesOrderWorkflowStagesForOrder(orderId).find((entry) => entry.id === targetStage);
+    return (stage?.requiredPermissions ?? []).filter((permission): permission is Permission =>
+      allPermissions.includes(permission as Permission),
+    );
+  }
+
+  saveSalesOrder(input: SaveSalesOrderInput, actor?: ActorContext): SalesOrder {
+    this.ensureReady();
+    const orderKind = normalizedSalesOrderKind(input.orderKind);
+    const customerName = text(input.customerName);
+    if (!customerName) throw new Error("Customer name is required.");
+    const poReference = text(input.poReference);
+    if (!poReference) throw new Error("PO/reference is required.");
+    if (!input.sourceLines?.length) throw new Error("Add at least one order line.");
+    const sourceLines = input.sourceLines.map((line) => {
+      const item = this.stockItemByGuid(line.itemTallyGuid);
+      return this.salesOrderSourceLineFromItem({
+        item,
+        quantity: wholeNumber(line.quantity, "Order line quantity", false),
+        value: optionalNumber(line.value ?? null, "Order line value"),
+      });
+    });
+    const initialStage = this.salesOrderWorkflowStagesFor(orderKind, "")[0]?.id ?? "PENDING_PO_APPROVAL";
+    const orderId = text(input.id) || randomUUID();
+    const existing = text(input.id) ? this.db.prepare(
+      "SELECT id, order_stage FROM planning_sales_orders WHERE id = ?",
+    ).get(orderId) as Row | undefined : undefined;
+    if (input.id && !existing) throw new Error("Sales Order not found.");
+    if (existing && ["CRF_SENT", "IN_FULFILMENT", "COMPLETED"].includes(text(existing.order_stage))) {
+      throw new Error("This order has already entered fulfilment. Create an amendment instead of editing the source order.");
+    }
+    const timestamp = nowIso();
+    const voucherNumber = text(input.voucherNumber) || `${orderKind === "SERVICE" ? "SVO" : "SO"}-${poReference}`;
+    const voucherGuid = existing
+      ? text((this.db.prepare("SELECT tally_voucher_guid FROM planning_sales_orders WHERE id = ?").get(orderId) as Row).tally_voucher_guid)
+      : `LOCAL:${orderKind}:${orderId}`;
+    this.host.transaction(existing ? "updating a local Sales Order" : "creating a local Sales Order", () => {
+      if (existing) {
+        this.db.prepare(`
+          UPDATE planning_sales_orders
+          SET order_kind = ?, customer_name = ?, customer_tally_guid = ?, po_reference = ?, po_value = ?,
+            voucher_number = ?, voucher_date = ?, due_date = ?, owner_user_id = ?, updated_at = ?
+          WHERE id = ?
+        `).run(
+          orderKind, customerName, text(input.customerTallyGuid), poReference,
+          optionalNumber(input.poValue ?? null, "PO value"), voucherNumber,
+          optionalDate(input.voucherDate) || dateOnly(), optionalDate(input.dueDate),
+          text(input.ownerUserId ?? actor?.userId ?? ""), timestamp, orderId,
+        );
+        this.db.prepare("DELETE FROM planning_sales_order_source_lines WHERE sales_order_id = ?").run(orderId);
+        this.invalidatePendingApprovals(orderId);
+      } else {
+        this.db.prepare(`
+          INSERT INTO planning_sales_orders(
+            id, order_kind, tally_voucher_guid, customer_name, customer_tally_guid, po_reference, po_value,
+            voucher_number, voucher_date, due_date, owner_user_id, order_stage, created_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          orderId, orderKind, voucherGuid, customerName, text(input.customerTallyGuid), poReference,
+          optionalNumber(input.poValue ?? null, "PO value"), voucherNumber,
+          optionalDate(input.voucherDate) || dateOnly(), optionalDate(input.dueDate),
+          text(input.ownerUserId ?? actor?.userId ?? ""), initialStage, timestamp, timestamp,
+        );
+        this.db.prepare(`
+          INSERT INTO planning_sales_order_stage_history(id, scope, scope_id, stage, entered_at)
+          VALUES (?, 'ORDER', ?, ?, ?)
+        `).run(randomUUID(), orderId, initialStage, timestamp);
+      }
+      for (const line of sourceLines) {
+        this.db.prepare(`
+          INSERT INTO planning_sales_order_source_lines(
+            id, sales_order_id, tally_voucher_line_guid, item_id, item_name_snapshot,
+            item_qualified_name_snapshot, family, quantity, value, created_at
+          ) VALUES (?, ?, '', ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          randomUUID(), orderId, line.itemId, line.itemNameSnapshot,
+          line.itemQualifiedNameSnapshot, line.family, line.quantity, line.value, timestamp,
+        );
+      }
+    });
+    return this.getSalesOrders().find((entry) => entry.id === orderId)!;
+  }
+
   /**
    * Sales/Accounts applying a detected Tally amendment: replaces the source
    * lines, clears the source_changed flag, and requires a brand-new CRF
@@ -1576,7 +2004,7 @@ export class PlanningDatabase {
     this.requireSourceNotChanged(salesOrderId);
     this.host.transaction("requesting CRF re-approval after an amendment", () => {
       this.createCrfRevision(salesOrderId);
-      this.createApprovalRequest("SALES_ORDER_CRF", salesOrderId, actor);
+      this.createApprovalRequest("SALES_ORDER_CRF", salesOrderId, actor, "IN_FULFILMENT");
     });
     return this.getSalesOrders().find((entry) => entry.id === salesOrderId)!;
   }
@@ -1613,6 +2041,7 @@ export class PlanningDatabase {
       resaleSupplierId: row.resale_supplier_id == null ? null : Number(row.resale_supplier_id),
       resaleSupplierName: text(row.resale_supplier_name),
       notes: text(row.notes),
+      stageHistory: [],
       createdAt: text(row.created_at),
       updatedAt: text(row.updated_at),
     };
@@ -1654,7 +2083,7 @@ export class PlanningDatabase {
       fulfilmentLinesByOrder.set(text(row.sales_order_id), list);
     }
     const requestRows = this.db.prepare(`
-      SELECT * FROM approval_requests WHERE entity_type IN ('SALES_ORDER_PO','SALES_ORDER_CRF') ORDER BY created_at
+      SELECT * FROM approval_requests WHERE entity_type IN ('SALES_ORDER_PO','SALES_ORDER_CRF','SALES_ORDER_STAGE') ORDER BY created_at
     `).all() as Row[];
     const decisionRows = this.db.prepare("SELECT * FROM approval_decisions ORDER BY decided_at").all() as Row[];
     const decisionsByRequest = new Map<string, ApprovalDecision[]>();
@@ -1678,6 +2107,7 @@ export class PlanningDatabase {
         id: text(row.id),
         entityType: text(row.entity_type) as ApprovalRequest["entityType"],
         entityId: text(row.entity_id),
+        targetStage: text(row.target_stage),
         status: text(row.status) as ApprovalRequest["status"],
         payloadHash: text(row.payload_hash),
         createdByUserId: text(row.created_by_user_id),
@@ -1707,10 +2137,42 @@ export class PlanningDatabase {
     for (const row of pendingAmendmentRows) {
       if (!pendingAmendmentByOrder.has(text(row.sales_order_id))) pendingAmendmentByOrder.set(text(row.sales_order_id), row);
     }
-    return orderRows.map((row) => {
-      const pendingAmendment = pendingAmendmentByOrder.get(text(row.id));
+    const productStageNames = new Map(this.getProductOrderWorkflowStates().map((stage) => [stage.id, stage.name]));
+    const salesStageNames = new Map(this.getSalesOrderWorkflowStages().map((stage) => [stage.id, stage.name]));
+    const formatFallbackStageName = (stageId: string) => stageId
+      .replaceAll("_", " ")
+      .replaceAll("-", " ")
+      .replace(/\b\w/g, (letter) => letter.toUpperCase());
+    const mapStageHistory = (row: Row): SalesOrderStageHistory => {
+      const stageId = text(row.stage);
+      const end = row.exited_at ? new Date(text(row.exited_at)).valueOf() : Date.now();
+      const start = new Date(text(row.entered_at)).valueOf();
       return {
         id: text(row.id),
+        scope: text(row.scope) as SalesOrderStageHistory["scope"],
+        scopeId: text(row.scope_id),
+        stageId,
+        stageName: salesStageNames.get(stageId) ?? productStageNames.get(stageId) ?? formatFallbackStageName(stageId),
+        enteredAt: text(row.entered_at),
+        exitedAt: row.exited_at ? text(row.exited_at) : null,
+        durationHours: Math.max(0, (end - start) / 3_600_000),
+      };
+    };
+    const orderStageHistoryByOrder = new Map<string, SalesOrderStageHistory[]>();
+    const fulfilmentStageHistoryByLine = new Map<string, SalesOrderStageHistory[]>();
+    for (const row of this.db.prepare("SELECT * FROM planning_sales_order_stage_history ORDER BY entered_at").all() as Row[]) {
+      const mapped = mapStageHistory(row);
+      const target = mapped.scope === "ORDER" ? orderStageHistoryByOrder : fulfilmentStageHistoryByLine;
+      const list = target.get(mapped.scopeId) ?? [];
+      list.push(mapped);
+      target.set(mapped.scopeId, list);
+    }
+    return orderRows.map((row) => {
+      const pendingAmendment = pendingAmendmentByOrder.get(text(row.id));
+      const fulfilmentLines = fulfilmentLinesByOrder.get(text(row.id)) ?? [];
+      return {
+        id: text(row.id),
+        orderKind: normalizedSalesOrderKind(row.order_kind),
         tallyVoucherGuid: text(row.tally_voucher_guid),
         customerName: text(row.customer_name),
         customerTallyGuid: text(row.customer_tally_guid),
@@ -1723,8 +2185,12 @@ export class PlanningDatabase {
         orderStage: text(row.order_stage) as SalesOrder["orderStage"],
         holdStatus: text(row.hold_status) as SalesOrder["holdStatus"],
         sourceChanged: Number(row.source_changed) === 1,
+        stageHistory: orderStageHistoryByOrder.get(text(row.id)) ?? [],
         sourceLines: sourceLinesByOrder.get(text(row.id)) ?? [],
-        fulfilmentLines: fulfilmentLinesByOrder.get(text(row.id)) ?? [],
+        fulfilmentLines: fulfilmentLines.map((line) => ({
+          ...line,
+          stageHistory: fulfilmentStageHistoryByLine.get(line.id) ?? [],
+        })),
         approvalRequests: requestsByOrder.get(text(row.id)) ?? [],
         crfRevisions: revisionsByOrder.get(text(row.id)) ?? [],
         pendingSourceAmendment: pendingAmendment ? {
@@ -1844,15 +2310,20 @@ export class PlanningDatabase {
   }
 
   /** MANUFACTURED lines reuse the existing 15-stage workflow lookup, starting at Material Planning since PO/CRF are now order-level concerns. */
-  private advanceManufacturedFulfilmentLine(fulfilmentLineId: string, targetStageId: string): void {
+  private advanceManufacturedFulfilmentLine(fulfilmentLineId: string, targetStageId: string, actor?: ActorContext): void {
+    const line = this.fulfilmentLineById(fulfilmentLineId);
     const states = this.db.prepare(`
-      SELECT id, position FROM planning_product_order_workflow_states
+      SELECT id, name, position, stock_group_name, required_permissions_json FROM planning_product_order_workflow_states
       WHERE order_type = 'PRODUCTION' ORDER BY position
     `).all() as Row[];
     const materialPlanningPosition = Number(states.find((entry) => text(entry.id) === "material-planning")?.position ?? 0);
-    const eligible = states.filter((entry) => Number(entry.position) >= materialPlanningPosition);
+    const eligible = states.filter((entry) =>
+      Number(entry.position) >= materialPlanningPosition
+      && this.workflowStageAppliesToItem(entry, Number(line.item_id)),
+    );
     const target = eligible.find((entry) => text(entry.id) === targetStageId);
     if (!target) throw new Error("Choose a valid Manufactured fulfilment stage.");
+    this.requireWorkflowStagePermissions(target, actor);
     if (text(target.id) === "quality-control") {
       const reachedMaterialPurchase = this.db.prepare(`
         SELECT 1 FROM planning_sales_order_stage_history
@@ -1877,7 +2348,7 @@ export class PlanningDatabase {
     }
   }
 
-  advanceFulfilmentLineStage(fulfilmentLineId: string, targetStage: string, _actor?: ActorContext): SalesOrderFulfilmentLine {
+  advanceFulfilmentLineStage(fulfilmentLineId: string, targetStage: string, actor?: ActorContext): SalesOrderFulfilmentLine {
     this.ensureReady();
     const line = this.fulfilmentLineById(fulfilmentLineId);
     this.requireSourceNotChanged(text(line.sales_order_id));
@@ -1886,7 +2357,7 @@ export class PlanningDatabase {
     }
     const family = text(line.family);
     const normalizedTarget = text(targetStage).toLocaleLowerCase();
-    if (family === "MANUFACTURED") this.advanceManufacturedFulfilmentLine(fulfilmentLineId, normalizedTarget);
+    if (family === "MANUFACTURED") this.advanceManufacturedFulfilmentLine(fulfilmentLineId, normalizedTarget, actor);
     else if (family === "RESALE") this.advanceFixedStageFulfilmentLine(fulfilmentLineId, normalizedTarget, RESALE_FULFILMENT_STAGES);
     else if (family === "RAW_MATERIAL") this.advanceFixedStageFulfilmentLine(fulfilmentLineId, normalizedTarget, RAW_MATERIAL_FULFILMENT_STAGES);
     else throw new Error("Service lines use markFulfilmentLineServiceDone instead of stage progression.");
@@ -1933,13 +2404,21 @@ export class PlanningDatabase {
   advanceSalesOrderStage(orderId: string, targetStage: SalesOrderStage, actor?: ActorContext): SalesOrder {
     this.ensureReady();
     const order = this.salesOrderById(orderId);
-    const currentIndex = SALES_ORDER_STAGE_SEQUENCE.indexOf(text(order.order_stage) as SalesOrderStage);
-    const targetIndex = SALES_ORDER_STAGE_SEQUENCE.indexOf(targetStage);
+    const stages = this.salesOrderWorkflowStagesForOrder(orderId);
+    const currentIndex = stages.findIndex((stage) => stage.id === text(order.order_stage));
+    const targetIndex = stages.findIndex((stage) => stage.id === targetStage);
     if (targetIndex !== currentIndex + 1) {
       throw new Error("Sales Order stages move forward one step at a time.");
     }
     if (targetStage === "CRF_PENDING" || targetStage === "IN_FULFILMENT") {
       throw new Error(`Moving to ${targetStage} requires an approved request — use the approval workflow instead.`);
+    }
+    const requiredPermissions = this.requiredPermissionsForSalesOrderStage(orderId, targetStage);
+    if (requiredPermissions.length > 0) {
+      this.host.transaction("requesting stage-transition approval", () => {
+        this.createApprovalRequest("SALES_ORDER_STAGE", orderId, actor, targetStage);
+      });
+      return this.getSalesOrders().find((entry) => entry.id === orderId)!;
     }
     this.setSalesOrderStage(orderId, targetStage, actor);
     const updated = this.getSalesOrders().find((entry) => entry.id === orderId);
@@ -1994,7 +2473,12 @@ export class PlanningDatabase {
     };
   }
 
-  private createApprovalRequest(entityType: ApprovalEntityType, salesOrderId: string, actor?: ActorContext): ApprovalRequest {
+  private createApprovalRequest(
+    entityType: ApprovalEntityType,
+    salesOrderId: string,
+    actor?: ActorContext,
+    targetStage = "",
+  ): ApprovalRequest {
     const existingPending = this.db.prepare(`
       SELECT 1 FROM approval_requests WHERE entity_type = ? AND entity_id = ? AND status = 'PENDING'
     `).get(entityType, salesOrderId);
@@ -2003,9 +2487,9 @@ export class PlanningDatabase {
     const timestamp = nowIso();
     const hash = payloadHash(this.currentSalesOrderPayload(salesOrderId));
     this.db.prepare(`
-      INSERT INTO approval_requests(id, entity_type, entity_id, payload_hash, status, created_by_user_id, created_at)
-      VALUES (?, ?, ?, ?, 'PENDING', ?, ?)
-    `).run(id, entityType, salesOrderId, hash, actor?.userId ?? "", timestamp);
+      INSERT INTO approval_requests(id, entity_type, entity_id, target_stage, payload_hash, status, created_by_user_id, created_at)
+      VALUES (?, ?, ?, ?, ?, 'PENDING', ?, ?)
+    `).run(id, entityType, salesOrderId, targetStage, hash, actor?.userId ?? "", timestamp);
     const order = this.getSalesOrders().find((entry) => entry.id === salesOrderId);
     return order!.approvalRequests.find((entry) => entry.id === id)!;
   }
@@ -2042,7 +2526,7 @@ export class PlanningDatabase {
     this.ensureReady();
     this.salesOrderById(salesOrderId);
     this.host.transaction("requesting PO approval", () => {
-      this.createApprovalRequest("SALES_ORDER_PO", salesOrderId, actor);
+      this.createApprovalRequest("SALES_ORDER_PO", salesOrderId, actor, "CRF_PENDING");
     });
     return this.getSalesOrders().find((entry) => entry.id === salesOrderId)!;
   }
@@ -2057,7 +2541,7 @@ export class PlanningDatabase {
     this.advanceSalesOrderStage(salesOrderId, "CRF_SENT", actor);
     this.host.transaction("submitting a CRF for approval", () => {
       this.createCrfRevision(salesOrderId);
-      this.createApprovalRequest("SALES_ORDER_CRF", salesOrderId, actor);
+      this.createApprovalRequest("SALES_ORDER_CRF", salesOrderId, actor, "IN_FULFILMENT");
     });
     return this.getSalesOrders().find((entry) => entry.id === salesOrderId)!;
   }
@@ -2115,10 +2599,10 @@ export class PlanningDatabase {
   }
 
   /**
-   * Records one approval/rejection decision. No self-approval: the user who
-   * created the request (submitted the CRF / requested PO approval) cannot
-   * also be the one deciding it. No permission-pair bypass: each decision is
-   * pinned to exactly one required-permission slot when recorded, so one
+   * Records one approval/rejection decision. Submitters may decide their own
+   * request when they hold the needed permission, but there is still no
+   * permission-pair bypass: each decision is pinned to exactly one required
+   * permission slot when recorded, so one
    * person (or one role) can never fill two slots — this is permission-based
    * rather than role-name-based so a custom role granted the right
    * permission participates correctly. isApprovalSatisfied() requires a
@@ -2130,18 +2614,18 @@ export class PlanningDatabase {
     if (!request) throw new Error("Approval request not found.");
     if (text(request.status) !== "PENDING") throw new Error("This approval request is no longer pending.");
     const entityType = text(request.entity_type) as ApprovalEntityType;
-    const requiredPermissions = APPROVAL_PERMISSION_REQUIREMENTS[entityType];
+    const salesOrderId = text(request.entity_id);
+    const requiredPermissions = entityType === "SALES_ORDER_STAGE"
+      ? this.requiredPermissionsForSalesOrderStage(salesOrderId, text(request.target_stage))
+      : APPROVAL_PERMISSION_REQUIREMENTS[entityType];
+    if (requiredPermissions.length === 0) throw new Error("This approval request no longer has any approver permissions configured.");
     if (!requiredPermissions.some((permission) => actor.permissions?.includes(permission))) {
       throw new Error(`${actor.role} does not hold a permission required to decide this approval.`);
-    }
-    if (text(request.created_by_user_id) === actor.userId) {
-      throw new Error("The person who submitted this request cannot also approve or reject it.");
     }
     if (decision === "REJECT" && !text(comment).trim()) {
       throw new Error("A rejection requires a comment explaining why.");
     }
     const currentHash = payloadHash(this.currentSalesOrderPayload(text(request.entity_id)));
-    const salesOrderId = text(request.entity_id);
     this.host.transaction("recording an approval decision", () => {
       const readDecisions = () => (this.db.prepare(
         "SELECT decided_by_user_id, qualifying_permission, decision FROM approval_decisions WHERE request_id = ?",
@@ -2154,7 +2638,7 @@ export class PlanningDatabase {
       // claimed by someone else) is still recorded for the audit trail, it
       // just claims no slot and so cannot advance the request on its own.
       const qualifyingPermission = decision === "APPROVE"
-        ? pickQualifyingPermission(entityType, actor.permissions, readDecisions())
+        ? pickQualifyingPermission(entityType, actor.permissions, readDecisions(), requiredPermissions)
         : null;
       this.db.prepare(`
         INSERT INTO approval_decisions(
@@ -2165,10 +2649,11 @@ export class PlanningDatabase {
       const records = readDecisions();
       if (hasRejection(records)) {
         this.db.prepare("UPDATE approval_requests SET status = 'REJECTED' WHERE id = ?").run(requestId);
-      } else if (isApprovalSatisfied(entityType, records)) {
+      } else if (isApprovalSatisfied(entityType, records, requiredPermissions)) {
         this.db.prepare("UPDATE approval_requests SET status = 'APPROVED' WHERE id = ?").run(requestId);
-        if (entityType === "SALES_ORDER_PO") this.setSalesOrderStage(salesOrderId, "CRF_PENDING", actor);
-        else this.setSalesOrderStage(salesOrderId, "IN_FULFILMENT", actor);
+        if (entityType === "SALES_ORDER_PO") this.setSalesOrderStage(salesOrderId, text(request.target_stage) || "CRF_PENDING", actor);
+        else if (entityType === "SALES_ORDER_CRF") this.setSalesOrderStage(salesOrderId, text(request.target_stage) || "IN_FULFILMENT", actor);
+        else this.setSalesOrderStage(salesOrderId, text(request.target_stage), actor);
       }
     });
     return this.getSalesOrders().find((entry) => entry.id === salesOrderId)!;
@@ -2358,15 +2843,17 @@ export class PlanningDatabase {
 
   private getProductOrderWorkflowStates(): ProductOrderWorkflowState[] {
     return (this.db.prepare(`
-      SELECT id, name, color, position, terminal, order_type
-      FROM planning_product_order_workflow_states ORDER BY position, name
+      SELECT id, name, color, position, terminal, order_type, stock_group_name, required_permissions_json
+      FROM planning_product_order_workflow_states ORDER BY order_type, stock_group_name, position, name
     `).all() as Row[]).map((row) => ({
       id: text(row.id),
       orderType: normalizedOrderType(row.order_type),
+      stockGroupName: text(row.stock_group_name),
       name: text(row.name),
       color: text(row.color),
       position: Number(row.position),
       terminal: Boolean(row.terminal),
+      requiredPermissions: parseJsonSafe<string[]>(text(row.required_permissions_json), []),
     }));
   }
 
@@ -2781,6 +3268,7 @@ export class PlanningDatabase {
       productOrders,
       productOrderWorkflowStates,
       productOrderFieldDefinitions,
+      salesOrderWorkflowStages: this.getSalesOrderWorkflowStages(),
       groups: [...new Set(items.map((item) => item.groupName).filter(Boolean))].sort(),
       primaryGroups: [...new Set(items.map((item) => item.primaryGroupName).filter(Boolean))].sort(),
       secondaryGroups: [...new Set(items.map((item) => item.secondaryGroupName).filter(Boolean))].sort(),

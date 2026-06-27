@@ -16,6 +16,10 @@
   top: 76px;
 }
 
+.stores-scanner-panel {
+  margin-bottom: 20px;
+}
+
 .box-qr-search-field,
 .box-qr-shared-fields label,
 .box-qr-item-row label {

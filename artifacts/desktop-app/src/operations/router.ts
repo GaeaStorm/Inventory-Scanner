@@ -43,6 +43,7 @@ export function createOperationsRouter(service: OperationsService): Router {
   });
   router.get("/roles", (_request, response) => response.json(service.listRoles()));
   router.post("/roles", (request, response) => response.status(201).json(service.createRole(request.body?.name, actor(request, "AUTH_MANAGE_USERS"))));
+  router.delete("/roles/:roleName", (request, response) => response.json(service.deleteRole(request.params.roleName, actor(request, "AUTH_MANAGE_USERS"))));
   router.get("/role-permissions", (request, response) => response.json(service.getRolePermissions(actor(request, "AUTH_MANAGE_USERS"))));
   router.post("/role-permissions", (request, response) => response.json(service.setRolePermission(
     request.body.roleName, request.body.permission, Boolean(request.body.enabled), actor(request, "AUTH_MANAGE_USERS"),

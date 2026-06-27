@@ -121,6 +121,15 @@ export function buildServiceOrderGroups(planning: PlanningState): ServiceOrderGr
 }
 
 export function serviceOrderAttention(group: ServiceOrderGroup): { label: string; tone: string } {
+  if (group.lines.length > 0 && group.lines.every((line) => line.status === "CANCELLED")) {
+    return { label: "Cancelled", tone: "danger" };
+  }
+  if (group.lines.length > 0 && group.lines.every((line) => line.status === "COMPLETED")) {
+    return { label: "Complete", tone: "success" };
+  }
+  if (group.lines.length > 0 && group.lines.every((line) => line.status === "ON_HOLD")) {
+    return { label: "On Hold", tone: "warning" };
+  }
   const due = group.dueDate;
   const openLines = group.lines.filter((line) => !isReady(line));
   if (due && due < today() && openLines.length) return { label: "Overdue", tone: "danger" };

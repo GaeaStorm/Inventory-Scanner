@@ -10,6 +10,7 @@ import { OperationsDatabase } from "../src/operations/database";
 import { permissionsForRole, requirePermission, resolveActorPermissions } from "../src/operations/permissions";
 import type { ActorContext, ConditionBalance } from "../src/operations/types";
 import { PlanningDatabase, warrantyStatusForSerial } from "../src/planning/database";
+import { PlanningExporter } from "../src/planning/exporter";
 import { buildCrfHtml } from "../src/planning/crf-document";
 import { traceabilityColumns } from "../src/renderer/traceability";
 import { parseBomWorkbook } from "../src/renderer/bom-import";
@@ -721,6 +722,43 @@ test("Sales Order aggregate groups one Tally voucher into one order with classif
   }
 });
 
+test("local Sales Orders can be created first and exported as Tally voucher import files", () => {
+  const context = createContext();
+  try {
+    const state = context.planning.saveSalesOrder({
+      orderKind: "SALES",
+      customerName: "Local Customer",
+      poReference: "LOCAL-PO-1",
+      voucherDate: "2026-06-26",
+      dueDate: "2026-07-01",
+      sourceLines: [{ itemTallyGuid: context.productGuid, quantity: 2, value: 5000 }],
+    }, context.actor);
+    assert.equal(state.customerName, "Local Customer");
+    assert.equal(state.orderKind, "SALES");
+    assert.match(state.tallyVoucherGuid, /^LOCAL:SALES:/);
+    assert.equal(state.sourceLines[0].itemTallyGuid, context.productGuid);
+
+    context.planning.saveSalesOrderWorkflowStage({
+      orderKind: "SALES",
+      stockGroupName: "",
+      name: "Dispatch Review",
+      position: 6,
+      requiredPermissions: ["SALES_ORDER_APPROVE_PO"],
+    });
+    assert.ok(context.planning.getState().salesOrderWorkflowStages.some((stage) => stage.name === "Dispatch Review"));
+
+    const result = new PlanningExporter(context.planning, context.stores).generateSalesOrderVouchers({
+      salesOrderIds: [state.id],
+      exportedBy: context.actor.displayName,
+    });
+    const xml = readFileSync(result.xmlPath, "utf8");
+    assert.match(xml, /<VOUCHERTYPENAME>Sales Order Master<\/VOUCHERTYPENAME>/);
+    assert.match(xml, /<STOCKITEMNAME>Test Product<\/STOCKITEMNAME>/);
+  } finally {
+    closeContext(context);
+  }
+});
+
 test("CRF revisions freeze an immutable snapshot, reprint historically, and Tally amendments after CRF Sent never silently rewrite source lines", () => {
   const context = createContext();
   const sales: ActorContext = { userId: "u-sales", displayName: "Sales Rep", username: "sales", role: "SALES", auditIdentity: "SALES", permissions: permissionsForRole(context.host.db, "SALES") };
@@ -791,7 +829,7 @@ test("CRF revisions freeze an immutable snapshot, reprint historically, and Tall
   }
 });
 
-test("dual-approval engine enforces distinct approvers and no self-approval, and the checklist engine resolves and waives requirements", () => {
+test("dual-approval engine requires each permission slot and permits submitter approval, and the checklist engine resolves and waives requirements", () => {
   const context = createContext();
   const sales: ActorContext = { userId: "u-sales", displayName: "Sales Rep", username: "sales", role: "SALES", auditIdentity: "SALES", permissions: permissionsForRole(context.host.db, "SALES") };
   const accounts: ActorContext = { userId: "u-accounts", displayName: "Accounts Rep", username: "accounts", role: "ACCOUNTS", auditIdentity: "ACCOUNTS", permissions: permissionsForRole(context.host.db, "ACCOUNTS") };
@@ -837,18 +875,13 @@ test("dual-approval engine enforces distinct approvers and no self-approval, and
     assert.equal(afterSubmit.orderStage, "CRF_SENT");
     const crfRequest = afterSubmit.approvalRequests.find((entry) => entry.entityType === "SALES_ORDER_CRF" && entry.status === "PENDING")!;
 
-    // The submitter cannot also approve.
-    assert.throws(() => context.planning.decideApproval(crfRequest.id, "APPROVE", "", sales), /cannot also approve/);
-    // One Accounts approval alone is not enough — Sales must also approve, from a different person.
-    context.planning.decideApproval(crfRequest.id, "APPROVE", "", accounts);
+    // The submitter may approve when they hold the required approval permission.
+    context.planning.decideApproval(crfRequest.id, "APPROVE", "", sales);
+    // One Sales approval alone is not enough — Accounts must also approve.
     const partial = context.planning.getState().salesOrders.find((o) => o.id === orderId)!;
     assert.equal(partial.orderStage, "CRF_SENT");
-    // A second Accounts approval cannot fill the Sales slot.
-    context.planning.decideApproval(crfRequest.id, "APPROVE", "", secondAccounts);
-    const stillPending = context.planning.getState().salesOrders.find((o) => o.id === orderId)!;
-    assert.equal(stillPending.orderStage, "CRF_SENT");
 
-    // Editing a fulfilment line after submission supersedes the pending approval.
+    // Editing a fulfilment line after submission supersedes the still-pending approval.
     context.planning.addSalesOrderFulfilmentLine({ salesOrderId: orderId, itemTallyGuid: context.productGuid, quantity: 1 }, sales);
     const afterEdit = context.planning.getState().salesOrders.find((o) => o.id === orderId)!;
     assert.equal(afterEdit.approvalRequests.find((entry) => entry.id === crfRequest.id)?.status, "SUPERSEDED");
@@ -985,7 +1018,7 @@ test("obsolete items remain visible to Accounts until a restock policy is decide
   }
 });
 
-test("order stages are fixed while custom fields can be deleted safely", () => {
+test("item stages can be scoped while custom fields can be deleted safely", () => {
   const context = createContext();
   try {
     const field = context.planning.saveProductOrderFieldDefinition({
@@ -997,11 +1030,26 @@ test("order stages are fixed while custom fields can be deleted safely", () => {
     assert.equal(state.productOrderWorkflowStates.filter((entry) => entry.orderType === "PRODUCTION").length, 15);
     assert.equal(state.productOrderWorkflowStates.filter((entry) => entry.orderType === "SERVICE").length, 9);
     assert.equal(state.productOrderFieldDefinitions.some((entry) => entry.id === field.id), false);
-    assert.throws(
-      () => context.planning.saveProductOrderWorkflowState({ name: "Temporary state" }),
-      /stages are fixed/,
-    );
-    assert.throws(() => context.planning.deleteProductOrderWorkflowState("po-pending"), /stages are fixed/);
+    context.planning.saveProductOrderWorkflowState({
+      orderType: "PRODUCTION",
+      stockGroupName: "MANUFACTURED PRODUCTS",
+      name: "Temporary state",
+      requiredPermissions: ["PRODUCTION_EXECUTE"],
+    });
+    state = context.planning.getState();
+    const temporaryStage = state.productOrderWorkflowStates.find((entry) => entry.name === "Temporary state" && entry.stockGroupName === "MANUFACTURED PRODUCTS");
+    assert.ok(temporaryStage);
+    context.planning.deleteProductOrderWorkflowState(temporaryStage.id);
+    state = context.planning.getState();
+    assert.equal(state.productOrderWorkflowStates.some((entry) => entry.id === temporaryStage.id), false);
+    context.planning.saveProductOrder({
+      externalReference: "PO-STAGE-DELETE-GUARD",
+      organisation: "Akademika Test Customer",
+      productTallyGuid: context.productGuid,
+      quantity: 1,
+      workflowStateId: "po-pending",
+    });
+    assert.throws(() => context.planning.deleteProductOrderWorkflowState("po-pending"), /already used/);
   } finally {
     closeContext(context);
   }
@@ -1023,7 +1071,7 @@ test("migrations are additive and receipt splits keep only AVAILABLE in the lega
       faultySerialNumbers: ["F-1", "F-2"],
       faultReason: "Damaged on arrival",
     });
-    assert.equal(context.operations.moduleVersion, 9);
+    assert.equal(context.operations.moduleVersion, 10);
     assert.equal(balance(context, "AVAILABLE").quantity, 5);
     assert.equal(balance(context, "PENDING_INSPECTION").quantity, 3);
     assert.equal(balance(context, "FAULTY").quantity, 2);
@@ -1046,7 +1094,7 @@ test("migrations are additive and receipt splits keep only AVAILABLE in the lega
     const migrationRows = context.host.db.prepare(
       "SELECT version FROM application_module_migrations WHERE module_name = 'operations' ORDER BY version",
     ).all() as Array<{ version: number }>;
-    assert.deepEqual(migrationRows.map((row) => Number(row.version)), [1, 2, 3, 4, 5, 6, 7, 8, 9]);
+    assert.deepEqual(migrationRows.map((row) => Number(row.version)), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
   } finally {
     closeContext(context);
   }
@@ -1273,6 +1321,11 @@ test("role permissions are enforced independently of renderer visibility, and ar
     db.prepare("UPDATE ops_role_permissions SET enabled = 0 WHERE role_name = 'STORE' AND permission = 'RECEIVE_MATERIAL'").run();
     const storeAfterRevoke: ActorContext = { ...store, permissions: permissionsForRole(db, "STORE") };
     assert.throws(() => requirePermission(storeAfterRevoke, "RECEIVE_MATERIAL"), /does not have permission/);
+    context.operations.createRole("TEMP_DELETE", context.actor);
+    assert.ok(context.operations.listRoles().some((role) => role.name === "TEMP_DELETE"));
+    context.operations.deleteRole("TEMP_DELETE", context.actor);
+    assert.equal(context.operations.listRoles().some((role) => role.name === "TEMP_DELETE"), false);
+    assert.throws(() => context.operations.deleteRole("ADMIN", context.actor), /System roles/);
   } finally {
     closeContext(context);
   }

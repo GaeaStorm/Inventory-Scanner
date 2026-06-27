@@ -31,6 +31,10 @@ import type {
   SaveProductOrderInput,
   SaveProductOrderFieldDefinitionInput,
   SaveProductOrderWorkflowStateInput,
+  SaveSalesOrderInput,
+  SaveSalesOrderWorkflowStageInput,
+  SalesOrderVoucherExportInput,
+  SalesOrderVoucherExportResult,
   PlanningExportInput,
   PlanningExportResult,
   AuthSession,
@@ -148,6 +152,7 @@ declare global {
         saveBom: (input: SaveBomInput) => Promise<PlanningState>;
         activateBom: (bomId: string) => Promise<PlanningState>;
         saveProductOrder: (input: SaveProductOrderInput) => Promise<PlanningState>;
+        saveSalesOrder: (input: SaveSalesOrderInput) => Promise<PlanningState>;
         updateProductOrderStatus: (
           orderId: string,
           status: "CANCELLED" | "COMPLETED" | "CONFIRMED" | "ON_HOLD",
@@ -155,10 +160,13 @@ declare global {
         updateProductOrderWorkflowState: (orderId: string, workflowStateId: string) => Promise<PlanningState>;
         bulkUpdateProductOrders: (input: import("../planning/types").BulkProductOrderUpdateInput) => Promise<PlanningState>;
         saveProductOrderWorkflowState: (input: SaveProductOrderWorkflowStateInput) => Promise<PlanningState>;
+        saveSalesOrderWorkflowStage: (input: SaveSalesOrderWorkflowStageInput) => Promise<PlanningState>;
         deleteProductOrderWorkflowState: (stateId: string) => Promise<PlanningState>;
+        deleteSalesOrderWorkflowStage: (input: { id: string; orderKind: import("../planning/types").SalesOrderKind; stockGroupName?: string }) => Promise<PlanningState>;
         saveProductOrderFieldDefinition: (input: SaveProductOrderFieldDefinitionInput) => Promise<PlanningState>;
         deleteProductOrderFieldDefinition: (fieldId: string) => Promise<PlanningState>;
         exportRestock: (input: PlanningExportInput) => Promise<PlanningExportResult>;
+        exportSalesOrderVouchers: (input: SalesOrderVoucherExportInput) => Promise<SalesOrderVoucherExportResult>;
         addSalesOrderFulfilmentLine: (input: import("../planning/types").SaveSalesOrderFulfilmentLineInput) => Promise<PlanningState>;
         advanceFulfilmentLineStage: (fulfilmentLineId: string, targetStage: string) => Promise<PlanningState>;
         assignResaleSupplier: (fulfilmentLineId: string, supplierId: number) => Promise<PlanningState>;
@@ -184,6 +192,7 @@ declare global {
         resetCredential: (input: ResetCredentialInput) => Promise<void>;
         listRoles: () => Promise<Array<{ name: string; isSystem: boolean }>>;
         createRole: (name: string) => Promise<Array<{ name: string; isSystem: boolean }>>;
+        deleteRole: (name: string) => Promise<Array<{ name: string; isSystem: boolean }>>;
         getRolePermissions: () => Promise<Array<{ roleName: string; permission: string; enabled: boolean }>>;
         setRolePermission: (input: { roleName: string; permission: string; enabled: boolean }) => Promise<Array<{ roleName: string; permission: string; enabled: boolean }>>;
         getComputerRestrictions: () => Promise<Array<{ permission: string; computerNames: string[] }>>;

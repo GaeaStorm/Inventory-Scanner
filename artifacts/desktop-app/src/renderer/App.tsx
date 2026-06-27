@@ -1,5 +1,4 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import QRCode from "qrcode";
 
 import BackupRestorePanel from "./BackupRestorePanel";
 import AdministrationDashboard from "./AdministrationDashboard";
@@ -25,28 +24,15 @@ import type {
   Permission,
   PlanningState,
   StoresState,
-  ScannerDevice,
 } from "./types";
 
-const tabs: Array<{ id: AppTab; label: string; icon: string; permission?: Permission | Permission[] }> = [
+const tabs: Array<{ id: AppTab; label: string; icon: string; permission?: Permission | Permission[]; utility?: boolean }> = [
   { id: "administration", label: "Admin Dashboard", icon: "₹", permission: "TALLY_REVIEW" },
   { id: "operations", label: "Orders & Production", icon: "↻", permission: "INVENTORY_VIEW" },
   { id: "dashboard", label: "Inventory Dashboard", icon: "▦", permission: "RESTOCK_VIEW" },
-  // Anyone who can manage settings OR just pair scanner phones needs to reach this tab —
-  // the panels inside are gated individually so Stores only sees the pairing card.
-  { id: "settings", label: "Settings", icon: "⚙", permission: ["SETTINGS_MANAGE", "SCANNER_PAIRING_MANAGE"] },
-  { id: "tally", label: "Tally Syncer", icon: "⇄", permission: "TALLY_REVIEW" },
+  { id: "settings", label: "Settings", icon: "⚙", permission: "SETTINGS_MANAGE", utility: true },
+  { id: "tally", label: "Tally Syncer", icon: "⇄", permission: "TALLY_REVIEW", utility: true },
 ];
-
-function formatDate(value: string | null): string {
-  if (!value) return "—";
-  const date = new Date(value);
-  if (Number.isNaN(date.valueOf())) return value;
-  return new Intl.DateTimeFormat("en-IN", {
-    dateStyle: "medium",
-    timeStyle: "short",
-  }).format(date);
-}
 
 function formatBytes(value: number): string {
   if (value < 1024) return `${value} B`;
@@ -73,11 +59,6 @@ export default function App() {
   const [stores, setStores] = useState<StoresState | null>(null);
   const [planning, setPlanning] = useState<PlanningState | null>(null);
   const [operations, setOperations] = useState<OperationsState | null>(null);
-  const [selectedScannerUrl, setSelectedScannerUrl] = useState("");
-  const [scannerLabel, setScannerLabel] = useState("Stores phone");
-  const [scannerQrUrl, setScannerQrUrl] = useState("");
-  const [scannerPairingExpiresAt, setScannerPairingExpiresAt] = useState("");
-  const [scannerDevices, setScannerDevices] = useState<ScannerDevice[]>([]);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState("");
@@ -157,7 +138,7 @@ export default function App() {
             await refresh();
             const nextDashboard = await getDashboard(100);
             if (cancelled) return;
-            setSelectedScannerUrl(nextDashboard.scannerUrls[0] ?? info.scannerUrls[0] ?? "");
+            setDashboard(nextDashboard);
           } catch {
             localStorage.removeItem("inventory-scanner-session");
             if (!cancelled) setAuth(await window.desktop.auth.state());
@@ -185,7 +166,7 @@ export default function App() {
     try {
       await refresh();
       const nextDashboard = await getDashboard(100);
-      setSelectedScannerUrl(nextDashboard.scannerUrls[0] ?? desktopInfo?.scannerUrls[0] ?? "");
+      setDashboard(nextDashboard);
     } finally {
       setLoading(false);
     }
@@ -228,39 +209,6 @@ export default function App() {
   const scannerUrls = dashboard?.scannerUrls.length
     ? dashboard.scannerUrls
     : desktopInfo?.scannerUrls ?? [];
-  useEffect(() => {
-    if (activeTab !== "settings" || !session?.permissions.includes("SCANNER_PAIRING_MANAGE")) return;
-    void window.desktop.scanners.list().then(setScannerDevices).catch(() => undefined);
-  }, [activeTab, session]);
-
-  async function createScannerPairing() {
-    if (!selectedScannerUrl) throw new Error("No LAN address is available for scanner pairing.");
-    const pairing = await window.desktop.scanners.createPairing(scannerLabel);
-    const payload = JSON.stringify({
-      type: "inventory-scanner/scanner-pairing",
-      version: 1,
-      url: selectedScannerUrl,
-      pairingToken: pairing.pairingToken,
-      deviceLabel: scannerLabel,
-    });
-    setScannerQrUrl(await QRCode.toDataURL(payload, { width: 760, margin: 2, errorCorrectionLevel: "M" }));
-    setScannerPairingExpiresAt(pairing.expiresAt);
-  }
-
-  async function perform(action: () => Promise<void>, success?: string) {
-    setBusy(true);
-    setError("");
-    setNotice("");
-    try {
-      await action();
-      if (success) setNotice(success);
-    } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason));
-    } finally {
-      setBusy(false);
-    }
-  }
-
   if (loading) {
     return <main className="loading-screen">Opening Inventory Scanner…</main>;
   }
@@ -275,6 +223,8 @@ export default function App() {
 
   const visibleTabs = tabs.filter((tab) => !tab.permission
     || (Array.isArray(tab.permission) ? tab.permission.some((permission) => auth.permissions.includes(permission)) : auth.permissions.includes(tab.permission)));
+  const primaryTabs = visibleTabs.filter((tab) => !tab.utility);
+  const utilityTabs = visibleTabs.filter((tab) => tab.utility);
   const can = (permission: Permission) => auth.permissions.includes(permission);
 
   return (
@@ -292,16 +242,32 @@ export default function App() {
       </header>
 
       <nav className="tab-bar" aria-label="Application sections">
-        {visibleTabs.map((tab) => (
-          <button
-            key={tab.id}
-            className={`tab-button ${activeTab === tab.id ? "tab-button--active" : ""}`}
-            onClick={() => setActiveTab(tab.id)}
-            type="button"
-          >
-            <span>{tab.icon}</span>{tab.label}
-          </button>
-        ))}
+        <div className="tab-bar__primary">
+          {primaryTabs.map((tab) => (
+            <button
+              key={tab.id}
+              className={`tab-button ${activeTab === tab.id ? "tab-button--active" : ""}`}
+              onClick={() => setActiveTab(tab.id)}
+              type="button"
+            >
+              <span className="tab-button__icon">{tab.icon}</span><span className="tab-button__label">{tab.label}</span>
+            </button>
+          ))}
+        </div>
+        {utilityTabs.length > 0 && <div className="tab-bar__utility">
+          {utilityTabs.map((tab) => (
+            <button
+              key={tab.id}
+              className={`tab-button tab-button--utility ${activeTab === tab.id ? "tab-button--active" : ""}`}
+              onClick={() => setActiveTab(tab.id)}
+              type="button"
+              title={tab.label}
+              aria-label={tab.label}
+            >
+              <span className="tab-button__icon">{tab.icon}</span><span className="tab-button__label">{tab.label}</span>
+            </button>
+          ))}
+        </div>}
       </nav>
 
       <main className="content">
@@ -338,6 +304,8 @@ export default function App() {
             onRefresh={refresh}
             onNotice={setNotice}
             onError={setError}
+            scannerUrls={scannerUrls}
+            canManageScannerPairing={can("SCANNER_PAIRING_MANAGE")}
           />
         )}
 
@@ -347,7 +315,7 @@ export default function App() {
 
         {activeTab === "settings" && stores && (
           <section className="tab-page">
-            <div className="page-heading"><div><p className="eyebrow">APPLICATION SETTINGS</p><h1>Scanner, database, and exports</h1></div></div>
+            <div className="page-heading"><div><p className="eyebrow">APPLICATION SETTINGS</p><h1>LAN, database, and access</h1></div></div>
             <div className="settings-grid settings-grid--application">
               {can("SETTINGS_MANAGE") && <article className="panel">
                 <div className="panel__header"><div><p className="eyebrow">COMPANY LAN</p><h2>{desktopInfo?.deploymentRole === "LAN_CLIENT" ? "LAN client" : "Production server"}</h2></div><span className="health-badge">{desktopInfo?.deploymentRole === "LAN_CLIENT" ? "REMOTE" : "AUTHORITATIVE"}</span></div>
@@ -361,26 +329,6 @@ export default function App() {
                 <div className="settings-actions">
                   <button className="button button--secondary" type="button" onClick={() => setShowDeploymentSetup(true)}>Change LAN setup</button>
                 </div>
-              </article>}
-              {can("SCANNER_PAIRING_MANAGE") && <article className="panel">
-                <div className="panel__header"><div><p className="eyebrow">PHONE CONNECTION</p><h2>Pair a scanner</h2></div></div>
-                <div className="scanner-settings">
-                  <div className="scanner-qr-card">{scannerQrUrl ? <img src={scannerQrUrl} alt="One-time phone scanner pairing QR" /> : <span>Create a one-time pairing QR</span>}</div>
-                  <div className="scanner-address-controls">
-                    <label>Desktop API address<select value={selectedScannerUrl} onChange={(event) => setSelectedScannerUrl(event.target.value)}>{scannerUrls.map((url) => <option key={url}>{url}</option>)}</select></label>
-                    <label>Scanner name<input value={scannerLabel} onChange={(event) => setScannerLabel(event.target.value)} placeholder="e.g. Stores phone 1" /></label>
-                    <button className="button button--secondary" type="button" onClick={() => void perform(createScannerPairing)} disabled={!selectedScannerUrl || !scannerLabel.trim()}>Create pairing QR</button>
-                  </div>
-                </div>
-                <p className="table-footnote">{scannerPairingExpiresAt ? `This one-time QR expires ${formatDate(scannerPairingExpiresAt)}.` : "Each QR can pair one scanner and expires after 10 minutes. A paired scanner receives its own revocable audit identity."}</p>
-                <div className="table-scroll"><table><thead><tr><th>Scanner</th><th>Last seen</th><th>Status</th><th /></tr></thead><tbody>
-                  {scannerDevices.map((device) => <tr key={device.id}><td>{device.label}</td><td>{formatDate(device.lastSeenAt)}</td><td>{device.revokedAt ? "Revoked" : "Active"}</td><td>{!device.revokedAt && <button className="button button--ghost button--small" type="button" onClick={() => void perform(async () => {
-                    await window.desktop.scanners.revoke(device.id);
-                    setScannerDevices(await window.desktop.scanners.list());
-                  }, `${device.label} revoked.`)}>Revoke</button>}</td></tr>)}
-                  {scannerDevices.length === 0 && <tr><td colSpan={4} className="empty-table">No paired scanners yet.</td></tr>}
-                </tbody></table></div>
-                <div className="read-only-note"><strong>LAN boundary:</strong> the API listens on the selected company LAN, but scanner inventory routes require a paired device token. Browser origins are restricted; native paired scanners do not send browser-origin headers.</div>
               </article>}
               {can("SETTINGS_MANAGE") && <article className="panel settings-database-card">
                 <div className="panel__header"><div><p className="eyebrow">SQLITE</p><h2>Operational database</h2></div><span className="health-badge">{stores.database.integrity.toUpperCase()}</span></div>

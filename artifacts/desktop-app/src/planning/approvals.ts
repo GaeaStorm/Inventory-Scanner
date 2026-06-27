@@ -1,6 +1,6 @@
 import type { Permission } from "../operations/types";
 
-export type ApprovalEntityType = "SALES_ORDER_PO" | "SALES_ORDER_CRF";
+export type ApprovalEntityType = "SALES_ORDER_PO" | "SALES_ORDER_CRF" | "SALES_ORDER_STAGE";
 
 /**
  * Which permissions must each contribute one APPROVE decision, from a
@@ -12,6 +12,7 @@ export type ApprovalEntityType = "SALES_ORDER_PO" | "SALES_ORDER_CRF";
 export const APPROVAL_PERMISSION_REQUIREMENTS: Record<ApprovalEntityType, Permission[]> = {
   SALES_ORDER_PO: ["SALES_ORDER_APPROVE_PO"],
   SALES_ORDER_CRF: ["SALES_ORDER_APPROVE_CRF_ACCOUNTS", "SALES_ORDER_APPROVE_CRF_SALES"],
+  SALES_ORDER_STAGE: [],
 };
 
 export interface ApprovalDecisionRecord {
@@ -27,8 +28,11 @@ export interface ApprovalDecisionRecord {
  * if they hold both permissions (e.g. an Accounts+Sales dual-hat user or
  * ADMIN), because each decision is pinned to exactly one slot when recorded.
  */
-export function isApprovalSatisfied(entityType: ApprovalEntityType, decisions: ApprovalDecisionRecord[]): boolean {
-  const requiredPermissions = APPROVAL_PERMISSION_REQUIREMENTS[entityType];
+export function isApprovalSatisfied(
+  entityType: ApprovalEntityType,
+  decisions: ApprovalDecisionRecord[],
+  requiredPermissions = APPROVAL_PERMISSION_REQUIREMENTS[entityType],
+): boolean {
   const approvals = decisions.filter((decision) => decision.decision === "APPROVE");
   const usedUserIds = new Set<string>();
   for (const permission of requiredPermissions) {
@@ -48,8 +52,8 @@ export function pickQualifyingPermission(
   entityType: ApprovalEntityType,
   actorPermissions: Permission[] | undefined,
   existingDecisions: ApprovalDecisionRecord[],
+  requiredPermissions = APPROVAL_PERMISSION_REQUIREMENTS[entityType],
 ): Permission | null {
-  const requiredPermissions = APPROVAL_PERMISSION_REQUIREMENTS[entityType];
   const claimedPermissions = new Set(
     existingDecisions.filter((decision) => decision.decision === "APPROVE").map((decision) => decision.qualifyingPermission),
   );

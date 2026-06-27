@@ -196,14 +196,17 @@ async function remoteChannelRequest(channel: string, first: unknown, second: unk
     case "planning:save-bom": return remoteRequest("/api/planning/boms", jsonBody(first));
     case "planning:activate-bom": return remoteRequest(`/api/planning/boms/${encodeURIComponent(String(first))}/activate`, jsonBody({}));
     case "planning:save-product-order": return remoteRequest("/api/planning/product-orders", jsonBody(first));
+    case "planning:save-sales-order": return remoteRequest("/api/planning/sales-orders", jsonBody(first));
     case "planning:update-product-order-status": return remoteRequest(`/api/planning/product-orders/${encodeURIComponent(String(first))}/status`, jsonBody({ status: second }));
     case "planning:update-product-order-workflow-state": return remoteRequest(`/api/planning/product-orders/${encodeURIComponent(String(first))}/workflow-state`, jsonBody({ workflowStateId: second }));
     case "planning:bulk-update-product-orders": return remoteRequest("/api/planning/product-orders/bulk-update", jsonBody(first));
     case "planning:save-product-order-workflow-state": return remoteRequest("/api/planning/product-order-workflow-states", jsonBody(first));
+    case "planning:save-sales-order-workflow-stage": return remoteRequest("/api/planning/sales-order-workflow-stages", jsonBody(first));
     case "planning:delete-product-order-workflow-state": return remoteRequest(`/api/planning/product-order-workflow-states/${encodeURIComponent(String(first))}`, { method: "DELETE" });
     case "planning:save-product-order-field-definition": return remoteRequest("/api/planning/product-order-fields", jsonBody(first));
     case "planning:delete-product-order-field-definition": return remoteRequest(`/api/planning/product-order-fields/${encodeURIComponent(String(first))}`, { method: "DELETE" });
     case "planning:export-restock": return remoteRequest("/api/planning/export", jsonBody(first));
+    case "planning:export-sales-order-vouchers": return remoteRequest("/api/planning/sales-orders/export-vouchers", jsonBody(first));
     case "planning:add-sales-order-fulfilment-line": return remoteRequest("/api/planning/sales-orders/fulfilment-lines", jsonBody(first));
     case "planning:advance-fulfilment-line-stage": return remoteRequest(`/api/planning/sales-orders/fulfilment-lines/${encodeURIComponent(String(first))}/stage`, jsonBody({ stage: second }));
     case "planning:assign-resale-supplier": return remoteRequest(`/api/planning/sales-orders/fulfilment-lines/${encodeURIComponent(String(first))}/supplier`, jsonBody({ supplierId: second }));
@@ -462,14 +465,18 @@ contextBridge.exposeInMainWorld("desktop", {
     saveBom: (input: unknown) => authenticatedSession("planning:save-bom", input),
     activateBom: (bomId: string) => authenticatedSession("planning:activate-bom", bomId),
     saveProductOrder: (input: unknown) => authenticatedSession("planning:save-product-order", input),
+    saveSalesOrder: (input: unknown) => authenticatedSession("planning:save-sales-order", input),
     updateProductOrderStatus: (orderId: string, status: string) => authenticatedSession("planning:update-product-order-status", orderId, status),
     updateProductOrderWorkflowState: (orderId: string, workflowStateId: string) => authenticatedSession("planning:update-product-order-workflow-state", orderId, workflowStateId),
     bulkUpdateProductOrders: (input: unknown) => authenticatedSession("planning:bulk-update-product-orders", input),
     saveProductOrderWorkflowState: (input: unknown) => authenticatedSession("planning:save-product-order-workflow-state", input),
+    saveSalesOrderWorkflowStage: (input: unknown) => authenticatedSession("planning:save-sales-order-workflow-stage", input),
     deleteProductOrderWorkflowState: (stateId: string) => authenticatedSession("planning:delete-product-order-workflow-state", stateId),
+    deleteSalesOrderWorkflowStage: (input: unknown) => authenticatedSession("planning:delete-sales-order-workflow-stage", input),
     saveProductOrderFieldDefinition: (input: unknown) => authenticatedSession("planning:save-product-order-field-definition", input),
     deleteProductOrderFieldDefinition: (fieldId: string) => authenticatedSession("planning:delete-product-order-field-definition", fieldId),
     exportRestock: (input: unknown) => authenticatedSession("planning:export-restock", input),
+    exportSalesOrderVouchers: (input: unknown) => authenticatedSession("planning:export-sales-order-vouchers", input),
     addSalesOrderFulfilmentLine: (input: unknown) => authenticatedSession("planning:add-sales-order-fulfilment-line", input),
     advanceFulfilmentLineStage: (fulfilmentLineId: string, targetStage: string) => authenticatedSession("planning:advance-fulfilment-line-stage", fulfilmentLineId, targetStage),
     assignResaleSupplier: (fulfilmentLineId: string, supplierId: number) => authenticatedSession("planning:assign-resale-supplier", fulfilmentLineId, supplierId),
@@ -495,6 +502,7 @@ contextBridge.exposeInMainWorld("desktop", {
     resetCredential: (input: unknown) => authenticatedSession("operations:reset-credential", input),
     listRoles: () => authenticatedSession("operations:list-roles"),
     createRole: (name: string) => authenticatedSession("operations:create-role", name),
+    deleteRole: (name: string) => authenticatedSession("operations:delete-role", name),
     getRolePermissions: () => authenticatedSession("operations:get-role-permissions"),
     setRolePermission: (input: { roleName: string; permission: string; enabled: boolean }) => authenticatedSession("operations:set-role-permission", input),
     getComputerRestrictions: () => authenticatedSession("operations:get-computer-restrictions"),

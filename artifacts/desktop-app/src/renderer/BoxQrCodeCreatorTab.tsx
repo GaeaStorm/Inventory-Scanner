@@ -9,12 +9,14 @@ import GroupFilterDropdown, {
   type GroupFilterValue,
 } from "./GroupFilterDropdown";
 import { operationalStockItems } from "./stock-item-visibility";
-import type { StoresBox, StoresState } from "./types";
+import type { ScannerDevice, StoresBox, StoresState } from "./types";
 import "./BoxQrCodeCreatorTab.css";
 
 interface Props {
   stores: StoresState;
   onChanged: (state: StoresState) => void;
+  scannerUrls: string[];
+  canManageScannerPairing: boolean;
 }
 
 interface QueueEntry {
@@ -65,7 +67,17 @@ function chunksOf<T>(values: T[], size: number): T[][] {
   return result;
 }
 
-export default function BoxQrCodeCreatorTab({ stores, onChanged }: Props) {
+function formatDate(value: string | null): string {
+  if (!value) return "—";
+  const date = new Date(value);
+  if (Number.isNaN(date.valueOf())) return value;
+  return new Intl.DateTimeFormat("en-IN", {
+    dateStyle: "medium",
+    timeStyle: "short",
+  }).format(date);
+}
+
+export default function BoxQrCodeCreatorTab({ stores, onChanged, scannerUrls, canManageScannerPairing }: Props) {
   const [boxId, setBoxId] = useState(() => newBoxId());
   const [expectedRevision, setExpectedRevision] = useState<number | undefined>();
   const [selectedGuids, setSelectedGuids] = useState<string[]>([]);
@@ -80,6 +92,12 @@ export default function BoxQrCodeCreatorTab({ stores, onChanged }: Props) {
   const [queue, setQueue] = useState<QueueEntry[]>([]);
   const [busy, setBusy] = useState(false);
   const [printing, setPrinting] = useState(false);
+  const [scannerBusy, setScannerBusy] = useState(false);
+  const [selectedScannerUrl, setSelectedScannerUrl] = useState(scannerUrls[0] ?? "");
+  const [scannerLabel, setScannerLabel] = useState("Stores phone");
+  const [scannerQrUrl, setScannerQrUrl] = useState("");
+  const [scannerPairingExpiresAt, setScannerPairingExpiresAt] = useState("");
+  const [scannerDevices, setScannerDevices] = useState<ScannerDevice[]>([]);
   const [notice, setNotice] = useState("");
   const [error, setError] = useState("");
   const selectableItems = useMemo(
@@ -130,6 +148,58 @@ export default function BoxQrCodeCreatorTab({ stores, onChanged }: Props) {
       return next.length === current.length ? current : next;
     });
   }, [selectableItems]);
+
+  useEffect(() => {
+    if (scannerUrls.length === 0) return;
+    setSelectedScannerUrl((current) => scannerUrls.includes(current) ? current : scannerUrls[0]);
+  }, [scannerUrls]);
+
+  useEffect(() => {
+    if (!canManageScannerPairing) return;
+    void window.desktop.scanners.list().then(setScannerDevices).catch((reason) => setError(reason instanceof Error ? reason.message : String(reason)));
+  }, [canManageScannerPairing]);
+
+  async function createScannerPairing(): Promise<void> {
+    if (!selectedScannerUrl) {
+      setError("No LAN address is available for scanner pairing.");
+      return;
+    }
+    setScannerBusy(true);
+    setError("");
+    setNotice("");
+    try {
+      const pairing = await window.desktop.scanners.createPairing(scannerLabel);
+      const payload = JSON.stringify({
+        type: "inventory-scanner/scanner-pairing",
+        version: 1,
+        url: selectedScannerUrl,
+        pairingToken: pairing.pairingToken,
+        deviceLabel: scannerLabel,
+      });
+      setScannerQrUrl(await QRCode.toDataURL(payload, { width: 760, margin: 2, errorCorrectionLevel: "M" }));
+      setScannerPairingExpiresAt(pairing.expiresAt);
+      setNotice("Pairing QR created.");
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setScannerBusy(false);
+    }
+  }
+
+  async function revokeScanner(device: ScannerDevice): Promise<void> {
+    setScannerBusy(true);
+    setError("");
+    setNotice("");
+    try {
+      await window.desktop.scanners.revoke(device.id);
+      setScannerDevices(await window.desktop.scanners.list());
+      setNotice(`${device.label} revoked.`);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setScannerBusy(false);
+    }
+  }
 
   function loadBox(box: StoresBox): void {
     setBoxId(box.boxId);
@@ -329,6 +399,24 @@ export default function BoxQrCodeCreatorTab({ stores, onChanged }: Props) {
           <button className="button" type="button" onClick={addToQueue} disabled={!qrDataUrl}>Add to print queue</button></div>
         </article>
       </div>
+
+      {canManageScannerPairing && <article className="panel stores-scanner-panel">
+        <div className="panel__header"><div><p className="eyebrow">PHONE CONNECTION</p><h2>Pair a phone</h2></div></div>
+        <div className="scanner-settings">
+          <div className="scanner-qr-card">{scannerQrUrl ? <img src={scannerQrUrl} alt="One-time phone scanner pairing QR" /> : <span>Create a one-time pairing QR</span>}</div>
+          <div className="scanner-address-controls">
+            <label>Desktop API address<select value={selectedScannerUrl} onChange={(event) => setSelectedScannerUrl(event.target.value)}>{scannerUrls.map((url) => <option key={url}>{url}</option>)}</select></label>
+            <label>Scanner name<input value={scannerLabel} onChange={(event) => setScannerLabel(event.target.value)} placeholder="e.g. Stores phone 1" /></label>
+            <button className="button button--secondary" type="button" onClick={() => void createScannerPairing()} disabled={scannerBusy || !selectedScannerUrl || !scannerLabel.trim()}>Create pairing QR</button>
+          </div>
+        </div>
+        <p className="table-footnote">{scannerPairingExpiresAt ? `This one-time QR expires ${formatDate(scannerPairingExpiresAt)}.` : "Each QR can pair one scanner and expires after 10 minutes. A paired scanner receives its own revocable audit identity."}</p>
+        <div className="table-scroll"><table><thead><tr><th>Scanner</th><th>Last seen</th><th>Status</th><th /></tr></thead><tbody>
+          {scannerDevices.map((device) => <tr key={device.id}><td>{device.label}</td><td>{formatDate(device.lastSeenAt)}</td><td>{device.revokedAt ? "Revoked" : "Active"}</td><td>{!device.revokedAt && <button className="button button--ghost button--small" type="button" disabled={scannerBusy} onClick={() => void revokeScanner(device)}>Revoke</button>}</td></tr>)}
+          {scannerDevices.length === 0 && <tr><td colSpan={4} className="empty-table">No paired scanners yet.</td></tr>}
+        </tbody></table></div>
+        <div className="read-only-note"><strong>LAN boundary:</strong> the API listens on the selected company LAN, but scanner inventory routes require a paired device token.</div>
+      </article>}
 
       <article className="panel">
         <div className="panel__header"><div><p className="eyebrow">PRINT QUEUE</p><h2>Box labels</h2></div><button className="button" type="button" onClick={() => void printQueue()} disabled={queue.length === 0 || printing}>{printing ? "Opening print dialog…" : "Print labels"}</button></div>

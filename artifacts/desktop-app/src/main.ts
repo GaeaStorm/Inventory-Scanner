@@ -796,6 +796,10 @@ function registerIpcHandlers(): void {
     if (!planningService) throw new Error("The Planning service is unavailable.");
     return planningService.saveProductOrder(input as never, requireActor(token, "PRODUCT_ORDER_MANAGE"));
   });
+  ipcMain.handle("planning:save-sales-order", (_event, token: unknown, input: unknown) => {
+    if (!planningService) throw new Error("The Planning service is unavailable.");
+    return planningService.saveSalesOrder(input as never, requireActor(token, "SALES_ORDER_EDIT_CRF"));
+  });
   ipcMain.handle("planning:update-product-order-status", (_event, token: unknown, orderId: unknown, status: unknown) => {
     if (!planningService) throw new Error("The Planning service is unavailable.");
     return planningService.updateProductOrderStatus(String(orderId ?? ""), String(status ?? "") as "CANCELLED" | "COMPLETED" | "CONFIRMED", requireActor(token, "PRODUCT_ORDER_MANAGE"));
@@ -812,9 +816,22 @@ function registerIpcHandlers(): void {
     if (!planningService) throw new Error("The Planning service is unavailable.");
     return planningService.saveProductOrderWorkflowState(input as never, requireActor(token, "PRODUCT_ORDER_MANAGE"));
   });
+  ipcMain.handle("planning:save-sales-order-workflow-stage", (_event, token: unknown, input: unknown) => {
+    if (!planningService) throw new Error("The Planning service is unavailable.");
+    return planningService.saveSalesOrderWorkflowStage(input as never, requireActor(token, "SALES_ORDER_CHECKLIST_CONFIGURE"));
+  });
   ipcMain.handle("planning:delete-product-order-workflow-state", (_event, token: unknown, stateId: unknown) => {
     if (!planningService) throw new Error("The Planning service is unavailable.");
     return planningService.deleteProductOrderWorkflowState(String(stateId ?? ""), requireActor(token, "PRODUCT_ORDER_MANAGE"));
+  });
+  ipcMain.handle("planning:delete-sales-order-workflow-stage", (_event, token: unknown, input: unknown) => {
+    if (!planningService) throw new Error("The Planning service is unavailable.");
+    const { id, orderKind, stockGroupName } = (input ?? {}) as { id?: unknown; orderKind?: unknown; stockGroupName?: unknown };
+    return planningService.deleteSalesOrderWorkflowStage({
+      id: String(id ?? ""),
+      orderKind: String(orderKind ?? "SALES") as "SALES" | "SERVICE",
+      stockGroupName: String(stockGroupName ?? ""),
+    }, requireActor(token, "SALES_ORDER_CHECKLIST_CONFIGURE"));
   });
   ipcMain.handle("planning:save-product-order-field-definition", (_event, token: unknown, input: unknown) => {
     if (!planningService) throw new Error("The Planning service is unavailable.");
@@ -827,6 +844,10 @@ function registerIpcHandlers(): void {
   ipcMain.handle("planning:export-restock", (_event, token: unknown, input: unknown) => {
     if (!planningService) throw new Error("The Planning service is unavailable.");
     return planningService.exportRestock(input as never, requireActor(token, "RESTOCK_MANAGE"));
+  });
+  ipcMain.handle("planning:export-sales-order-vouchers", (_event, token: unknown, input: unknown) => {
+    if (!planningService) throw new Error("The Planning service is unavailable.");
+    return planningService.exportSalesOrderVouchers(input as never, requireActor(token, "TALLY_REVIEW"));
   });
   ipcMain.handle("planning:add-sales-order-fulfilment-line", (_event, token: unknown, input: unknown) => {
     if (!planningService) throw new Error("The Planning service is unavailable.");
@@ -912,6 +933,10 @@ function registerIpcHandlers(): void {
   ipcMain.handle("operations:create-role", (_event, token: unknown, name: unknown) => {
     if (!operationsService) throw new Error("The inventory operations service is unavailable.");
     return operationsService.createRole(String(name ?? ""), requireActor(token, "AUTH_MANAGE_USERS"));
+  });
+  ipcMain.handle("operations:delete-role", (_event, token: unknown, name: unknown) => {
+    if (!operationsService) throw new Error("The inventory operations service is unavailable.");
+    return operationsService.deleteRole(String(name ?? ""), requireActor(token, "AUTH_MANAGE_USERS"));
   });
   ipcMain.handle("operations:get-role-permissions", (_event, token: unknown) => {
     if (!operationsService) throw new Error("The inventory operations service is unavailable.");
